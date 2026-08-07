@@ -1,0 +1,1391 @@
+#!/usr/bin/env bash
+# SC2016: Some fixtures intentionally emit literal shell variables for a mock
+# executable or verify that shell-like configuration text is not evaluated.
+# SC2034: Tests inject application globals that are consumed after sourcing;
+# ShellCheck cannot follow those assignments across the test/app boundary.
+# SC2329: Test cases use dynamic dispatch, and command mocks override functions
+# called indirectly by the sourced application.
+# shellcheck disable=SC2016,SC2034,SC2329
+set -uo pipefail
+
+TEST_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+PROJECT_DIR=$(cd -- "$TEST_DIR/.." && pwd)
+APP=$PROJECT_DIR/a2dpilot
+TESTS_RUN=0
+TESTS_FAILED=0
+
+fail() {
+  printf '    %s\n' "$*" >&2
+  return 1
+}
+
+assert_eq() {
+  local expected=$1 actual=$2
+  [[ $actual == "$expected" ]] || fail "expected '$expected', got '$actual'"
+}
+
+assert_contains() {
+  local value=$1 expected=$2
+  [[ $value == *"$expected"* ]] || fail "expected output to contain: $expected"
+}
+
+assert_not_contains() {
+  local value=$1 unexpected=$2
+  [[ $value != *"$unexpected"* ]] || fail "expected output not to contain: $unexpected"
+}
+
+assert_file_contains() {
+  local path=$1 expected=$2
+  grep -Fq -- "$expected" "$path" || fail "$path does not contain: $expected"
+}
+
+assert_file_not_contains() {
+  local path=$1 unexpected=$2
+  ! grep -Fq -- "$unexpected" "$path" || fail "$path unexpectedly contains: $unexpected"
+}
+
+expect_failure_contains() {
+  local expected=$1 output rc
+  shift
+  set +e
+  output=$("$@" 2>&1)
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail "command unexpectedly succeeded: $*"
+  assert_contains "$output" "$expected"
+}
+
+cleanup_scratch_dir() {
+  [[ -n ${TEST_SCRATCH:-} && -d $TEST_SCRATCH ]] || return 0
+  find "$TEST_SCRATCH" -depth -delete
+}
+
+setup_scratch_dir() {
+  TEST_SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/a2dpilot-test.XXXXXX")
+  trap cleanup_scratch_dir EXIT
+}
+
+load_app() {
+  set --
+  # SC1090: APP is derived from this test file's directory and deliberately
+  # sourced so each isolated test can exercise and override application code.
+  # shellcheck disable=SC1090
+  source "$APP" >/dev/null
+  # Keep command mocks visible to controller batches. Production uses coreutils
+  # timeout around bluetoothctl; isolated tests substitute a shell function.
+  run_bounded_bluetoothctl() {
+    shift
+    bluetoothctl "$@"
+  }
+}
+
+configure_scratch_paths() {
+  CONFIG_FILE=$TEST_SCRATCH/etc/a2dpilot.conf
+  STATE_DIR=$TEST_SCRATCH/state
+  BACKUP_DIR=$STATE_DIR/backup
+  STATE_FILE=$STATE_DIR/state
+  INSTALLED_CLI=$TEST_SCRATCH/usr/local/sbin/a2dpilot
+  SYSTEMD_UNIT=$TEST_SCRATCH/etc/systemd/system/a2dpilot.service
+  WIREPLUMBER_CONF=$TEST_SCRATCH/etc/wireplumber/wireplumber.conf.d/51-a2dpilot.conf
+  TRIGGER_CONF=$TEST_SCRATCH/etc/triggerhappy/triggers.d/a2dpilot.conf
+  LOCK_FILE=$TEST_SCRATCH/run/lock/a2dpilot/lock
+  MEDIA_STATE_DIR=$TEST_SCRATCH/run/a2dpilot
+  MEDIA_LOCK_FILE=$MEDIA_STATE_DIR/media.lock
+  MEDIA_RUNTIME_USER=$(id -un)
+  install -d "$(dirname "$CONFIG_FILE")" "$(dirname "$LOCK_FILE")" "$STATE_DIR" "$BACKUP_DIR"
+}
+
+write_test_config() {
+  local path=$1 user=$2
+  shift 2
+  {
+    printf 'audio-user = %s\n' "$user"
+    printf 'controller = auto\n'
+    printf 'reconnect-interval = 5\n'
+    printf 'media-controls = auto\n'
+    printf 'base-url = http://127.0.0.1:32500/\n'
+    printf 'media-key = KEY_PLAYCD player/playback/playPause?type=music&commandID={command-id}\n'
+    printf 'media-key = KEY_PAUSECD player/playback/playPause?type=music&commandID={command-id}\n'
+    printf 'media-key = KEY_NEXTSONG player/playback/skipNext?type=music&commandID={command-id}\n'
+    printf 'media-key = KEY_PREVIOUSSONG player/playback/skipPrevious?type=music&commandID={command-id}\n'
+    while [[ $# -gt 0 ]]; do
+      printf 'speaker = %s\n' "$1"
+      shift
+    done
+  } > "$path"
+}
+
+run_test() {
+  local name=$1 test_function=$2 rc
+  TESTS_RUN=$((TESTS_RUN + 1))
+  set +e
+  (
+    set -Eeuo pipefail
+    "$test_function"
+  )
+  rc=$?
+  set -e
+  if (( rc == 0 )); then
+    printf 'ok %d - %s\n' "$TESTS_RUN" "$name"
+  else
+    printf 'not ok %d - %s\n' "$TESTS_RUN" "$name"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+  fi
+}
+
+test_syntax_help_and_stream_bootstrap() {
+  local local_help streamed_help output
+  bash -n "$APP"
+  local_help=$(bash "$APP" --help)
+  streamed_help=$(bash -s -- --help < "$APP")
+  assert_eq "$local_help" "$streamed_help"
+  assert_contains "$local_help" 'a2dpilot install [--user USER] [--non-interactive]'
+  assert_contains "$local_help" 'a2dpilot config [--check]'
+  assert_contains "$local_help" 'uninstall [--keep-bonds | --remove-bonds]'
+  assert_not_contains "$local_help" 'update --mac'
+  assert_not_contains "$local_help" '--control-helper'
+  set +e
+  output=$(bash "$APP" update 2>&1)
+  set -e
+  assert_contains "$output" 'Unknown command: update'
+}
+
+test_managed_package_list() {
+  local package
+  local -a expected=(
+    bluez bluez-firmware pipewire pipewire-alsa pipewire-pulse wireplumber
+    libspa-0.2-bluetooth rtkit triggerhappy curl rfkill
+  )
+  local -A seen=()
+  load_app
+  assert_eq nobody "$MEDIA_RUNTIME_USER"
+  for package in "${PACKAGES[@]}"; do
+    [[ ! ${seen[$package]+present} ]] || fail "duplicate package: $package"
+    seen[$package]=1
+  done
+  for package in "${expected[@]}"; do
+    [[ ${seen[$package]+present} ]] || fail "missing package: $package"
+  done
+  assert_eq "${#expected[@]}" "${#PACKAGES[@]}"
+}
+
+test_config_parser_and_normalization() {
+  local user
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  {
+    printf '# A safe config\n\n'
+    printf ' audio-user = %s \n' "$user"
+    printf 'controller = aa:bb:cc:dd:ee:01\n'
+    printf 'reconnect-interval = 9\n'
+    printf 'media-controls = required\n'
+    printf 'base-url = https://player.example:32500/api///\n'
+    printf 'media-key = KEY_NEXTSONG /next?request={command-id}\n'
+    printf 'media-key = KEY_PLAYPAUSE https://other.example/play?literal=yes\n'
+    printf 'speaker = aa:bb:cc:dd:ee:ff\n'
+    printf 'speaker = 10:20:30:40:50:60\n'
+  } > "$CONFIG_FILE"
+  parse_config "$CONFIG_FILE"
+  assert_eq "$user" "$CFG_AUDIO_USER"
+  assert_eq AA:BB:CC:DD:EE:01 "$CFG_CONTROLLER"
+  assert_eq 9 "$CFG_RECONNECT_INTERVAL"
+  assert_eq required "$CFG_MEDIA_CONTROLS"
+  assert_eq https://player.example:32500/api "$CFG_BASE_URL"
+  assert_eq KEY_NEXTSONG "${CFG_MEDIA_KEYS[0]}"
+  assert_eq '/next?request={command-id}' "${CFG_MEDIA_URLS[0]}"
+  assert_eq KEY_PLAYPAUSE "${CFG_MEDIA_KEYS[1]}"
+  assert_eq 'https://other.example/play?literal=yes' "${CFG_MEDIA_URLS[1]}"
+  assert_eq AA:BB:CC:DD:EE:FF "${CFG_SPEAKERS[0]}"
+  assert_eq 10:20:30:40:50:60 "${CFG_SPEAKERS[1]}"
+}
+
+test_default_media_key_mappings() {
+  local user index
+  local -a expected_keys=(
+    KEY_PLAYPAUSE KEY_PLAY KEY_PLAYCD KEY_PAUSE KEY_PAUSECD
+    KEY_STOP KEY_STOPCD KEY_NEXT KEY_NEXTSONG KEY_PREVIOUS KEY_PREVIOUSSONG
+    KEY_FORWARD KEY_FASTFORWARD KEY_REWIND KEY_FASTREVERSE
+    KEY_VOLUMEUP KEY_VOLUMEDOWN KEY_MUTE KEY_SHUFFLE KEY_MEDIA_REPEAT
+  )
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  write_default_config "$CONFIG_FILE" "$user"
+  parse_config "$CONFIG_FILE"
+  assert_eq "${#expected_keys[@]}" "${#CFG_MEDIA_KEYS[@]}"
+  for index in "${!expected_keys[@]}"; do
+    assert_eq "${expected_keys[$index]}" "${CFG_MEDIA_KEYS[$index]}"
+  done
+  assert_eq '/player/playback/play?type=music&commandID={command-id}' "${CFG_MEDIA_URLS[2]}"
+  assert_eq '/player/playback/pause?type=music&commandID={command-id}' "${CFG_MEDIA_URLS[4]}"
+  assert_eq '/player/playback/stepForward?type=music&commandID={command-id}' "${CFG_MEDIA_URLS[12]}"
+  assert_eq '/player/playback/stepBack?type=music&commandID={command-id}' "${CFG_MEDIA_URLS[14]}"
+  assert_eq '/player/playback/setParameters?type=music&volume={volume-up}&commandID={command-id}' \
+    "${CFG_MEDIA_URLS[15]}"
+  assert_eq '/player/playback/setParameters?type=music&volume={mute-toggle}&commandID={command-id}' \
+    "${CFG_MEDIA_URLS[17]}"
+  assert_eq '/player/playback/setParameters?type=music&shuffle={shuffle-toggle}&commandID={command-id}' \
+    "${CFG_MEDIA_URLS[18]}"
+  assert_eq '/player/playback/setParameters?type=music&repeat={repeat-cycle}&commandID={command-id}' \
+    "${CFG_MEDIA_URLS[19]}"
+}
+
+test_config_parser_rejections_and_no_eval() {
+  local user marker
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  marker=$TEST_SCRATCH/executed
+  write_test_config "$CONFIG_FILE" "$user" AA:BB:CC:DD:EE:FF aa:bb:cc:dd:ee:ff
+  if parse_config "$CONFIG_FILE"; then fail 'duplicate MAC was accepted'; fi
+  assert_contains "$CONFIG_ERROR" 'duplicate speaker'
+
+  write_test_config "$CONFIG_FILE" "$user"
+  printf 'unknown-setting = true\n' >> "$CONFIG_FILE"
+  if parse_config "$CONFIG_FILE"; then fail 'unknown key was accepted'; fi
+  assert_contains "$CONFIG_ERROR" 'unknown setting'
+
+  write_test_config "$CONFIG_FILE" "$user"
+  sed -i 's/reconnect-interval = 5/reconnect-interval = 0/' "$CONFIG_FILE"
+  if parse_config "$CONFIG_FILE"; then fail 'zero interval was accepted'; fi
+  assert_contains "$CONFIG_ERROR" 'positive integer'
+
+  write_test_config "$CONFIG_FILE" "\$(touch $marker)"
+  if parse_config "$CONFIG_FILE"; then fail 'code-like user value was accepted'; fi
+  [[ ! -e $marker ]] || fail 'configuration was evaluated as shell code'
+
+  write_test_config "$CONFIG_FILE" "$user"
+  user_home() { printf '/definitely/not/a/home\n'; }
+  if parse_config "$CONFIG_FILE"; then fail 'audio user without a usable home was accepted'; fi
+  assert_contains "$CONFIG_ERROR" 'no usable home directory'
+
+  write_test_config "$TEST_SCRATCH/real-config" "$user"
+  unlink "$CONFIG_FILE"
+  ln -s "$TEST_SCRATCH/real-config" "$CONFIG_FILE"
+  if parse_config "$CONFIG_FILE"; then fail 'symlinked configuration was accepted'; fi
+  assert_contains "$CONFIG_ERROR" 'missing or unsafe'
+}
+
+test_invalid_reload_retains_last_valid_configuration() {
+  local user
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  write_test_config "$CONFIG_FILE" "$user" AA:BB:CC:DD:EE:FF
+  parse_config "$CONFIG_FILE"
+  printf 'this is not configuration\n' > "$CONFIG_FILE"
+  if parse_config "$CONFIG_FILE"; then fail 'invalid reload unexpectedly succeeded'; fi
+  assert_eq "$user" "$CFG_AUDIO_USER"
+  assert_eq 5 "$CFG_RECONNECT_INTERVAL"
+  assert_eq http://127.0.0.1:32500 "$CFG_BASE_URL"
+  assert_eq KEY_PLAYCD "${CFG_MEDIA_KEYS[0]}"
+  assert_eq '/player/playback/playPause?type=music&commandID={command-id}' "${CFG_MEDIA_URLS[0]}"
+  assert_eq AA:BB:CC:DD:EE:FF "${CFG_SPEAKERS[0]}"
+}
+
+test_media_url_configuration_validation() {
+  local user
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+
+  write_test_config "$CONFIG_FILE" "$user"
+  printf 'media-key = KEY_NEXTSONG https://override.example/next\n' >> "$CONFIG_FILE"
+  if parse_config "$CONFIG_FILE"; then fail 'duplicate media key was accepted'; fi
+  assert_contains "$CONFIG_ERROR" 'duplicate media key'
+
+  write_test_config "$CONFIG_FILE" "$user"
+  printf 'base-url = https://duplicate.example\n' >> "$CONFIG_FILE"
+  if parse_config "$CONFIG_FILE"; then fail 'duplicate base-url was accepted'; fi
+  assert_contains "$CONFIG_ERROR" 'duplicate setting: base-url'
+
+  write_test_config "$CONFIG_FILE" "$user"
+  printf 'media-key = next https://override.example/next\n' >> "$CONFIG_FILE"
+  if parse_config "$CONFIG_FILE"; then fail 'invalid media key name was accepted'; fi
+  assert_contains "$CONFIG_ERROR" 'invalid media key name'
+
+  write_test_config "$CONFIG_FILE" "$user"
+  sed -i '/^base-url =/d' "$CONFIG_FILE"
+  if parse_config "$CONFIG_FILE"; then fail 'relative mapping without base-url was accepted'; fi
+  assert_contains "$CONFIG_ERROR" 'relative media-key URL requires base-url'
+
+  write_test_config "$CONFIG_FILE" "$user"
+  sed -i '/^base-url =/d; /^media-key =/d' "$CONFIG_FILE"
+  printf 'media-key = KEY_CUSTOM https://other.example/action?literal=yes\n' >> "$CONFIG_FILE"
+  parse_config "$CONFIG_FILE"
+  assert_eq '' "$CFG_BASE_URL"
+  assert_eq KEY_CUSTOM "${CFG_MEDIA_KEYS[0]}"
+
+  write_test_config "$CONFIG_FILE" "$user"
+  sed -i '/^media-key =/d' "$CONFIG_FILE"
+  parse_config "$CONFIG_FILE"
+  assert_eq 0 "${#CFG_MEDIA_KEYS[@]}"
+
+  write_test_config "$CONFIG_FILE" "$user"
+  sed -i 's#media-key = KEY_PLAYCD .*#media-key = KEY_PLAYCD ftp://other.example/action#' "$CONFIG_FILE"
+  if parse_config "$CONFIG_FILE"; then fail 'non-HTTP media URL was accepted'; fi
+  assert_contains "$CONFIG_ERROR" 'invalid media-key URL or placeholder'
+
+  write_test_config "$CONFIG_FILE" "$user"
+  sed -i 's#media-key = KEY_PLAYCD .*#media-key = KEY_PLAYCD //other.example/action#' "$CONFIG_FILE"
+  if parse_config "$CONFIG_FILE"; then fail 'scheme-relative media URL was accepted'; fi
+  assert_contains "$CONFIG_ERROR" 'invalid media-key URL or placeholder'
+
+  write_test_config "$CONFIG_FILE" "$user"
+  sed -i 's#media-key = KEY_PLAYCD .*#media-key = KEY_PLAYCD ../action#' "$CONFIG_FILE"
+  if parse_config "$CONFIG_FILE"; then fail 'parent-relative media URL was accepted'; fi
+  assert_contains "$CONFIG_ERROR" 'invalid media-key URL or placeholder'
+
+  write_test_config "$CONFIG_FILE" "$user"
+  sed -i 's#media-key = KEY_PLAYCD .*#media-key = KEY_PLAYCD ?action=next#' "$CONFIG_FILE"
+  if parse_config "$CONFIG_FILE"; then fail 'query-only media URL was accepted'; fi
+  assert_contains "$CONFIG_ERROR" 'invalid media-key URL or placeholder'
+
+  write_test_config "$CONFIG_FILE" "$user"
+  sed -i 's#base-url = .*#base-url = http://127.0.0.1:32500/api?bad=yes#' "$CONFIG_FILE"
+  if parse_config "$CONFIG_FILE"; then fail 'base-url query was accepted'; fi
+  assert_contains "$CONFIG_ERROR" 'without a query or fragment'
+
+  write_test_config "$CONFIG_FILE" "$user"
+  sed -i 's#base-url = .*#base-url = http://-bad.example:70000#' "$CONFIG_FILE"
+  if parse_config "$CONFIG_FILE"; then fail 'malformed base-url authority was accepted'; fi
+  assert_contains "$CONFIG_ERROR" 'base-url must be an HTTP or HTTPS URL'
+
+  write_test_config "$CONFIG_FILE" "$user"
+  sed -i 's#base-url = .*#base-url = http://[::::]:32500#' "$CONFIG_FILE"
+  if parse_config "$CONFIG_FILE"; then fail 'malformed IPv6 authority was accepted'; fi
+  assert_contains "$CONFIG_ERROR" 'base-url must be an HTTP or HTTPS URL'
+
+  write_test_config "$CONFIG_FILE" "$user"
+  sed -i 's#base-url = .*#base-url = http://localhost/bad%path#' "$CONFIG_FILE"
+  if parse_config "$CONFIG_FILE"; then fail 'malformed base-url path was accepted'; fi
+  assert_contains "$CONFIG_ERROR" 'base-url must be an HTTP or HTTPS URL'
+
+  write_test_config "$CONFIG_FILE" "$user"
+  sed -i 's/{command-id}/{unknown}/' "$CONFIG_FILE"
+  if parse_config "$CONFIG_FILE"; then fail 'unknown URL placeholder was accepted'; fi
+  assert_contains "$CONFIG_ERROR" 'invalid media-key URL or placeholder'
+
+  write_test_config "$CONFIG_FILE" "$user"
+  sed -i '/^base-url =/d; /^media-key =/d' "$CONFIG_FILE"
+  printf 'media-key = KEY_VOLUMEUP https://player.example/set?volume={volume-up}\n' >> "$CONFIG_FILE"
+  if parse_config "$CONFIG_FILE"; then fail 'stateful placeholder without base-url was accepted'; fi
+  assert_contains "$CONFIG_ERROR" 'stateful media-key placeholder requires base-url'
+
+  write_test_config "$CONFIG_FILE" "$user"
+  sed -i 's#{command-id}#{volume-up}\&down={volume-down}#' "$CONFIG_FILE"
+  if parse_config "$CONFIG_FILE"; then fail 'multiple stateful placeholders were accepted'; fi
+  assert_contains "$CONFIG_ERROR" 'invalid media-key URL or placeholder'
+
+  write_test_config "$CONFIG_FILE" "$user"
+  {
+    printf 'media-key = KEY_CUSTOM https://other.example/'
+    printf '\a'
+    printf 'action\n'
+  } >> "$CONFIG_FILE"
+  if parse_config "$CONFIG_FILE"; then fail 'control character in URL was accepted'; fi
+  assert_contains "$CONFIG_ERROR" 'invalid media-key URL or placeholder'
+
+  write_test_config "$CONFIG_FILE" "$user"
+  printf 'player-url = http://legacy.example\n' >> "$CONFIG_FILE"
+  if parse_config "$CONFIG_FILE"; then fail 'removed player-url setting was accepted'; fi
+  assert_contains "$CONFIG_ERROR" 'unknown setting: player-url'
+}
+
+test_generated_integration_files() {
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  install -d "$(dirname "$WIREPLUMBER_CONF")" "$(dirname "$TRIGGER_CONF")" "$(dirname "$SYSTEMD_UNIT")"
+  CFG_MEDIA_KEYS=(KEY_NEXTSONG KEY_PREVIOUSSONG)
+  CFG_MEDIA_URLS=(
+    '/next?commandID={command-id}'
+    'https://other.example/previous'
+  )
+  write_wireplumber_config "$WIREPLUMBER_CONF"
+  write_trigger_config "$TRIGGER_CONF" auto
+  write_systemd_unit "$SYSTEMD_UNIT"
+  assert_file_contains "$WIREPLUMBER_CONF" 'monitor.bluez.seat-monitoring = disabled'
+  assert_file_not_contains "$WIREPLUMBER_CONF" 'bluez5.codecs'
+  assert_file_contains "$TRIGGER_CONF" 'a2dpilot player-control KEY_NEXTSONG'
+  assert_file_contains "$TRIGGER_CONF" 'a2dpilot player-control KEY_PREVIOUSSONG'
+  assert_file_not_contains "$TRIGGER_CONF" 'https://other.example'
+  assert_file_contains "$SYSTEMD_UNIT" 'ExecStart='
+  assert_file_contains "$SYSTEMD_UNIT" 'a2dpilot daemon'
+  assert_file_contains "$SYSTEMD_UNIT" 'RuntimeDirectory=a2dpilot'
+  assert_file_contains "$SYSTEMD_UNIT" 'RuntimeDirectoryPreserve=restart'
+  assert_file_contains "$SYSTEMD_UNIT" "ExecStartPre=/usr/bin/install -d -o $MEDIA_RUNTIME_USER"
+  assert_file_contains "$SYSTEMD_UNIT" 'Before=triggerhappy.service'
+
+  write_trigger_config "$TRIGGER_CONF" off
+  assert_file_contains "$TRIGGER_CONF" 'media controls are disabled'
+  assert_file_not_contains "$TRIGGER_CONF" 'KEY_NEXTSONG'
+
+  CFG_MEDIA_KEYS=()
+  CFG_MEDIA_URLS=()
+  write_trigger_config "$TRIGGER_CONF" required
+  assert_file_contains "$TRIGGER_CONF" 'no media-key mappings are configured'
+}
+
+test_trigger_config_rejects_symlinked_parent() {
+  local parent redirected
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  parent=$(dirname "$TRIGGER_CONF")
+  redirected=$TEST_SCRATCH/redirected-trigger-config
+  install -d "$(dirname "$parent")" "$redirected"
+  ln -s "$redirected" "$parent"
+  CFG_MEDIA_KEYS=(KEY_PLAYCD)
+  CFG_MEDIA_URLS=('/player/playback/playPause')
+  systemctl() { printf '%s\n' "$*" >> "$TEST_SCRATCH/systemctl.log"; }
+
+  expect_failure_contains 'Refusing to traverse symlinked directory' apply_trigger_config auto
+  [[ -z $(find "$redirected" -mindepth 1 -print -quit) ]] || \
+    fail 'apply_trigger_config wrote through its symlinked parent'
+  [[ ! -e $TEST_SCRATCH/systemctl.log ]] || \
+    fail 'apply_trigger_config restarted Triggerhappy after rejecting the parent'
+}
+
+test_noninteractive_install_and_uninstall_fixture() {
+  local user apt_log output
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  apt_log=$TEST_SCRATCH/apt.log
+
+  require_root() { :; }
+  acquire_lock() { :; }
+  release_lock() { :; }
+  has_tty() { return 1; }
+  install() {
+    local -a forwarded=()
+    while [[ $# -gt 0 ]]; do
+      case $1 in
+        -o|-g) shift 2 ;;
+        *) forwarded+=("$1"); shift ;;
+      esac
+    done
+    /usr/bin/install "${forwarded[@]}"
+  }
+  chown() { :; }
+  record_system_service_states() { : > "$STATE_DIR/system-service-states"; }
+  record_user_state() { :; }
+  record_rfkill_state() { : > "$STATE_DIR/rfkill-state"; }
+  record_controller_state() { : > "$STATE_DIR/controller-state"; }
+  dpkg-query() { return 1; }
+  apt-get() { printf '%s\n' "$*" >> "$apt_log"; }
+  systemctl() { printf '%s\n' "$*" >> "$TEST_SCRATCH/systemctl.log"; }
+  ensure_audio_user() { :; }
+  power_controller() { :; }
+
+  output=$(install_action --user "$user" --non-interactive)
+  assert_contains "$output" 'installed successfully'
+  [[ -x $INSTALLED_CLI ]] || fail 'installer did not persist the executable'
+  bash -n "$INSTALLED_CLI"
+  parse_config "$CONFIG_FILE"
+  assert_eq "$user" "$CFG_AUDIO_USER"
+  assert_eq 0 "${#CFG_SPEAKERS[@]}"
+  assert_eq http://127.0.0.1:32500 "$CFG_BASE_URL"
+  assert_eq 20 "${#CFG_MEDIA_KEYS[@]}"
+  assert_file_contains "$SYSTEMD_UNIT" "$INSTALLED_CLI daemon"
+  assert_file_contains "$TRIGGER_CONF" 'player-control KEY_PLAYCD'
+  assert_file_not_contains "$TRIGGER_CONF" 'commandID='
+  assert_file_contains "$STATE_FILE" 'INSTALL_PHASE=installed'
+  assert_file_contains "$apt_log" 'install -y --no-install-recommends'
+  assert_file_contains "$STATE_DIR/new-packages" rfkill
+  assert_file_contains "$TEST_SCRATCH/systemctl.log" \
+    'enable --now bluetooth.service triggerhappy.service triggerhappy.socket a2dpilot.service'
+
+  restore_all_user_states() { :; }
+  restore_controller_state() { :; }
+  restore_rfkill_state() { :; }
+  restore_system_service_states() { :; }
+  output=$(uninstall_action --keep-bonds)
+  assert_contains "$output" 'prior system state was restored'
+  [[ ! -e $INSTALLED_CLI ]] || fail 'created executable survived uninstall'
+  [[ ! -e $CONFIG_FILE ]] || fail 'created configuration survived uninstall'
+  [[ ! -e $STATE_DIR ]] || fail 'rollback state survived successful uninstall'
+  assert_file_contains "$apt_log" 'remove -y'
+}
+
+test_config_editor_success_and_validation_failure() {
+  local user candidate before output rc
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  write_test_config "$CONFIG_FILE" "$user"
+  : > "$STATE_FILE"
+  candidate=$TEST_SCRATCH/candidate
+  write_test_config "$candidate" "$user" AA:BB:CC:DD:EE:FF
+  before=$TEST_SCRATCH/before
+  cp "$CONFIG_FILE" "$before"
+
+  require_root() { :; }
+  acquire_lock() { :; }
+  release_lock() { :; }
+  chown() { :; }
+  run_editor() { cp "$candidate" "$1"; }
+  atomic_install_file() { cp "$1" "$2"; }
+  reconcile_runtime_configuration() { :; }
+  systemctl() { :; }
+  SUDO_USER=$user
+
+  config_action
+  parse_config "$CONFIG_FILE"
+  assert_eq AA:BB:CC:DD:EE:FF "${CFG_SPEAKERS[0]}"
+
+  cp "$before" "$CONFIG_FILE"
+  printf 'not valid\n' > "$candidate"
+  set +e
+  output=$(config_action 2>&1)
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'invalid editor content was installed'
+  assert_contains "$output" 'expected key = value'
+  cmp -s "$before" "$CONFIG_FILE" || fail 'invalid edit changed the live configuration'
+
+  run_editor() { rm -f -- "$1"; ln -s /etc/passwd "$1"; }
+  set +e
+  output=$(config_action 2>&1)
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'symlinked editor candidate was installed'
+  assert_contains "$output" 'unsafe configuration candidate'
+  cmp -s "$before" "$CONFIG_FILE" || fail 'unsafe edit changed the live configuration'
+}
+
+test_config_editor_installs_protected_snapshot() {
+  local user candidate editor_path='' installed_source=''
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  write_test_config "$CONFIG_FILE" "$user"
+  : > "$STATE_FILE"
+  candidate=$TEST_SCRATCH/candidate
+  write_test_config "$candidate" "$user" AA:BB:CC:DD:EE:FF
+
+  require_root() { :; }
+  acquire_lock() { :; }
+  release_lock() { :; }
+  chown() { :; }
+  run_editor() {
+    editor_path=$1
+    cp "$candidate" "$editor_path"
+  }
+  atomic_install_file() {
+    installed_source=$1
+    [[ $installed_source != "$editor_path" ]] || {
+      fail 'configuration was installed from the editor-owned inode'
+      return 1
+    }
+    [[ ! -e $editor_path ]] || {
+      fail 'editor workspace remained reachable during installation'
+      return 1
+    }
+    cp "$installed_source" "$2"
+  }
+  reconcile_runtime_configuration() { :; }
+  systemctl() { :; }
+  SUDO_USER=$user
+
+  config_action
+  [[ $installed_source == "$STATE_DIR"/.a2dpilot-config-new.* ]] || \
+    fail 'configuration was not installed from protected state'
+  parse_config "$CONFIG_FILE"
+  assert_eq AA:BB:CC:DD:EE:FF "${CFG_SPEAKERS[0]}"
+}
+
+test_config_application_rolls_back() {
+  local user candidate before output rc restart_count=0
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  write_test_config "$CONFIG_FILE" "$user"
+  : > "$STATE_FILE"
+  candidate=$TEST_SCRATCH/candidate
+  write_test_config "$candidate" "$user" AA:BB:CC:DD:EE:FF
+  before=$TEST_SCRATCH/before
+  cp "$CONFIG_FILE" "$before"
+
+  require_root() { :; }
+  acquire_lock() { :; }
+  release_lock() { :; }
+  chown() { :; }
+  run_editor() { cp "$candidate" "$1"; }
+  atomic_install_file() { cp "$1" "$2"; }
+  reconcile_runtime_configuration() { :; }
+  systemctl() {
+    if [[ $* == 'restart a2dpilot.service' ]]; then
+      restart_count=$((restart_count + 1))
+      (( restart_count > 1 ))
+    fi
+  }
+  SUDO_USER=$user
+  set +e
+  output=$(config_action 2>&1)
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'fault-injected application unexpectedly succeeded'
+  assert_contains "$output" 'previous configuration was restored'
+  cmp -s "$before" "$CONFIG_FILE" || fail 'application rollback did not restore exact config'
+}
+
+test_player_control_resolves_configured_urls() {
+  local user mock_bin output rc mapped_url first_id second_id
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  write_test_config "$CONFIG_FILE" "$user"
+  sed -i 's#http://127.0.0.1:32500/#http://player.example:1234/api/#' "$CONFIG_FILE"
+  printf 'media-key = KEY_CUSTOM https://other.example/action?literal=yes\n' >> "$CONFIG_FILE"
+  printf 'media-key = KEY_MULTI https://other.example/{command-id}?id={command-id}\n' >> "$CONFIG_FILE"
+  mock_bin=$TEST_SCRATCH/bin
+  install -d "$mock_bin"
+  {
+    printf '%s\n' '#!/bin/sh'
+    printf '%s\n' 'printf "%s\n" "$@" > "$CURL_LOG"'
+  } > "$mock_bin/curl"
+  chmod 0755 "$mock_bin/curl"
+  (PATH="$mock_bin:$PATH" CURL_LOG="$TEST_SCRATCH/curl.log" player_control_action KEY_NEXTSONG)
+  assert_file_contains "$TEST_SCRATCH/curl.log" \
+    'http://player.example:1234/api/player/playback/skipNext?type=music&commandID='
+  assert_file_not_contains "$TEST_SCRATCH/curl.log" '{command-id}'
+
+  (PATH="$mock_bin:$PATH" CURL_LOG="$TEST_SCRATCH/curl.log" player_control_action KEY_CUSTOM)
+  assert_file_contains "$TEST_SCRATCH/curl.log" 'https://other.example/action?literal=yes'
+
+  (PATH="$mock_bin:$PATH" CURL_LOG="$TEST_SCRATCH/curl.log" player_control_action KEY_MULTI)
+  mapped_url=$(tail -n1 "$TEST_SCRATCH/curl.log")
+  assert_not_contains "$mapped_url" '{command-id}'
+  first_id=${mapped_url#https://other.example/}
+  first_id=${first_id%%\?*}
+  second_id=${mapped_url##*=}
+  assert_eq "$first_id" "$second_id"
+
+  rm -f -- "$TEST_SCRATCH/curl.log"
+  set +e
+  output=$(PATH="$mock_bin:$PATH" CURL_LOG="$TEST_SCRATCH/curl.log" \
+    player_control_action KEY_MISSING 2>&1)
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'unmapped media key unexpectedly succeeded'
+  assert_contains "$output" 'No valid media URL is configured for KEY_MISSING'
+  [[ ! -e $TEST_SCRATCH/curl.log ]] || fail 'curl ran for an unmapped media key'
+}
+
+test_player_control_resolves_stateful_media_keys() {
+  local user mock_bin output rc mute_state
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  write_default_config "$CONFIG_FILE" "$user"
+  mock_bin=$TEST_SCRATCH/bin
+  install -d "$mock_bin"
+  {
+    printf '%s\n' '#!/bin/sh'
+    printf '%s\n' 'for argument do url=$argument; done'
+    printf '%s\n' 'case $url in'
+    printf '%s\n' '  */player/timeline/poll\?*)'
+    printf '%s\n' '    printf "poll %s\n" "$*" >> "$CURL_LOG"'
+    printf '%s\n' '    printf "<MediaContainer><Timeline type=\"music\" volume=\"%s\" shuffle=\"%s\" repeat=\"%s\" /></MediaContainer>\n" "${TIMELINE_VOLUME:-50}" "${TIMELINE_SHUFFLE:-0}" "${TIMELINE_REPEAT:-0}"'
+    printf '%s\n' '    ;;'
+    printf '%s\n' '  *)'
+    printf '%s\n' '    printf "request %s\n" "$url" >> "$CURL_LOG"'
+    printf '%s\n' '    [ "${FINAL_REQUEST_FAIL:-0}" = 0 ]'
+    printf '%s\n' '    ;;'
+    printf '%s\n' 'esac'
+  } > "$mock_bin/curl"
+  chmod 0755 "$mock_bin/curl"
+  acquire_media_lock() { printf 'acquire\n' >> "$TEST_SCRATCH/media-lock.log"; }
+  release_media_lock() { printf 'release\n' >> "$TEST_SCRATCH/media-lock.log"; }
+
+  (PATH="$mock_bin:$PATH" CURL_LOG="$TEST_SCRATCH/curl.log" TIMELINE_VOLUME=98 \
+    player_control_action KEY_VOLUMEUP)
+  assert_file_contains "$TEST_SCRATCH/curl.log" 'X-Plex-Client-Identifier: a2dpilot'
+  assert_file_contains "$TEST_SCRATCH/curl.log" \
+    'request http://127.0.0.1:32500/player/playback/setParameters?type=music&volume=100&commandID='
+
+  (PATH="$mock_bin:$PATH" CURL_LOG="$TEST_SCRATCH/curl.log" TIMELINE_VOLUME=2 \
+    player_control_action KEY_VOLUMEDOWN)
+  assert_file_contains "$TEST_SCRATCH/curl.log" \
+    'request http://127.0.0.1:32500/player/playback/setParameters?type=music&volume=0&commandID='
+
+  (PATH="$mock_bin:$PATH" CURL_LOG="$TEST_SCRATCH/curl.log" TIMELINE_VOLUME=63 \
+    player_control_action KEY_MUTE)
+  assert_file_contains "$TEST_SCRATCH/curl.log" \
+    'request http://127.0.0.1:32500/player/playback/setParameters?type=music&volume=0&commandID='
+  parse_config "$CONFIG_FILE"
+  mute_state=$(media_mute_state_path)
+  assert_file_contains "$mute_state" '63'
+
+  (PATH="$mock_bin:$PATH" CURL_LOG="$TEST_SCRATCH/curl.log" TIMELINE_VOLUME=0 \
+    player_control_action KEY_MUTE)
+  assert_file_contains "$TEST_SCRATCH/curl.log" \
+    'request http://127.0.0.1:32500/player/playback/setParameters?type=music&volume=63&commandID='
+  [[ ! -e $mute_state ]] || fail 'successful unmute retained the saved volume'
+
+  (PATH="$mock_bin:$PATH" CURL_LOG="$TEST_SCRATCH/curl.log" TIMELINE_VOLUME=0 \
+    player_control_action KEY_MUTE)
+  assert_file_contains "$TEST_SCRATCH/curl.log" \
+    'request http://127.0.0.1:32500/player/playback/setParameters?type=music&volume=15&commandID='
+
+  (PATH="$mock_bin:$PATH" CURL_LOG="$TEST_SCRATCH/curl.log" TIMELINE_VOLUME=42 \
+    player_control_action KEY_MUTE)
+  [[ -f $mute_state ]] || fail 'mute did not save its pre-mute volume'
+  (PATH="$mock_bin:$PATH" CURL_LOG="$TEST_SCRATCH/curl.log" TIMELINE_VOLUME=0 \
+    player_control_action KEY_VOLUMEUP)
+  [[ ! -e $mute_state ]] || fail 'volume-up from zero retained the saved mute volume'
+
+  (PATH="$mock_bin:$PATH" CURL_LOG="$TEST_SCRATCH/curl.log" TIMELINE_VOLUME=54 \
+    player_control_action KEY_MUTE)
+  set +e
+  PATH="$mock_bin:$PATH" CURL_LOG="$TEST_SCRATCH/curl.log" TIMELINE_VOLUME=0 \
+    FINAL_REQUEST_FAIL=1 player_control_action KEY_MUTE
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'fault-injected unmute unexpectedly succeeded'
+  assert_file_contains "$mute_state" '54'
+
+  (PATH="$mock_bin:$PATH" CURL_LOG="$TEST_SCRATCH/curl.log" TIMELINE_SHUFFLE=0 \
+    player_control_action KEY_SHUFFLE)
+  assert_file_contains "$TEST_SCRATCH/curl.log" \
+    'request http://127.0.0.1:32500/player/playback/setParameters?type=music&shuffle=1&commandID='
+
+  (PATH="$mock_bin:$PATH" CURL_LOG="$TEST_SCRATCH/curl.log" TIMELINE_REPEAT=2 \
+    player_control_action KEY_MEDIA_REPEAT)
+  assert_file_contains "$TEST_SCRATCH/curl.log" \
+    'request http://127.0.0.1:32500/player/playback/setParameters?type=music&repeat=1&commandID='
+
+  set +e
+  output=$(PATH="$mock_bin:$PATH" CURL_LOG="$TEST_SCRATCH/curl.log" TIMELINE_VOLUME=101 \
+    player_control_action KEY_VOLUMEUP 2>&1)
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'out-of-range timeline volume was accepted'
+  assert_contains "$output" 'No valid media URL is configured for KEY_VOLUMEUP'
+  assert_file_contains "$TEST_SCRATCH/media-lock.log" 'acquire'
+  assert_file_contains "$TEST_SCRATCH/media-lock.log" 'release'
+}
+
+test_mute_state_rejects_symlinked_parent() {
+  local user redirected
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  write_default_config "$CONFIG_FILE" "$user"
+  parse_config "$CONFIG_FILE"
+  acquire_media_lock
+  [[ -n $MEDIA_LOCK_FD ]] || fail 'media lock did not retain a descriptor'
+  assert_eq 600 "$(stat -c %a "$MEDIA_LOCK_FILE")"
+  release_media_lock
+  [[ -z $MEDIA_LOCK_FD ]] || fail 'media lock descriptor was not released'
+  rm -f -- "$MEDIA_LOCK_FILE"
+  rmdir -- "$MEDIA_STATE_DIR"
+  redirected=$TEST_SCRATCH/redirected-media-state
+  install -d "$(dirname "$MEDIA_STATE_DIR")" "$redirected"
+  ln -s "$redirected" "$MEDIA_STATE_DIR"
+  expect_failure_contains 'Refusing to traverse symlinked directory' read_media_mute_volume
+  expect_failure_contains 'Refusing to traverse symlinked directory' write_media_mute_volume 70
+  [[ -z $(find "$redirected" -mindepth 1 -print -quit) ]] || \
+    fail 'mute state was written through its symlinked parent'
+}
+
+test_status_reports_media_url_configuration() {
+  local user output
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  write_test_config "$CONFIG_FILE" "$user"
+  require_root() { :; }
+  rfkill() { :; }
+  systemctl() { :; }
+  as_user_systemctl() { :; }
+  output=$(status_action)
+  assert_contains "$output" 'Base URL: http://127.0.0.1:32500'
+  assert_contains "$output" 'Media key mappings: 4'
+}
+
+test_pairing_provenance_and_existing_bond() {
+  local user mac=AA:BB:CC:DD:EE:FF paired=0 trusted=0
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  write_test_config "$CONFIG_FILE" "$user"
+  parse_config "$CONFIG_FILE"
+  : > "$STATE_DIR/created-bonds"
+  atomic_install_file() { cp "$1" "$2"; }
+  has_tty() { return 1; }
+  scan_bredr() { :; }
+  configured_controller_address() { printf '12:34:56:78:9A:BC\n'; }
+  device_paired() { (( paired )); }
+  device_trusted() { (( trusted )); }
+  wait_for_device_connection() { return 0; }
+  systemctl() { :; }
+  bluetoothctl() {
+    printf '%s\n' "$*" >> "$TEST_SCRATCH/bluetooth.log"
+    if [[ $* == *' pair '* ]]; then paired=1; trusted=1; fi
+    if [[ $* == *' trust '* ]]; then trusted=1; fi
+    return 0
+  }
+
+  pair_one "$mac" NoInputNoOutput
+  assert_file_contains "$STATE_DIR/created-bonds" "12:34:56:78:9A:BC $mac"
+  assert_file_contains "$TEST_SCRATCH/bluetooth.log" "pair $mac"
+  parse_config "$CONFIG_FILE"
+  assert_eq "$mac" "${CFG_SPEAKERS[0]}"
+
+  : > "$TEST_SCRATCH/bluetooth.log"
+  : > "$STATE_DIR/created-bonds"
+  trusted=0
+  pair_one "$mac" NoInputNoOutput
+  assert_file_not_contains "$TEST_SCRATCH/bluetooth.log" "pair $mac"
+  assert_file_contains "$TEST_SCRATCH/bluetooth.log" "trust $mac"
+  [[ ! -s $STATE_DIR/created-bonds ]] || fail 'existing bond was recorded as A2DPilot-created'
+}
+
+test_pair_all_attempts_every_configured_speaker() {
+  local user first=AA:BB:CC:DD:EE:01 second=AA:BB:CC:DD:EE:02 output rc
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  CFG_CONTROLLER=auto
+  user=$(id -un)
+  write_test_config "$CONFIG_FILE" "$user" "$first" "$second"
+  : > "$STATE_FILE"
+  require_root() { :; }
+  acquire_lock() { :; }
+  release_lock() { :; }
+  power_controller() { :; }
+  pair_one() {
+    printf '%s\n' "$1" >> "$TEST_SCRATCH/pair-order"
+    [[ $1 != "$first" ]]
+  }
+  systemctl() { :; }
+  set +e
+  output=$(pair_action --all 2>&1)
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'partial --all pairing failure reported success'
+  assert_contains "$output" "Could not provision $first"
+  assert_eq "$first" "$(sed -n '1p' "$TEST_SCRATCH/pair-order")"
+  assert_eq "$second" "$(sed -n '2p' "$TEST_SCRATCH/pair-order")"
+}
+
+test_interactive_scan_selection() {
+  local -a answers=(1 '')
+  local answer_index=0
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  CFG_CONTROLLER=auto
+  scan_bredr() { :; }
+  tty_print() { :; }
+  tty_read() {
+    printf -v "$1" '%s' "${answers[$answer_index]}"
+    answer_index=$((answer_index + 1))
+  }
+  bluetoothctl() {
+    if [[ ${1:-} == devices ]]; then
+      printf 'Device AA:BB:CC:DD:EE:FF Kitchen Speaker\n'
+      printf 'Device 10:20:30:40:50:60 Other Device\n'
+    fi
+  }
+  pair_one() { printf '%s %s\n' "$1" "$2" >> "$TEST_SCRATCH/selected"; }
+  interactive_pair_loop KeyboardDisplay
+  assert_file_contains "$TEST_SCRATCH/selected" 'AA:BB:CC:DD:EE:FF KeyboardDisplay'
+  assert_eq 1 "$(wc -l < "$TEST_SCRATCH/selected")"
+}
+
+test_forget_removes_config_and_provenance() {
+  local user mac=AA:BB:CC:DD:EE:FF present=1 recorded_present=1
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  write_test_config "$CONFIG_FILE" "$user" "$mac" 10:20:30:40:50:60
+  printf '12:34:56:78:9A:BC %s\n' "$mac" > "$STATE_DIR/created-bonds"
+  : > "$STATE_FILE"
+  require_root() { :; }
+  acquire_lock() { :; }
+  release_lock() { :; }
+  atomic_install_file() { cp "$1" "$2"; }
+  device_info() { (( present )) && printf 'Paired: yes\n'; }
+  remove_bluetooth_device() {
+    present=0
+    printf 'current %s\n' "$1" >> "$TEST_SCRATCH/bluetooth.log"
+  }
+  device_info_on_controller() { (( recorded_present )); }
+  remove_bluetooth_device_on_controller() {
+    recorded_present=0
+    printf '%s %s\n' "$1" "$2" >> "$TEST_SCRATCH/bluetooth.log"
+  }
+  systemctl() { :; }
+  forget_action "$mac" --yes
+  parse_config "$CONFIG_FILE"
+  assert_eq 1 "${#CFG_SPEAKERS[@]}"
+  assert_eq 10:20:30:40:50:60 "${CFG_SPEAKERS[0]}"
+  [[ ! -s $STATE_DIR/created-bonds ]] || fail 'forgotten bond remained in provenance ledger'
+  assert_file_contains "$TEST_SCRATCH/bluetooth.log" "current $mac"
+  assert_file_contains "$TEST_SCRATCH/bluetooth.log" "12:34:56:78:9A:BC $mac"
+}
+
+test_media_control_health_modes() {
+  load_app
+  device_connected() { return 0; }
+  a2dp_connected() { return 0; }
+  avrcp_connected() { return 1; }
+  CFG_MEDIA_CONTROLS=auto
+  device_healthy AA:BB:CC:DD:EE:FF || fail 'auto mode required AVRCP'
+  CFG_MEDIA_CONTROLS=off
+  device_healthy AA:BB:CC:DD:EE:FF || fail 'off mode required AVRCP'
+  CFG_MEDIA_CONTROLS=required
+  if device_healthy AA:BB:CC:DD:EE:FF; then fail 'required mode ignored AVRCP'; fi
+}
+
+test_codec_reporting_is_optimistic() {
+  local user candidate_codec output
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  write_test_config "$CONFIG_FILE" "$user" AA:BB:CC:DD:EE:FF
+  require_root() { :; }
+  device_paired() { return 0; }
+  device_trusted() { return 0; }
+  device_connected() { return 0; }
+  a2dp_connected() { return 0; }
+  avrcp_connected() { return 1; }
+  device_name() { printf 'Test Speaker\n'; }
+  for candidate_codec in sbc sbc_xq aptx aptx_hd ldac mystery_codec; do
+    TEST_CODEC=$candidate_codec
+    a2dp_codec() { printf '%s\n' "$TEST_CODEC"; }
+    output=$(devices_action)
+    assert_contains "$output" "$candidate_codec"
+    assert_contains "$output" 'yes'
+  done
+}
+
+test_codec_property_parsing() {
+  local codec
+  load_app
+  CFG_AUDIO_USER=$(id -un)
+  find_a2dp_node_id() { printf '42\n'; }
+  user_wpctl() {
+    printf '  * api.bluez5.codec = "ldac"\n'
+  }
+  codec=$(a2dp_codec AA:BB:CC:DD:EE:FF)
+  assert_eq ldac "$codec"
+}
+
+test_daemon_nonpreemption_and_failover_order() {
+  local first=AA:BB:CC:DD:EE:01 second=AA:BB:CC:DD:EE:02
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  CFG_SPEAKERS=("$first" "$second")
+  CFG_RECONNECT_INTERVAL=5
+  CFG_MEDIA_CONTROLS=auto
+  CFG_CONTROLLER=auto
+  DAEMON_ACTIVE=$second
+  device_healthy() { [[ $1 == "$second" ]]; }
+  disconnect_other_speakers() { printf '%s\n' "$1" > "$TEST_SCRATCH/stale-cleanup"; }
+  bluetoothctl() { printf '%s\n' "$*" >> "$TEST_SCRATCH/bluetooth.log"; }
+  daemon_cycle
+  [[ ! -e $TEST_SCRATCH/bluetooth.log ]] || fail 'healthy fallback was preempted'
+  assert_eq "$second" "$(< "$TEST_SCRATCH/stale-cleanup")"
+  assert_eq "$second" "$DAEMON_ACTIVE"
+
+  DAEMON_ACTIVE=
+  DAEMON_FAILURES=()
+  DAEMON_NEXT_ATTEMPT=()
+  device_healthy() { return 1; }
+  device_paired() { return 0; }
+  device_trusted() { return 0; }
+  wait_for_health() { [[ $1 == "$second" ]]; }
+  disconnect_other_speakers() { :; }
+  a2dp_codec() { printf 'ldac\n'; }
+  now_seconds() { printf '100\n'; }
+  bluetoothctl() {
+    if [[ $* == *' connect '* ]]; then
+      printf '%s\n' "${*: -1}" >> "$TEST_SCRATCH/connect-order"
+      [[ ${*: -1} == "$second" ]]
+    else
+      return 0
+    fi
+  }
+  daemon_cycle >/dev/null
+  assert_eq "$first" "$(sed -n '1p' "$TEST_SCRATCH/connect-order")"
+  assert_eq "$second" "$(sed -n '2p' "$TEST_SCRATCH/connect-order")"
+  assert_eq "$second" "$DAEMON_ACTIVE"
+}
+
+test_daemon_disconnects_new_stale_connection() {
+  local stale=AA:BB:CC:DD:EE:01 active=AA:BB:CC:DD:EE:02
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  CFG_SPEAKERS=("$stale" "$active")
+  CFG_RECONNECT_INTERVAL=5
+  CFG_MEDIA_CONTROLS=auto
+  CFG_CONTROLLER=auto
+  DAEMON_ACTIVE=$active
+  device_healthy() { [[ $1 == "$active" ]]; }
+  device_connected() { [[ $1 == "$stale" ]]; }
+  disconnect_bluetooth_device() { printf '%s\n' "$1" >> "$TEST_SCRATCH/disconnected"; }
+
+  daemon_cycle
+  assert_eq "$stale" "$(< "$TEST_SCRATCH/disconnected")"
+  assert_eq "$active" "$DAEMON_ACTIVE"
+}
+
+test_daemon_reuses_connection_deadline() {
+  local mac=AA:BB:CC:DD:EE:FF
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  CFG_SPEAKERS=("$mac")
+  CFG_RECONNECT_INTERVAL=5
+  CFG_MEDIA_CONTROLS=auto
+  CFG_CONTROLLER=auto
+  DAEMON_ACTIVE=
+  DAEMON_FAILURES=()
+  DAEMON_NEXT_ATTEMPT=()
+  device_healthy() { return 1; }
+  device_paired() { return 0; }
+  device_trusted() { return 0; }
+  now_seconds() { printf '100\n'; }
+  bluetooth_device_command() {
+    printf '%s %s %s\n' "$1" "$2" "$3" > "$TEST_SCRATCH/connect-command"
+  }
+  wait_for_health() {
+    printf '%s\n' "${2:-missing}" > "$TEST_SCRATCH/health-deadline"
+    return 1
+  }
+
+  daemon_cycle >/dev/null
+  assert_eq "${CONNECT_TIMEOUT} connect $mac" "$(< "$TEST_SCRATCH/connect-command")"
+  assert_eq "$((100 + CONNECT_TIMEOUT))" "$(< "$TEST_SCRATCH/health-deadline")"
+}
+
+test_daemon_cooldown_and_backoff() {
+  local mac=AA:BB:CC:DD:EE:FF
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  CFG_SPEAKERS=("$mac")
+  CFG_RECONNECT_INTERVAL=5
+  CFG_MEDIA_CONTROLS=auto
+  CFG_CONTROLLER=auto
+  DAEMON_ACTIVE=
+  DAEMON_FAILURES=()
+  DAEMON_NEXT_ATTEMPT=()
+  device_healthy() { return 1; }
+  device_paired() { return 0; }
+  device_trusted() { return 0; }
+  now_seconds() { printf '100\n'; }
+  bluetoothctl() {
+    [[ $* == *' connect '* ]] && printf 'attempt\n' >> "$TEST_SCRATCH/attempts"
+    return 1
+  }
+  daemon_cycle >/dev/null
+  daemon_cycle >/dev/null
+  assert_eq 1 "$(wc -l < "$TEST_SCRATCH/attempts")"
+  assert_eq 5 "$(connection_backoff 1 5)"
+  assert_eq 10 "$(connection_backoff 2 5)"
+  assert_eq 60 "$(connection_backoff 9 5)"
+}
+
+test_daemon_disconnects_removed_active_speaker() {
+  local removed=AA:BB:CC:DD:EE:01 replacement=AA:BB:CC:DD:EE:02
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  printf '%s\n' "$removed" > "$STATE_DIR/active-speaker"
+  CFG_SPEAKERS=("$replacement")
+  CFG_RECONNECT_INTERVAL=5
+  CFG_MEDIA_CONTROLS=auto
+  CFG_CONTROLLER=auto
+  DAEMON_ACTIVE=
+  load_daemon_active
+  device_healthy() { [[ $1 == "$replacement" ]]; }
+  disconnect_bluetooth_device() {
+    printf 'disconnect %s\n' "$1" >> "$TEST_SCRATCH/bluetooth.log"
+  }
+  daemon_cycle
+  assert_file_contains "$TEST_SCRATCH/bluetooth.log" "disconnect $removed"
+  assert_eq "$replacement" "$DAEMON_ACTIVE"
+  assert_eq "$replacement" "$(< "$STATE_DIR/active-speaker")"
+}
+
+test_audio_user_reconciliation() {
+  local old_user=root new_user
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  new_user=$(id -un)
+  [[ $new_user != root ]] || old_user=nobody
+  printf '%s\n' "$old_user" > "$STATE_DIR/runtime-user"
+  id() { return 0; }
+  ensure_audio_user() { printf 'ensure %s\n' "$1" >> "$TEST_SCRATCH/users.log"; }
+  restore_user_state() { printf 'restore %s\n' "$1" >> "$TEST_SCRATCH/users.log"; }
+  reconcile_audio_user "$new_user"
+  assert_file_contains "$TEST_SCRATCH/users.log" "ensure $new_user"
+  assert_file_contains "$TEST_SCRATCH/users.log" "restore $old_user"
+  assert_eq "$new_user" "$(< "$STATE_DIR/runtime-user")"
+}
+
+test_rfkill_snapshot_restore_and_hard_block() {
+  local sysfs
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  sysfs=$TEST_SCRATCH/sys/class/rfkill
+  RFKILL_SYSFS=$sysfs
+  install -d "$sysfs/rfkill0" "$sysfs/rfkill1"
+  printf 'bluetooth\n' > "$sysfs/rfkill0/type"
+  printf 'adapter-one\n' > "$sysfs/rfkill0/name"
+  printf '1\n' > "$sysfs/rfkill0/soft"
+  printf '0\n' > "$sysfs/rfkill0/hard"
+  printf 'bluetooth\n' > "$sysfs/rfkill1/type"
+  printf 'adapter-two\n' > "$sysfs/rfkill1/name"
+  printf '0\n' > "$sysfs/rfkill1/soft"
+  printf '1\n' > "$sysfs/rfkill1/hard"
+  record_rfkill_state
+  rfkill() { printf '%s\n' "$*" >> "$TEST_SCRATCH/rfkill.log"; }
+  restore_rfkill_state
+  assert_file_contains "$TEST_SCRATCH/rfkill.log" 'block 0'
+  assert_file_contains "$TEST_SCRATCH/rfkill.log" 'unblock 1'
+  if hard_blocked; then fail 'one usable adapter was treated as globally hard-blocked'; fi
+  printf '1\n' > "$sysfs/rfkill0/hard"
+  hard_blocked || fail 'all-hard-blocked state was not detected'
+}
+
+test_controller_selection_and_power() {
+  local controller=12:34:56:78:9A:BC
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  CFG_CONTROLLER=$controller
+  hard_blocked() { return 1; }
+  controller_exists() { [[ $1 == "$controller" ]]; }
+  rfkill() { printf '%s\n' "$*" >> "$TEST_SCRATCH/rfkill.log"; }
+  bluetoothctl() {
+    if [[ ${1:-} == show ]]; then
+      printf '\tPowered: yes\n'
+    else
+      cat > "$TEST_SCRATCH/controller-input"
+    fi
+  }
+  power_controller
+  assert_file_contains "$TEST_SCRATCH/rfkill.log" 'unblock bluetooth'
+  assert_file_contains "$TEST_SCRATCH/controller-input" "select $controller"
+  assert_file_contains "$TEST_SCRATCH/controller-input" 'power on'
+}
+
+test_explicit_controller_scopes_device_operations() {
+  local controller=12:34:56:78:9A:BC mac=AA:BB:CC:DD:EE:FF devices
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  CFG_CONTROLLER=$controller
+  has_tty() { return 1; }
+  bluetoothctl() {
+    local input
+    if [[ ${1:-} == list ]]; then
+      printf 'Controller 00:11:22:33:44:55 First Adapter\n'
+      printf 'Controller %s Selected Adapter [default]\n' "$controller"
+      return 0
+    fi
+    input=$(cat)
+    printf '%s\n---\n' "$input" >> "$TEST_SCRATCH/controller-sessions"
+    case $input in
+      *"info $mac"*) printf 'Device %s Test Speaker\n\tPaired: yes\n' "$mac" ;;
+      *devices*) printf 'Device %s Test Speaker\n' "$mac" ;;
+      *"pair $mac"*) printf 'Pairing successful\n' ;;
+    esac
+  }
+  busctl() {
+    case $* in
+      'tree --list org.bluez')
+        printf '/org/bluez/hci0\n/org/bluez/hci7\n'
+        ;;
+      *'/org/bluez/hci0 org.bluez.Adapter1 Address')
+        printf 's "00:11:22:33:44:55"\n'
+        ;;
+      *'/org/bluez/hci7 org.bluez.Adapter1 Address')
+        printf 's "%s"\n' "$controller"
+        ;;
+      *"/org/bluez/hci7/dev_${mac//:/_} org.bluez.MediaControl1 Connected")
+        printf '%s\n' "$*" > "$TEST_SCRATCH/avrcp-path"
+        printf 'b true\n'
+        ;;
+      *) return 1 ;;
+    esac
+  }
+
+  device_info "$mac" >/dev/null
+  bluetooth_device_command 5 trust "$mac" >/dev/null
+  devices=$(configured_bluetooth_devices)
+  assert_contains "$devices" "$mac"
+  pair_on_controller "$mac" NoInputNoOutput >/dev/null
+  assert_eq 4 "$(grep -Fc "select $controller" "$TEST_SCRATCH/controller-sessions")"
+  assert_file_contains "$TEST_SCRATCH/controller-sessions" "info $mac"
+  assert_file_contains "$TEST_SCRATCH/controller-sessions" "trust $mac"
+  assert_file_contains "$TEST_SCRATCH/controller-sessions" "pair $mac"
+  avrcp_connected "$mac"
+  assert_file_contains "$TEST_SCRATCH/avrcp-path" "/org/bluez/hci7/dev_${mac//:/_}"
+  CFG_CONTROLLER=auto
+  assert_eq "$controller" "$(configured_controller_address)"
+}
+
+test_bond_policy_and_removal_aggregation() {
+  local output rc controller=12:34:56:78:9A:BC
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  printf '%s %s\n' "$controller" AA:BB:CC:DD:EE:01 > "$STATE_DIR/created-bonds"
+  printf '%s %s\n' "$controller" AA:BB:CC:DD:EE:02 >> "$STATE_DIR/created-bonds"
+  has_tty() { return 1; }
+  assert_eq keep "$(choose_bond_policy ask)"
+  assert_eq remove "$(choose_bond_policy remove)"
+
+  device_info_on_controller() { return 0; }
+  remove_bluetooth_device_on_controller() {
+    printf '%s %s\n' "$1" "$2" >> "$TEST_SCRATCH/bond-removals"
+    [[ $2 != AA:BB:CC:DD:EE:01 ]]
+  }
+  set +e
+  output=$(remove_created_bonds 2>&1)
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'partial bond removal reported success'
+  assert_contains "$output" 'Could not remove'
+  assert_file_contains "$TEST_SCRATCH/bond-removals" 'AA:BB:CC:DD:EE:01'
+  assert_file_contains "$TEST_SCRATCH/bond-removals" 'AA:BB:CC:DD:EE:02'
+
+  require_root() { :; }
+  : > "$STATE_FILE"
+  expect_failure_contains 'mutually exclusive' uninstall_action --keep-bonds --remove-bonds
+}
+
+test_managed_paths_and_state_serialization() {
+  local existing created mode
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  install -d "$(dirname "$INSTALLED_CLI")" "$(dirname "$SYSTEMD_UNIT")" \
+    "$(dirname "$WIREPLUMBER_CONF")" "$(dirname "$TRIGGER_CONF")"
+  : > "$STATE_DIR/created-files"
+  : > "$STATE_DIR/replaced-files"
+  existing=$CONFIG_FILE
+  created=$SYSTEMD_UNIT
+  printf 'original\n' > "$existing"
+  backup_file "$existing"
+  backup_file "$created"
+  assert_file_contains "$STATE_DIR/replaced-files" "$existing"
+  assert_file_contains "$STATE_DIR/created-files" "$created"
+  assert_file_contains "$BACKUP_DIR$existing" original
+
+  render_state_file "$STATE_FILE" installed
+  mode=$(stat -c %a "$STATE_FILE")
+  assert_eq 600 "$mode"
+  assert_file_contains "$STATE_FILE" 'INSTALL_PHASE=installed'
+
+  install -d "$TEST_SCRATCH/real" "$TEST_SCRATCH/target"
+  ln -s "$TEST_SCRATCH/target" "$TEST_SCRATCH/real/link"
+  expect_failure_contains 'Refusing to traverse symlinked directory' \
+    validate_directory_chain "$TEST_SCRATCH/real/link/child"
+  LOCK_FILE=$TEST_SCRATCH/real/link/lock
+  expect_failure_contains 'Refusing to traverse symlinked directory' prepare_lock_directory
+  if allowed_managed_path /tmp/not-managed; then fail 'arbitrary path passed allowlist'; fi
+}
+
+test_system_service_state_restoration() {
+  local expected
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  cat > "$STATE_DIR/system-service-states" <<'EOF'
+enabled.service enabled 1
+disabled.service disabled 0
+static.service static 1
+missing.service not-found 0
+EOF
+  systemctl() {
+    local action=$1 unit=${2:-}
+    if [[ $action == show ]]; then
+      if [[ $unit == missing.service ]]; then printf 'not-found\n'; else printf 'loaded\n'; fi
+      return 0
+    fi
+    printf '%s\n' "$*" >> "$TEST_SCRATCH/systemctl.log"
+  }
+  restore_system_service_states
+  expected=$TEST_SCRATCH/expected
+  cat > "$expected" <<'EOF'
+enable enabled.service
+start enabled.service
+disable disabled.service
+stop disabled.service
+start static.service
+EOF
+  diff -u "$expected" "$TEST_SCRATCH/systemctl.log"
+}
+
+run_test 'syntax, help, and streamed bootstrap' test_syntax_help_and_stream_bootstrap
+run_test 'managed dependency list' test_managed_package_list
+run_test 'configuration parsing and normalization' test_config_parser_and_normalization
+run_test 'default media-key mappings' test_default_media_key_mappings
+run_test 'configuration rejection and non-evaluation' test_config_parser_rejections_and_no_eval
+run_test 'invalid reload retains last valid configuration' test_invalid_reload_retains_last_valid_configuration
+run_test 'media URL configuration validation' test_media_url_configuration_validation
+run_test 'generated system integration files' test_generated_integration_files
+run_test 'Triggerhappy config rejects symlinked parent' test_trigger_config_rejects_symlinked_parent
+run_test 'non-interactive install and uninstall fixture' test_noninteractive_install_and_uninstall_fixture
+run_test 'safe config editor success and validation failure' test_config_editor_success_and_validation_failure
+run_test 'config editor installs a protected snapshot' test_config_editor_installs_protected_snapshot
+run_test 'failed config application restores previous config' test_config_application_rolls_back
+run_test 'player control resolves configured URLs' test_player_control_resolves_configured_urls
+run_test 'player control resolves stateful media keys' test_player_control_resolves_stateful_media_keys
+run_test 'mute state rejects symlinked parent' test_mute_state_rejects_symlinked_parent
+run_test 'status reports media URL configuration' test_status_reports_media_url_configuration
+run_test 'pairing provenance and existing bonds' test_pairing_provenance_and_existing_bond
+run_test 'pair --all attempts every configured speaker' test_pair_all_attempts_every_configured_speaker
+run_test 'interactive scan selection' test_interactive_scan_selection
+run_test 'forget removes config and provenance' test_forget_removes_config_and_provenance
+run_test 'media-control health modes' test_media_control_health_modes
+run_test 'optimistic codec reporting' test_codec_reporting_is_optimistic
+run_test 'PipeWire codec property parsing' test_codec_property_parsing
+run_test 'non-preemptive failover order' test_daemon_nonpreemption_and_failover_order
+run_test 'healthy active speaker disconnects new stale connections' test_daemon_disconnects_new_stale_connection
+run_test 'connection health reuses the original deadline' test_daemon_reuses_connection_deadline
+run_test 'daemon cooldown and bounded backoff' test_daemon_cooldown_and_backoff
+run_test 'removed active speaker is disconnected after restart' test_daemon_disconnects_removed_active_speaker
+run_test 'audio-user reconciliation' test_audio_user_reconciliation
+run_test 'rfkill snapshot, restore, and hard blocks' test_rfkill_snapshot_restore_and_hard_block
+run_test 'controller selection and power control' test_controller_selection_and_power
+run_test 'explicit controller scopes device operations' test_explicit_controller_scopes_device_operations
+run_test 'bond policy and removal aggregation' test_bond_policy_and_removal_aggregation
+run_test 'managed path and private state safety' test_managed_paths_and_state_serialization
+run_test 'system service restoration' test_system_service_state_restoration
+
+if (( TESTS_FAILED > 0 )); then
+  printf '%d of %d tests failed\n' "$TESTS_FAILED" "$TESTS_RUN" >&2
+  exit 1
+fi
+printf 'All %d tests passed\n' "$TESTS_RUN"

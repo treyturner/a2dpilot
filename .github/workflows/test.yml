@@ -1,0 +1,38 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Bash and regression tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends shellcheck
+
+      - name: Check Bash syntax
+        run: bash -n a2dpilot tests/a2dpilot_test.sh
+
+      - name: Run ShellCheck
+        run: shellcheck -x a2dpilot tests/a2dpilot_test.sh
+
+      - name: Run regression tests
+        run: ./tests/a2dpilot_test.sh

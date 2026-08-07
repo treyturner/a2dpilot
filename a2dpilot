@@ -1,0 +1,2415 @@
+#!/usr/bin/env bash
+
+# When Bash reads this program from stdin, preserve the unread application body
+# in a real file and re-execute it. This makes curl | sudo bash installs able to
+# copy the complete application to its permanent location.
+if [[ -z ${BASH_SOURCE[0]:-} ]]; then
+  a2dpilot_stream_tmp=$(mktemp "/tmp/a2dpilot-stream.XXXXXX") || exit 1
+  trap 'rm -f -- "$a2dpilot_stream_tmp"' EXIT
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    dd status=none
+  } > "$a2dpilot_stream_tmp" || exit 1
+  chmod 0700 "$a2dpilot_stream_tmp" || exit 1
+  "$a2dpilot_stream_tmp" "$@"
+  exit $?
+fi
+
+set -Eeuo pipefail
+
+SCRIPT_PATH=$(readlink -f -- "${BASH_SOURCE[0]}")
+INSTALLED_CLI=/usr/local/sbin/a2dpilot
+CONFIG_FILE=/etc/a2dpilot.conf
+STATE_DIR=/var/lib/a2dpilot
+BACKUP_DIR=$STATE_DIR/backup
+STATE_FILE=$STATE_DIR/state
+SYSTEMD_UNIT=/etc/systemd/system/a2dpilot.service
+WIREPLUMBER_CONF=/etc/wireplumber/wireplumber.conf.d/51-a2dpilot.conf
+TRIGGER_CONF=/etc/triggerhappy/triggers.d/a2dpilot.conf
+LOCK_FILE=/run/lock/a2dpilot/lock
+MEDIA_LOCK_FILE=/run/a2dpilot/media.lock
+MEDIA_STATE_DIR=/run/a2dpilot
+# Debian's triggerhappy.service drops handler processes to this account.
+MEDIA_RUNTIME_USER=nobody
+RFKILL_SYSFS=/sys/class/rfkill
+CONNECT_TIMEOUT=10
+SCAN_TIMEOUT=15
+VOLUME_STEP=5
+
+PACKAGES=(
+  bluez
+  bluez-firmware
+  pipewire
+  pipewire-alsa
+  pipewire-pulse
+  wireplumber
+  libspa-0.2-bluetooth
+  rtkit
+  triggerhappy
+  curl
+  rfkill
+)
+
+USER_UNITS=(
+  pipewire.service
+  pipewire.socket
+  pipewire-pulse.service
+  pipewire-pulse.socket
+  wireplumber.service
+)
+
+SYSTEM_UNITS=(
+  bluetooth.service
+  triggerhappy.service
+  triggerhappy.socket
+  a2dpilot.service
+)
+
+CFG_AUDIO_USER=
+CFG_CONTROLLER=
+CFG_RECONNECT_INTERVAL=
+CFG_MEDIA_CONTROLS=
+CFG_BASE_URL=
+CFG_SPEAKERS=()
+CFG_MEDIA_KEYS=()
+CFG_MEDIA_URLS=()
+CONFIG_ERROR=
+LOCK_FD=
+MEDIA_LOCK_FD=
+RESOLVED_MEDIA_URL=
+EXPANDED_MEDIA_TEMPLATE=
+MEDIA_STATE_ACTION=
+
+declare -gA DAEMON_FAILURES=()
+declare -gA DAEMON_NEXT_ATTEMPT=()
+DAEMON_ACTIVE=
+DAEMON_LAST_CONFIG_ERROR=
+DAEMON_HAVE_CONFIG=0
+
+usage() {
+  cat <<'EOF'
+Usage:
+  sudo a2dpilot install [--user USER] [--non-interactive]
+  sudo a2dpilot config [--check]
+  sudo a2dpilot devices
+  sudo a2dpilot pair [MAC | --all] [--agent CAPABILITY]
+  sudo a2dpilot forget MAC [--yes]
+  sudo a2dpilot status
+  sudo a2dpilot uninstall [--keep-bonds | --remove-bonds]
+
+Internal integration commands:
+  a2dpilot daemon
+  a2dpilot player-control KEY_NAME
+
+Configuration: /etc/a2dpilot.conf
+EOF
+}
+
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+note() { printf '%s\n' "$*"; }
+warn() { printf 'Warning: %s\n' "$*" >&2; }
+
+require_root() {
+  [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Run this command with sudo."
+}
+
+has_tty() {
+  [[ -t 1 || -t 2 ]] && [[ -r /dev/tty && -w /dev/tty ]]
+}
+
+tty_print() {
+  # shellcheck disable=SC2059 # This wrapper intentionally accepts printf arguments.
+  printf "$@" > /dev/tty
+}
+
+tty_read() {
+  local variable=$1
+  # shellcheck disable=SC2229 # Bash read accepts a variable name here.
+  IFS= read -r "$variable" < /dev/tty
+}
+
+prepare_lock_directory() {
+  local directory owner
+  directory=$(dirname "$LOCK_FILE")
+  validate_directory_chain "$directory"
+  if [[ ! -e $directory ]]; then
+    mkdir -m 0755 -- "$directory" 2>/dev/null || true
+  fi
+  [[ -d $directory && ! -L $directory ]] || die "Unsafe lock directory: $directory"
+  owner=$(stat -c %u "$directory")
+  [[ $owner == 0 ]] || die "Lock directory must be owned by root: $directory"
+  chmod 0755 "$directory"
+  [[ ! -e $LOCK_FILE || -f $LOCK_FILE && ! -L $LOCK_FILE ]] || \
+    die "Unsafe lock file: $LOCK_FILE"
+}
+
+acquire_lock() {
+  local timeout=${1:-} previous_umask
+  prepare_lock_directory
+  previous_umask=$(umask)
+  umask 077
+  if ! exec {LOCK_FD}> "$LOCK_FILE"; then
+    umask "$previous_umask"
+    return 1
+  fi
+  umask "$previous_umask"
+  chmod 0600 "$LOCK_FILE"
+  if [[ -n $timeout ]]; then
+    if ! flock -w "$timeout" "$LOCK_FD"; then
+      exec {LOCK_FD}>&-
+      LOCK_FD=
+      return 1
+    fi
+  else
+    flock "$LOCK_FD"
+  fi
+}
+
+release_lock() {
+  if [[ -n ${LOCK_FD:-} ]]; then
+    flock -u "$LOCK_FD" 2>/dev/null || true
+    exec {LOCK_FD}>&-
+    LOCK_FD=
+  fi
+}
+
+acquire_media_lock() {
+  local previous_umask media_group
+  prepare_media_state_directory || return 1
+  [[ ! -e $MEDIA_LOCK_FILE || -f $MEDIA_LOCK_FILE && ! -L $MEDIA_LOCK_FILE ]] || return 1
+  previous_umask=$(umask)
+  umask 077
+  if ! exec {MEDIA_LOCK_FD}> "$MEDIA_LOCK_FILE"; then
+    umask "$previous_umask"
+    return 1
+  fi
+  umask "$previous_umask"
+  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    media_group=$(id -gn "$MEDIA_RUNTIME_USER") || return 1
+    chown "$MEDIA_RUNTIME_USER:$media_group" "$MEDIA_LOCK_FILE" || return 1
+  fi
+  chmod 0600 "$MEDIA_LOCK_FILE"
+  if ! flock -w 3 "$MEDIA_LOCK_FD"; then
+    exec {MEDIA_LOCK_FD}>&-
+    MEDIA_LOCK_FD=
+    return 1
+  fi
+}
+
+release_media_lock() {
+  if [[ -n ${MEDIA_LOCK_FD:-} ]]; then
+    flock -u "$MEDIA_LOCK_FD" 2>/dev/null || true
+    exec {MEDIA_LOCK_FD}>&-
+    MEDIA_LOCK_FD=
+  fi
+}
+
+trim() {
+  local value=$1
+  value=${value#"${value%%[![:space:]]*}"}
+  value=${value%"${value##*[![:space:]]}"}
+  printf '%s' "$value"
+}
+
+valid_mac() {
+  [[ $1 =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]]
+}
+
+normalize_mac() {
+  printf '%s\n' "${1^^}"
+}
+
+valid_url_port() {
+  local port=$1
+  [[ $port =~ ^[0-9]{1,5}$ ]] || return 1
+  (( 10#$port >= 1 && 10#$port <= 65535 ))
+}
+
+valid_ipv6_literal() {
+  local address=$1 left right side group count=0
+  local -a groups=()
+  [[ $address == *:* && $address != *:::* ]] || return 1
+  if [[ $address == *::* ]]; then
+    left=${address%%::*}
+    right=${address#*::}
+    [[ $right != *::* ]] || return 1
+    for side in "$left" "$right"; do
+      [[ -n $side ]] || continue
+      IFS=: read -r -a groups <<< "$side"
+      for group in "${groups[@]}"; do
+        [[ $group =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+        count=$((count + 1))
+      done
+    done
+    (( count < 8 ))
+  else
+    IFS=: read -r -a groups <<< "$address"
+    (( ${#groups[@]} == 8 )) || return 1
+    for group in "${groups[@]}"; do
+      [[ $group =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    done
+  fi
+}
+
+valid_http_authority() {
+  local authority=$1 host port='' label octet ipv6
+  local -a labels=()
+  if [[ $authority =~ ^\[([0-9A-Fa-f:.]+)\](:([0-9]+))?$ ]]; then
+    ipv6=${BASH_REMATCH[1]}
+    valid_ipv6_literal "$ipv6" || return 1
+    port=${BASH_REMATCH[3]:-}
+  elif [[ $authority =~ ^([^:]+)(:([0-9]+))?$ ]]; then
+    host=${BASH_REMATCH[1]}
+    port=${BASH_REMATCH[3]:-}
+    [[ ${#host} -le 253 && $host != .* && $host != *. && $host != *..* ]] || return 1
+    IFS=. read -r -a labels <<< "$host"
+    for label in "${labels[@]}"; do
+      [[ ${#label} -le 63 && $label =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+    done
+    if [[ $host =~ ^[0-9.]+$ ]]; then
+      (( ${#labels[@]} == 4 )) || return 1
+      for octet in "${labels[@]}"; do
+        [[ $octet =~ ^[0-9]{1,3}$ ]] && (( 10#$octet <= 255 )) || return 1
+      done
+    fi
+  else
+    return 1
+  fi
+  [[ -z $port ]] || valid_url_port "$port"
+}
+
+valid_http_url() {
+  local url=$1 authority
+  [[ ! $url =~ [[:space:][:cntrl:]] ]] || return 1
+  [[ $url =~ ^https?://([^/?#]+) ]] || return 1
+  authority=${BASH_REMATCH[1]}
+  valid_http_authority "$authority"
+}
+
+valid_url_path() {
+  local path=$1 remaining allowed
+  allowed="^[/A-Za-z0-9._~!\$&'()*+,;=:@%-]*$"
+  [[ -z $path || $path == /* ]] || return 1
+  [[ $path =~ $allowed ]] || return 1
+  remaining=${path//%[[:xdigit:]][[:xdigit:]]/}
+  [[ $remaining != *%* ]]
+}
+
+valid_base_url() {
+  local url=$1 path
+  [[ $url != *\?* && $url != *\#* && $url != *\{* && $url != *\}* ]] || return 1
+  valid_http_url "$url" || return 1
+  [[ $url =~ ^https?://[^/]+(.*)$ ]] || return 1
+  path=${BASH_REMATCH[1]}
+  valid_url_path "$path"
+}
+
+normalize_base_url() {
+  local url=$1
+  while [[ $url == */ ]]; do url=${url%/}; done
+  printf '%s\n' "$url"
+}
+
+valid_relative_media_reference() {
+  local reference=$1 path canonical segment
+  local -a segments=()
+  [[ -n $reference && $reference != //* && $reference != \?* && $reference != \#* ]] || return 1
+  [[ ! $reference =~ ^[A-Za-z][A-Za-z0-9+.-]*: ]] || return 1
+  path=${reference%%[?#]*}
+  [[ -n $path ]] || return 1
+  canonical=$path
+  [[ $canonical == /* ]] || canonical=/$canonical
+  valid_url_path "$canonical" || return 1
+  IFS=/ read -r -a segments <<< "$canonical"
+  for segment in "${segments[@]}"; do
+    [[ $segment != . && $segment != .. ]] || return 1
+  done
+}
+
+normalize_media_url_template() {
+  local template=$1
+  if [[ $template =~ ^https?:// || $template == /* ]]; then
+    printf '%s\n' "$template"
+  else
+    printf '/%s\n' "$template"
+  fi
+}
+
+valid_media_url_template() {
+  local template=$1 base_url=$2 expanded normalized state_placeholders=0
+  [[ ! $template =~ [[:space:][:cntrl:]] ]] || return 1
+  [[ $template != *'{volume-up}'* ]] || state_placeholders=$((state_placeholders + 1))
+  [[ $template != *'{volume-down}'* ]] || state_placeholders=$((state_placeholders + 1))
+  [[ $template != *'{mute-toggle}'* ]] || state_placeholders=$((state_placeholders + 1))
+  [[ $template != *'{shuffle-toggle}'* ]] || state_placeholders=$((state_placeholders + 1))
+  [[ $template != *'{repeat-cycle}'* ]] || state_placeholders=$((state_placeholders + 1))
+  (( state_placeholders <= 1 )) || return 1
+  expanded=${template//\{command-id\}/0}
+  expanded=${expanded//\{volume-up\}/100}
+  expanded=${expanded//\{volume-down\}/0}
+  expanded=${expanded//\{mute-toggle\}/0}
+  expanded=${expanded//\{shuffle-toggle\}/1}
+  expanded=${expanded//\{repeat-cycle\}/2}
+  [[ $expanded != *\{* && $expanded != *\}* ]] || return 1
+  if [[ $template =~ ^https?:// ]]; then
+    valid_http_url "$expanded"
+  else
+    valid_relative_media_reference "$expanded" || return 1
+    [[ -n $base_url ]] || return 1
+    normalized=$(normalize_media_url_template "$expanded")
+    valid_http_url "$base_url$normalized"
+  fi
+}
+
+config_fail() {
+  CONFIG_ERROR=$1
+  return 1
+}
+
+parse_config() {
+  local path=${1:-$CONFIG_FILE}
+  local raw line key value lineno=0
+  local audio_user='' controller='' interval='' media_controls='' base_url='' home
+  local media_key media_url index
+  local -a speakers=() media_keys=() media_urls=() media_lines=()
+  local -A scalar_seen=() speaker_seen=() media_key_seen=()
+
+  CONFIG_ERROR=
+  [[ -f $path && ! -L $path ]] || {
+    config_fail "Configuration is missing or unsafe: $path"
+    return 1
+  }
+
+  while IFS= read -r raw || [[ -n $raw ]]; do
+    lineno=$((lineno + 1))
+    line=$(trim "$raw")
+    [[ -z $line || $line == \#* ]] && continue
+    [[ $line == *=* ]] || {
+      config_fail "$path:$lineno: expected key = value"
+      return 1
+    }
+    key=$(trim "${line%%=*}")
+    value=$(trim "${line#*=}")
+    [[ -n $key && -n $value ]] || {
+      config_fail "$path:$lineno: key and value must not be empty"
+      return 1
+    }
+
+    case $key in
+      audio-user|controller|reconnect-interval|media-controls|base-url)
+        [[ ! ${scalar_seen[$key]+present} ]] || {
+          config_fail "$path:$lineno: duplicate setting: $key"
+          return 1
+        }
+        scalar_seen[$key]=1
+        case $key in
+          audio-user) audio_user=$value ;;
+          controller) controller=$value ;;
+          reconnect-interval) interval=$value ;;
+          media-controls) media_controls=$value ;;
+          base-url) base_url=$value ;;
+        esac
+        ;;
+      speaker)
+        valid_mac "$value" || {
+          config_fail "$path:$lineno: invalid speaker MAC address: $value"
+          return 1
+        }
+        value=$(normalize_mac "$value")
+        [[ ! ${speaker_seen[$value]+present} ]] || {
+          config_fail "$path:$lineno: duplicate speaker: $value"
+          return 1
+        }
+        speaker_seen[$value]=1
+        speakers+=("$value")
+        ;;
+      media-key)
+        media_key=${value%%[[:space:]]*}
+        media_url=$(trim "${value#"$media_key"}")
+        [[ $media_key != "$value" && -n $media_url ]] || {
+          config_fail "$path:$lineno: media-key requires KEY_NAME followed by a URL"
+          return 1
+        }
+        [[ $media_key =~ ^KEY_[A-Z0-9_]+$ ]] || {
+          config_fail "$path:$lineno: invalid media key name: $media_key"
+          return 1
+        }
+        [[ ! ${media_key_seen[$media_key]+present} ]] || {
+          config_fail "$path:$lineno: duplicate media key: $media_key"
+          return 1
+        }
+        media_key_seen[$media_key]=1
+        media_keys+=("$media_key")
+        media_urls+=("$media_url")
+        media_lines+=("$lineno")
+        ;;
+      *)
+        config_fail "$path:$lineno: unknown setting: $key"
+        return 1
+        ;;
+    esac
+  done < "$path"
+
+  for key in audio-user controller reconnect-interval media-controls; do
+    [[ ${scalar_seen[$key]+present} ]] || {
+      config_fail "$path: missing required setting: $key"
+      return 1
+    }
+  done
+
+  id "$audio_user" >/dev/null 2>&1 || {
+    config_fail "$path: audio user does not exist: $audio_user"
+    return 1
+  }
+  home=$(user_home "$audio_user")
+  [[ -n $home && -d $home ]] || {
+    config_fail "$path: audio user has no usable home directory: $audio_user"
+    return 1
+  }
+  if [[ $controller != auto ]]; then
+    valid_mac "$controller" || {
+      config_fail "$path: controller must be 'auto' or a MAC address"
+      return 1
+    }
+    controller=$(normalize_mac "$controller")
+  fi
+  [[ $interval =~ ^[1-9][0-9]*$ ]] || {
+    config_fail "$path: reconnect-interval must be a positive integer"
+    return 1
+  }
+  case $media_controls in
+    auto|required|off) ;;
+    *)
+      config_fail "$path: media-controls must be auto, required, or off"
+      return 1
+      ;;
+  esac
+  if [[ ${scalar_seen[base-url]+present} ]]; then
+    valid_base_url "$base_url" || {
+      config_fail "$path: base-url must be an HTTP or HTTPS URL without a query or fragment"
+      return 1
+    }
+    base_url=$(normalize_base_url "$base_url")
+  fi
+  for index in "${!media_keys[@]}"; do
+    if [[ ! ${media_urls[$index]} =~ ^https?:// && -z $base_url ]]; then
+      config_fail "$path:${media_lines[$index]}: relative media-key URL requires base-url"
+      return 1
+    fi
+    if [[ ${media_urls[$index]} == *'{volume-up}'* ||
+          ${media_urls[$index]} == *'{volume-down}'* ||
+          ${media_urls[$index]} == *'{mute-toggle}'* ||
+          ${media_urls[$index]} == *'{shuffle-toggle}'* ||
+          ${media_urls[$index]} == *'{repeat-cycle}'* ]] && [[ -z $base_url ]]; then
+      config_fail "$path:${media_lines[$index]}: stateful media-key placeholder requires base-url"
+      return 1
+    fi
+    valid_media_url_template "${media_urls[$index]}" "$base_url" || {
+      config_fail "$path:${media_lines[$index]}: invalid media-key URL or placeholder"
+      return 1
+    }
+    media_urls[index]=$(normalize_media_url_template "${media_urls[$index]}")
+  done
+
+  CFG_AUDIO_USER=$audio_user
+  CFG_CONTROLLER=$controller
+  CFG_RECONNECT_INTERVAL=$interval
+  CFG_MEDIA_CONTROLS=$media_controls
+  CFG_BASE_URL=$base_url
+  CFG_SPEAKERS=("${speakers[@]}")
+  CFG_MEDIA_KEYS=("${media_keys[@]}")
+  CFG_MEDIA_URLS=("${media_urls[@]}")
+}
+
+write_default_config() {
+  local path=$1 audio_user=$2
+  {
+    printf 'audio-user = %s\n' "$audio_user"
+    printf 'controller = auto\n'
+    printf 'reconnect-interval = 5\n'
+    printf 'media-controls = auto\n'
+    printf 'base-url = http://127.0.0.1:32500\n\n'
+    printf 'media-key = KEY_PLAYPAUSE player/playback/playPause?type=music&commandID={command-id}\n'
+    printf 'media-key = KEY_PLAY player/playback/play?type=music&commandID={command-id}\n'
+    printf 'media-key = KEY_PLAYCD player/playback/play?type=music&commandID={command-id}\n'
+    printf 'media-key = KEY_PAUSE player/playback/pause?type=music&commandID={command-id}\n'
+    printf 'media-key = KEY_PAUSECD player/playback/pause?type=music&commandID={command-id}\n'
+    printf 'media-key = KEY_STOP player/playback/stop?type=music&commandID={command-id}\n'
+    printf 'media-key = KEY_STOPCD player/playback/stop?type=music&commandID={command-id}\n'
+    printf 'media-key = KEY_NEXT player/playback/skipNext?type=music&commandID={command-id}\n'
+    printf 'media-key = KEY_NEXTSONG player/playback/skipNext?type=music&commandID={command-id}\n'
+    printf 'media-key = KEY_PREVIOUS player/playback/skipPrevious?type=music&commandID={command-id}\n'
+    printf 'media-key = KEY_PREVIOUSSONG player/playback/skipPrevious?type=music&commandID={command-id}\n\n'
+    printf 'media-key = KEY_FORWARD player/playback/stepForward?type=music&commandID={command-id}\n'
+    printf 'media-key = KEY_FASTFORWARD player/playback/stepForward?type=music&commandID={command-id}\n'
+    printf 'media-key = KEY_REWIND player/playback/stepBack?type=music&commandID={command-id}\n'
+    printf 'media-key = KEY_FASTREVERSE player/playback/stepBack?type=music&commandID={command-id}\n\n'
+    printf 'media-key = KEY_VOLUMEUP player/playback/setParameters?type=music&volume={volume-up}&commandID={command-id}\n'
+    printf 'media-key = KEY_VOLUMEDOWN player/playback/setParameters?type=music&volume={volume-down}&commandID={command-id}\n'
+    printf 'media-key = KEY_MUTE player/playback/setParameters?type=music&volume={mute-toggle}&commandID={command-id}\n'
+    printf 'media-key = KEY_SHUFFLE player/playback/setParameters?type=music&shuffle={shuffle-toggle}&commandID={command-id}\n'
+    printf 'media-key = KEY_MEDIA_REPEAT player/playback/setParameters?type=music&repeat={repeat-cycle}&commandID={command-id}\n\n'
+    printf '# Speakers are attempted in top-down order.\n'
+    printf '# speaker = AA:BB:CC:DD:EE:FF\n'
+  } > "$path"
+  chmod 0644 "$path"
+}
+
+validate_directory_chain() {
+  local directory=$1 current=/ component
+  local -a components=()
+  [[ $directory == /* ]] || die "Directory path must be absolute: $directory"
+  IFS=/ read -r -a components <<< "${directory#/}"
+  for component in "${components[@]}"; do
+    [[ -n $component ]] || continue
+    current=${current%/}/$component
+    [[ ! -L $current ]] || die "Refusing to traverse symlinked directory: $current"
+    [[ ! -e $current || -d $current ]] || die "Path component is not a directory: $current"
+  done
+}
+
+validate_managed_paths() {
+  local path
+  local -A seen=()
+  for path in "$@"; do
+    [[ $path == /* && $path != *$'\n'* ]] || die "Invalid managed path: $path"
+    [[ ! ${seen[$path]+present} ]] || die "Managed paths must be unique: $path"
+    seen[$path]=1
+    validate_directory_chain "$(dirname "$path")"
+  done
+}
+
+allowed_managed_path() {
+  case $1 in
+    "$INSTALLED_CLI"|"$CONFIG_FILE"|"$SYSTEMD_UNIT"|"$WIREPLUMBER_CONF"|"$TRIGGER_CONF") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+backup_file() {
+  local path=$1
+  allowed_managed_path "$path" || die "Refusing to back up unmanaged path: $path"
+  [[ ! -d $path || -L $path ]] || die "Refusing to replace a directory: $path"
+  if [[ -e $path || -L $path ]]; then
+    install -d -m 0700 "$BACKUP_DIR$(dirname "$path")"
+    cp -a -- "$path" "$BACKUP_DIR$path"
+    printf '%s\n' "$path" >> "$STATE_DIR/replaced-files"
+  else
+    printf '%s\n' "$path" >> "$STATE_DIR/created-files"
+  fi
+}
+
+prepare_file_target() {
+  local path=$1
+  [[ ! -d $path || -L $path ]] || die "Refusing to replace a directory: $path"
+  rm -f -- "$path"
+}
+
+atomic_install_file() {
+  local source=$1 destination=$2 mode=${3:-0644} directory temp
+  directory=$(dirname "$destination")
+  validate_directory_chain "$directory"
+  [[ ! -d $destination || -L $destination ]] || return 1
+  temp=$(mktemp "$directory/.a2dpilot.XXXXXX") || return 1
+  if ! install -o root -g root -m "$mode" "$source" "$temp" || ! mv -f -- "$temp" "$destination"; then
+    rm -f -- "$temp"
+    return 1
+  fi
+}
+
+user_home() {
+  getent passwd "$1" | cut -d: -f6
+}
+
+as_user_systemctl() {
+  local user=$1 uid runtime home
+  shift
+  uid=$(id -u "$user")
+  runtime=/run/user/$uid
+  home=$(user_home "$user")
+  runuser -u "$user" -- env HOME="$home" XDG_RUNTIME_DIR="$runtime" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus" systemctl --user "$@"
+}
+
+user_wpctl() {
+  local user=$1 uid runtime home
+  shift
+  uid=$(id -u "$user")
+  runtime=/run/user/$uid
+  home=$(user_home "$user")
+  runuser -u "$user" -- env HOME="$home" XDG_RUNTIME_DIR="$runtime" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus" wpctl "$@"
+}
+
+system_unit_enabled_state() {
+  systemctl is-enabled "$1" 2>/dev/null || true
+}
+
+system_unit_active_bit() {
+  [[ $(systemctl is-active "$1" 2>/dev/null || true) == active ]] && printf '1\n' || printf '0\n'
+}
+
+user_unit_enabled_state() {
+  local user=$1 unit=$2 home
+  home=$(user_home "$user")
+  runuser -u "$user" -- env HOME="$home" systemctl --user --root=/ is-enabled "$unit" 2>/dev/null || true
+}
+
+user_unit_active_bit() {
+  local user=$1 unit=$2 uid
+  uid=$(id -u "$user")
+  if [[ -S /run/user/$uid/systemd/private ]] && \
+    [[ $(as_user_systemctl "$user" is-active "$unit" 2>/dev/null || true) == active ]]; then
+    printf '1\n'
+  else
+    printf '0\n'
+  fi
+}
+
+validate_enabled_state() {
+  case $1 in
+    enabled|enabled-runtime|disabled|not-found|masked|masked-runtime|static|indirect|generated|transient|alias) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+record_system_service_states() {
+  local unit enabled active
+  : > "$STATE_DIR/system-service-states"
+  for unit in "${SYSTEM_UNITS[@]}"; do
+    enabled=$(system_unit_enabled_state "$unit")
+    [[ -n $enabled ]] || enabled=not-found
+    validate_enabled_state "$enabled" || die "Unsupported enablement state '$enabled' for $unit."
+    active=$(system_unit_active_bit "$unit")
+    printf '%s %s %s\n' "$unit" "$enabled" "$active" >> "$STATE_DIR/system-service-states"
+  done
+}
+
+user_state_dir() {
+  printf '%s/users/%s\n' "$STATE_DIR" "$(id -u "$1")"
+}
+
+record_user_state() {
+  local user=$1 directory unit enabled active linger
+  directory=$(user_state_dir "$user")
+  [[ ! -e $directory || -d $directory && ! -L $directory ]] || die "Unsafe user state directory: $directory"
+  [[ ! -f $directory/recorded ]] || return 0
+  install -d -m 0700 "$directory"
+  printf '%s\n' "$user" > "$directory/user"
+  linger=$(loginctl show-user "$user" -p Linger --value 2>/dev/null || true)
+  [[ $linger == yes ]] || linger=no
+  printf '%s\n' "$linger" > "$directory/linger"
+  : > "$directory/service-states"
+  for unit in "${USER_UNITS[@]}"; do
+    enabled=$(user_unit_enabled_state "$user" "$unit")
+    [[ -n $enabled ]] || enabled=not-found
+    validate_enabled_state "$enabled" || die "Unsupported enablement state '$enabled' for $user unit $unit."
+    active=$(user_unit_active_bit "$user" "$unit")
+    printf '%s %s %s\n' "$unit" "$enabled" "$active" >> "$directory/service-states"
+  done
+  : > "$directory/recorded"
+}
+
+set_unit_enabled_state() {
+  local scope=$1 user=$2 unit=$3 state=$4
+  local -a command=()
+  case $state in
+    enabled) command=(enable "$unit") ;;
+    enabled-runtime) command=(enable --runtime "$unit") ;;
+    disabled|not-found) command=(disable "$unit") ;;
+    masked) command=(mask "$unit") ;;
+    masked-runtime) command=(mask --runtime "$unit") ;;
+    static|indirect|generated|transient|alias) return 0 ;;
+    *) return 1 ;;
+  esac
+  if [[ $scope == system ]]; then
+    systemctl "${command[@]}"
+  else
+    as_user_systemctl "$user" "${command[@]}"
+  fi
+}
+
+restore_user_state() {
+  local user=$1 directory unit enabled active uid linger load_state action
+  directory=$(user_state_dir "$user")
+  [[ -f $directory/recorded ]] || return 0
+  uid=$(id -u "$user")
+  loginctl enable-linger "$user" || return 1
+  systemctl start "user@$uid.service" || return 1
+  while read -r unit enabled active; do
+    [[ -n $unit ]] || continue
+    load_state=$(as_user_systemctl "$user" show "$unit" -p LoadState --value 2>/dev/null || true)
+    if [[ $load_state == not-found && $enabled == not-found && $active == 0 ]]; then
+      continue
+    fi
+    [[ $load_state != not-found ]] || return 1
+    set_unit_enabled_state user "$user" "$unit" "$enabled" || return 1
+    action=stop
+    [[ $active == 1 ]] && action=start
+    [[ $unit == wireplumber.service && $active == 1 ]] && action=restart
+    as_user_systemctl "$user" "$action" "$unit" || return 1
+  done < "$directory/service-states"
+  linger=$(< "$directory/linger")
+  if [[ $linger != yes ]]; then
+    loginctl disable-linger "$user" || return 1
+  fi
+}
+
+ensure_audio_user() {
+  local user=$1 uid home
+  id "$user" >/dev/null 2>&1 || return 1
+  home=$(user_home "$user")
+  [[ -n $home && -d $home ]] || return 1
+  record_user_state "$user"
+  uid=$(id -u "$user")
+  loginctl enable-linger "$user" || return 1
+  systemctl start "user@$uid.service" || return 1
+  as_user_systemctl "$user" enable --now pipewire.service pipewire-pulse.service wireplumber.service || return 1
+  as_user_systemctl "$user" restart wireplumber.service || return 1
+}
+
+reconcile_audio_user() {
+  local new_user=$1 old_user=
+  [[ -d $STATE_DIR ]] || return 0
+  [[ -f $STATE_DIR/runtime-user ]] && old_user=$(< "$STATE_DIR/runtime-user")
+  [[ $old_user == "$new_user" ]] && return 0
+  ensure_audio_user "$new_user" || return 1
+  if [[ -n $old_user && $old_user != "$new_user" ]] && id "$old_user" >/dev/null 2>&1; then
+    restore_user_state "$old_user" || return 1
+  fi
+  printf '%s\n' "$new_user" > "$STATE_DIR/runtime-user"
+}
+
+restore_all_user_states() {
+  local directory user failed=0
+  [[ -d $STATE_DIR/users ]] || return 0
+  for directory in "$STATE_DIR"/users/*; do
+    [[ -d $directory && -f $directory/user ]] || continue
+    user=$(< "$directory/user")
+    if id "$user" >/dev/null 2>&1; then
+      restore_user_state "$user" || failed=1
+    else
+      warn "Cannot restore state for missing user $user."
+      failed=1
+    fi
+  done
+  (( failed == 0 ))
+}
+
+restore_system_service_states() {
+  local unit enabled active load_state action
+  [[ -f $STATE_DIR/system-service-states ]] || return 0
+  while read -r unit enabled active; do
+    [[ -n $unit ]] || continue
+    load_state=$(systemctl show "$unit" -p LoadState --value 2>/dev/null || true)
+    if [[ $load_state == not-found && $enabled == not-found && $active == 0 ]]; then
+      continue
+    fi
+    [[ $load_state != not-found ]] || return 1
+    set_unit_enabled_state system '' "$unit" "$enabled" || return 1
+    action=stop
+    [[ $active == 1 ]] && action=start
+    case $unit:$active in
+      triggerhappy.service:1) action=restart ;;
+    esac
+    systemctl "$action" "$unit" || return 1
+  done < "$STATE_DIR/system-service-states"
+}
+
+record_rfkill_state() {
+  local path name type soft
+  : > "$STATE_DIR/rfkill-state"
+  for path in "$RFKILL_SYSFS"/rfkill*; do
+    [[ -f $path/type && -f $path/name && -f $path/soft ]] || continue
+    type=$(< "$path/type")
+    [[ $type == bluetooth ]] || continue
+    name=$(< "$path/name")
+    soft=$(< "$path/soft")
+    printf '%s\t%s\n' "$soft" "$name" >> "$STATE_DIR/rfkill-state"
+  done
+}
+
+restore_rfkill_state() {
+  local original_soft original_name path name type id
+  [[ -f $STATE_DIR/rfkill-state ]] || return 0
+  while IFS=$'\t' read -r original_soft original_name; do
+    [[ -n $original_name ]] || continue
+    for path in "$RFKILL_SYSFS"/rfkill*; do
+      [[ -f $path/type && -f $path/name ]] || continue
+      type=$(< "$path/type")
+      name=$(< "$path/name")
+      [[ $type == bluetooth && $name == "$original_name" ]] || continue
+      id=${path##*rfkill}
+      if [[ $original_soft == 1 ]]; then
+        rfkill block "$id" || warn "Could not restore rfkill block for $original_name."
+      else
+        rfkill unblock "$id" || warn "Could not restore rfkill state for $original_name."
+      fi
+    done
+  done < "$STATE_DIR/rfkill-state"
+}
+
+record_controller_state() {
+  local line mac powered
+  : > "$STATE_DIR/controller-state"
+  command -v bluetoothctl >/dev/null 2>&1 || return 0
+  while IFS= read -r line; do
+    [[ $line =~ ^Controller[[:space:]]+(([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}) ]] || continue
+    mac=${BASH_REMATCH[1]^^}
+    powered=$(bluetoothctl show "$mac" 2>/dev/null | awk '/^[[:space:]]*Powered:/ { print $2; exit }')
+    case $powered in yes|no) printf '%s %s\n' "$mac" "$powered" >> "$STATE_DIR/controller-state" ;; esac
+  done < <(bluetoothctl list 2>/dev/null || true)
+}
+
+restore_controller_state() {
+  local mac powered
+  [[ -f $STATE_DIR/controller-state ]] || return 0
+  while read -r mac powered; do
+    [[ -n $mac ]] || continue
+    if bluetoothctl list 2>/dev/null | grep -Fqi "Controller $mac "; then
+      if ! controller_batch "$mac" 5 "power $powered" >/dev/null 2>&1 ||
+         [[ $(controller_power_state "$mac" 2>/dev/null || true) != "$powered" ]]; then
+        warn "Could not restore controller $mac power state to $powered."
+      fi
+    fi
+  done < "$STATE_DIR/controller-state"
+}
+
+render_state_file() {
+  local path=$1 phase=$2
+  (
+    umask 077
+    printf 'INSTALL_PHASE=%q\n' "$phase" > "$path"
+  )
+}
+
+write_state_file() {
+  local phase=$1 temp=$STATE_FILE.tmp
+  render_state_file "$temp" "$phase"
+  mv -f -- "$temp" "$STATE_FILE"
+}
+
+write_systemd_unit() {
+  local path=$1 media_group
+  media_group=$(id -gn "$MEDIA_RUNTIME_USER") || return 1
+  cat > "$path" <<EOF
+[Unit]
+Description=A2DPilot Bluetooth audio connection manager
+After=bluetooth.service
+Wants=bluetooth.service
+Before=triggerhappy.service
+
+[Service]
+Type=simple
+RuntimeDirectory=a2dpilot
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=restart
+ExecStartPre=/usr/bin/install -d -o $MEDIA_RUNTIME_USER -g $media_group -m 0700 $MEDIA_STATE_DIR
+ExecStart=$INSTALLED_CLI daemon
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 0644 "$path"
+}
+
+write_wireplumber_config() {
+  local path=$1
+  cat > "$path" <<'EOF'
+wireplumber.profiles = {
+  main = {
+    monitor.bluez.seat-monitoring = disabled
+  }
+}
+EOF
+  chmod 0644 "$path"
+}
+
+write_trigger_config() {
+  local path=$1 mode=$2 index
+  if [[ $mode == off ]]; then
+    printf '# Managed by A2DPilot; media controls are disabled.\n' > "$path"
+  elif (( ${#CFG_MEDIA_KEYS[@]} == 0 )); then
+    printf '# Managed by A2DPilot; no media-key mappings are configured.\n' > "$path"
+  else
+    : > "$path"
+    for index in "${!CFG_MEDIA_KEYS[@]}"; do
+      printf '%s\t%s\t%s\n' "${CFG_MEDIA_KEYS[$index]}" 1 \
+        "$INSTALLED_CLI player-control ${CFG_MEDIA_KEYS[$index]}" >> "$path"
+    done
+  fi
+  chmod 0644 "$path"
+}
+
+apply_trigger_config() {
+  local mode=$1 directory temp
+  directory=$(dirname "$TRIGGER_CONF")
+  validate_directory_chain "$directory"
+  install -d -m 0755 "$directory"
+  temp=$(mktemp "$directory/.a2dpilot-trigger.XXXXXX") || return 1
+  write_trigger_config "$temp" "$mode"
+  if [[ -f $TRIGGER_CONF ]] && cmp -s "$temp" "$TRIGGER_CONF"; then
+    rm -f -- "$temp"
+    return 0
+  fi
+  mv -f -- "$temp" "$TRIGGER_CONF" || return 1
+  systemctl try-restart triggerhappy.service || return 1
+}
+
+reconcile_runtime_configuration() {
+  reconcile_audio_user "$CFG_AUDIO_USER" || return 1
+  apply_trigger_config "$CFG_MEDIA_CONTROLS" || return 1
+}
+
+run_editor() {
+  local path=$1 editor_user=$2 editor_spec
+  local -a editor_command=()
+  editor_spec=${SUDO_EDITOR:-${VISUAL:-${EDITOR:-editor}}}
+  read -r -a editor_command <<< "$editor_spec"
+  [[ ${#editor_command[@]} -gt 0 ]] || return 1
+  if [[ $editor_user == root ]]; then
+    "${editor_command[@]}" "$path"
+  else
+    runuser -u "$editor_user" -- "${editor_command[@]}" "$path"
+  fi
+}
+
+config_action() {
+  local check=0
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --check) check=1; shift ;;
+      *) die "Unknown config option: $1" ;;
+    esac
+  done
+  parse_config "$CONFIG_FILE" || die "$CONFIG_ERROR"
+  if (( check )); then
+    note "Configuration is valid: $CONFIG_FILE"
+    return 0
+  fi
+
+  require_root
+  [[ -f $STATE_FILE ]] || die "A2DPilot is not installed."
+  acquire_lock
+  local editor_user=${SUDO_USER:-root} editor_group edit_dir edit_tmp old_tmp candidate_tmp=''
+  local old_user old_mode new_user
+  old_user=$CFG_AUDIO_USER
+  old_mode=$CFG_MEDIA_CONTROLS
+  install -d -m 0755 "$(dirname "$LOCK_FILE")"
+  edit_dir=$(mktemp -d "$(dirname "$LOCK_FILE")/.a2dpilot-edit.XXXXXX")
+  edit_tmp=$edit_dir/a2dpilot.conf
+  old_tmp=$(mktemp "$STATE_DIR/.a2dpilot-config-old.XXXXXX")
+  cp -a -- "$CONFIG_FILE" "$old_tmp"
+  cp -- "$CONFIG_FILE" "$edit_tmp"
+  chmod 0600 "$edit_tmp"
+  if [[ $editor_user != root ]]; then
+    id "$editor_user" >/dev/null 2>&1 || die "Editor user does not exist: $editor_user"
+    editor_group=$(id -gn "$editor_user")
+    chown "$editor_user:$editor_group" "$edit_dir" "$edit_tmp"
+    chmod 0700 "$edit_dir"
+  fi
+
+  if ! run_editor "$edit_tmp" "$editor_user"; then
+    rm -rf -- "$edit_dir"
+    rm -f -- "$old_tmp"
+    release_lock
+    die "Editor exited unsuccessfully; configuration was not changed."
+  fi
+  # Reclaim the workspace, then copy the edited inode into root-only state.
+  # Ownership changes do not revoke an editor child's already-open descriptor;
+  # validating and installing the new snapshot keeps those writes out of the
+  # live configuration.
+  chown root:root "$edit_dir"
+  chmod 0700 "$edit_dir"
+  if [[ ! -f $edit_tmp || -L $edit_tmp ]]; then
+    rm -rf -- "$edit_dir"
+    rm -f -- "$old_tmp"
+    release_lock
+    die "The editor produced an unsafe configuration candidate."
+  fi
+  chown root:root "$edit_tmp"
+  chmod 0600 "$edit_tmp"
+  candidate_tmp=$(mktemp "$STATE_DIR/.a2dpilot-config-new.XXXXXX") || {
+    rm -rf -- "$edit_dir"
+    rm -f -- "$old_tmp"
+    release_lock
+    die "Could not create a protected configuration snapshot."
+  }
+  if ! cp -- "$edit_tmp" "$candidate_tmp"; then
+    rm -rf -- "$edit_dir"
+    rm -f -- "$old_tmp" "$candidate_tmp"
+    release_lock
+    die "Could not snapshot the edited configuration."
+  fi
+  chmod 0600 "$candidate_tmp"
+  rm -rf -- "$edit_dir"
+  parse_config "$candidate_tmp" || {
+    local error=$CONFIG_ERROR
+    rm -f -- "$old_tmp" "$candidate_tmp"
+    release_lock
+    die "$error"
+  }
+  new_user=$CFG_AUDIO_USER
+  atomic_install_file "$candidate_tmp" "$CONFIG_FILE" 0644 || {
+    rm -f -- "$old_tmp" "$candidate_tmp"
+    release_lock
+    die "Could not install the edited configuration."
+  }
+  rm -f -- "$candidate_tmp"
+
+  if reconcile_runtime_configuration; then
+    release_lock
+    if systemctl restart a2dpilot.service; then
+      rm -f -- "$old_tmp"
+      note "Configuration updated and applied."
+      [[ $old_user == "$CFG_AUDIO_USER" && $old_mode == "$CFG_MEDIA_CONTROLS" ]] || \
+        note "Applied audio-user/media-control integration changes."
+      return 0
+    fi
+    acquire_lock
+  fi
+
+  {
+    warn "Could not apply the edited configuration; restoring the previous version."
+    atomic_install_file "$old_tmp" "$CONFIG_FILE" 0644 || \
+      die "Configuration rollback failed; previous copy remains at $old_tmp"
+    parse_config "$CONFIG_FILE" || die "$CONFIG_ERROR"
+    reconcile_runtime_configuration || warn "Could not fully reapply the previous runtime configuration."
+    if [[ $old_user != "$new_user" ]]; then
+      restore_user_state "$new_user" || true
+    fi
+    rm -f -- "$old_tmp"
+    release_lock
+    systemctl restart a2dpilot.service || warn "Could not restart A2DPilot with the restored configuration."
+    die "Configuration application failed; the previous configuration was restored."
+  }
+}
+
+hard_blocked() {
+  local path type hard found=0
+  for path in "$RFKILL_SYSFS"/rfkill*; do
+    [[ -f $path/type && -f $path/hard ]] || continue
+    type=$(< "$path/type")
+    hard=$(< "$path/hard")
+    [[ $type == bluetooth ]] || continue
+    found=1
+    [[ $hard == 1 ]] || return 1
+  done
+  (( found == 1 ))
+}
+
+controller_exists() {
+  local controller=$1
+  if [[ $controller == auto ]]; then
+    bluetoothctl list 2>/dev/null | grep -q '^Controller '
+  else
+    bluetoothctl list 2>/dev/null | grep -Fqi "Controller $controller "
+  fi
+}
+
+controller_batch() {
+  local controller=$1 timeout=$2
+  shift 2
+  {
+    [[ $controller == auto ]] || printf 'select %s\n' "$controller"
+    printf '%s\n' "$@"
+    printf 'quit\n'
+  } | run_bounded_bluetoothctl "$timeout" --timeout "$timeout"
+}
+
+controller_agent_batch() {
+  local controller=$1 timeout=$2 agent=$3
+  shift 3
+  {
+    [[ $controller == auto ]] || printf 'select %s\n' "$controller"
+    printf '%s\n' "$@"
+    printf 'quit\n'
+  } | run_bounded_bluetoothctl "$timeout" --timeout "$timeout" --agent "$agent"
+}
+
+run_bounded_bluetoothctl() {
+  local timeout=$1
+  shift
+  timeout --signal=TERM --kill-after=1 "$timeout" bluetoothctl "$@"
+}
+
+bluetooth_device_command_on_controller() {
+  local controller=$1 timeout=$2 verb=$3 mac=$4
+  if [[ $controller == auto ]]; then
+    bluetoothctl --timeout "$timeout" "$verb" "$mac"
+  else
+    controller_batch "$controller" "$timeout" "$verb $mac"
+  fi
+}
+
+bluetooth_device_command() {
+  bluetooth_device_command_on_controller "$CFG_CONTROLLER" "$@"
+}
+
+configured_bluetooth_devices() {
+  if [[ $CFG_CONTROLLER == auto ]]; then
+    bluetoothctl devices
+  else
+    controller_batch "$CFG_CONTROLLER" 5 devices
+  fi
+}
+
+configured_controller_address() {
+  local line address first=''
+  if [[ $CFG_CONTROLLER != auto ]]; then
+    printf '%s\n' "$CFG_CONTROLLER"
+    return 0
+  fi
+  while IFS= read -r line; do
+    [[ $line =~ ^Controller[[:space:]]+(([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}) ]] || continue
+    address=${BASH_REMATCH[1]^^}
+    [[ -n $first ]] || first=$address
+    if [[ $line == *' [default]' ]]; then
+      printf '%s\n' "$address"
+      return 0
+    fi
+  done < <(bluetoothctl list 2>/dev/null || true)
+  [[ -n $first ]] || return 1
+  printf '%s\n' "$first"
+}
+
+controller_power_state() {
+  local controller=$1 state
+  if [[ $controller == auto ]]; then
+    state=$(bluetoothctl show 2>/dev/null | awk '/^[[:space:]]*Powered:/ { print $2; exit }')
+  else
+    state=$(bluetoothctl show "$controller" 2>/dev/null | \
+      awk '/^[[:space:]]*Powered:/ { print $2; exit }')
+  fi
+  case $state in
+    yes|no) printf '%s\n' "$state" ;;
+    *) return 1 ;;
+  esac
+}
+
+power_controller() {
+  hard_blocked && {
+    warn "Bluetooth is hard-blocked and cannot be enabled in software."
+    return 1
+  }
+  rfkill unblock bluetooth >/dev/null 2>&1 || \
+    warn "Could not clear every Bluetooth soft block; continuing with controller detection."
+  if ! controller_exists "$CFG_CONTROLLER"; then
+    if [[ $CFG_CONTROLLER == auto ]]; then
+      warn "No Bluetooth controller is visible to BlueZ; check the adapter, kernel log, and firmware."
+    else
+      warn "Configured Bluetooth controller $CFG_CONTROLLER is not visible to BlueZ."
+    fi
+    return 1
+  fi
+  controller_batch "$CFG_CONTROLLER" 5 'power on' >/dev/null 2>&1 || {
+    warn "Could not power on Bluetooth controller $CFG_CONTROLLER."
+    return 1
+  }
+  [[ $(controller_power_state "$CFG_CONTROLLER" 2>/dev/null || true) == yes ]] || {
+    warn "Could not power on Bluetooth controller $CFG_CONTROLLER."
+    return 1
+  }
+}
+
+scan_bredr() {
+  {
+    [[ $CFG_CONTROLLER == auto ]] || printf 'select %s\n' "$CFG_CONTROLLER"
+    printf 'scan bredr\n'
+    sleep "$SCAN_TIMEOUT"
+    printf 'scan off\nquit\n'
+  } | bluetoothctl --timeout "$((SCAN_TIMEOUT + 5))" >/dev/null 2>&1 || true
+}
+
+device_info_on_controller() {
+  local controller=$1 mac=$2 output
+  output=$(bluetooth_device_command_on_controller "$controller" 5 info "$mac" 2>/dev/null) || return 1
+  grep -q '^[[:space:]]*Paired:' <<< "$output" || return 1
+  printf '%s\n' "$output"
+}
+
+device_info() {
+  device_info_on_controller "$CFG_CONTROLLER" "$1"
+}
+
+device_property_is_yes() {
+  local mac=$1 property=$2
+  device_info "$mac" | grep -q "^[[:space:]]*$property: yes$"
+}
+
+device_paired() { device_property_is_yes "$1" Paired; }
+device_trusted() { device_property_is_yes "$1" Trusted; }
+device_connected() { device_property_is_yes "$1" Connected; }
+
+disconnect_bluetooth_device() {
+  local mac=$1
+  bluetooth_device_command "$CONNECT_TIMEOUT" disconnect "$mac" >/dev/null 2>&1 || true
+  ! device_connected "$mac"
+}
+
+remove_bluetooth_device() {
+  local mac=$1
+  remove_bluetooth_device_on_controller "$CFG_CONTROLLER" "$mac"
+}
+
+remove_bluetooth_device_on_controller() {
+  local controller=$1 mac=$2
+  bluetooth_device_command_on_controller "$controller" "$CONNECT_TIMEOUT" remove "$mac" \
+    >/dev/null 2>&1 || true
+  ! device_info_on_controller "$controller" "$mac" >/dev/null 2>&1
+}
+
+device_name() {
+  device_name_on_controller "$CFG_CONTROLLER" "$1"
+}
+
+device_name_on_controller() {
+  local controller=$1 mac=$2 name
+  name=$(device_info_on_controller "$controller" "$mac" | \
+    sed -n 's/^[[:space:]]*Name: //p' | head -n1)
+  printf '%s\n' "${name:-unknown}"
+}
+
+find_a2dp_node_id() {
+  local mac=$1 mac_key line
+  mac_key=${mac//:/_}
+  line=$(user_wpctl "$CFG_AUDIO_USER" status --name 2>/dev/null | \
+    grep -Fm1 "bluez_output.${mac_key}." || true)
+  [[ -n $line ]] || return 1
+  sed -E 's/^[^0-9]*([0-9]+)\..*/\1/' <<< "$line"
+}
+
+a2dp_connected() {
+  find_a2dp_node_id "$1" >/dev/null
+}
+
+a2dp_codec() {
+  local mac=$1 node codec
+  node=$(find_a2dp_node_id "$mac") || return 1
+  codec=$(user_wpctl "$CFG_AUDIO_USER" inspect "$node" 2>/dev/null | \
+    awk -F'= ' '/api\.bluez5\.codec/ { gsub(/"/, "", $2); print $2; exit }')
+  if [[ -z $codec ]]; then
+    codec=$(user_wpctl "$CFG_AUDIO_USER" inspect --associated "$node" 2>/dev/null | \
+      awk -F'= ' '/api\.bluez5\.codec/ { gsub(/"/, "", $2); print $2; exit }')
+  fi
+  printf '%s\n' "${codec:-unknown}"
+}
+
+configured_controller_path() {
+  local address=$CFG_CONTROLLER line path property
+  if [[ $address == auto ]]; then
+    line=$(bluetoothctl list 2>/dev/null | sed -n '1p') || return 1
+    [[ $line =~ ^Controller[[:space:]]+(([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}) ]] || return 1
+    address=${BASH_REMATCH[1]^^}
+  fi
+  while IFS= read -r path; do
+    [[ $path =~ ^/org/bluez/hci[0-9]+$ ]] || continue
+    property=$(busctl get-property org.bluez "$path" org.bluez.Adapter1 Address 2>/dev/null) || continue
+    [[ $property =~ ^s[[:space:]]+\"(([[:xdigit:]]{2}:){5}[[:xdigit:]]{2})\"$ ]] || continue
+    [[ ${BASH_REMATCH[1]^^} == "$address" ]] || continue
+    printf '%s\n' "$path"
+    return 0
+  done < <(busctl tree --list org.bluez 2>/dev/null || true)
+  return 1
+}
+
+avrcp_connected() {
+  local mac=$1 mac_key controller_path device_path
+  mac_key=${mac//:/_}
+  controller_path=$(configured_controller_path) || return 1
+  device_path=$controller_path/dev_$mac_key
+  busctl get-property org.bluez "$device_path" org.bluez.MediaControl1 Connected 2>/dev/null | \
+    grep -q '^b true$'
+}
+
+device_healthy() {
+  local mac=$1
+  device_connected "$mac" && a2dp_connected "$mac" || return 1
+  [[ $CFG_MEDIA_CONTROLS != required ]] || avrcp_connected "$mac"
+}
+
+speaker_configured() {
+  local wanted=$1 mac
+  for mac in "${CFG_SPEAKERS[@]}"; do
+    [[ $mac == "$wanted" ]] && return 0
+  done
+  return 1
+}
+
+append_unique_line() {
+  local path=$1 value=$2
+  [[ -f $path ]] && grep -Fxq -- "$value" "$path" && return 0
+  printf '%s\n' "$value" >> "$path"
+}
+
+remove_created_bond_records_for_mac() {
+  local wanted=$1 path=$STATE_DIR/created-bonds temp controller mac extra
+  [[ -f $path ]] || return 0
+  temp=$(mktemp "$STATE_DIR/.lines.XXXXXX") || return 1
+  while read -r controller mac extra; do
+    [[ -z $extra && -n $controller && -n $mac ]] || {
+      rm -f -- "$temp"
+      return 1
+    }
+    if ! valid_mac "$controller" || ! valid_mac "$mac"; then
+      rm -f -- "$temp"
+      return 1
+    fi
+    [[ $mac == "$wanted" ]] || printf '%s %s\n' "$controller" "$mac" >> "$temp"
+  done < "$path"
+  mv -f -- "$temp" "$path"
+}
+
+remove_recorded_bonds_for_speaker() {
+  local wanted=$1 controller mac extra failed=0
+  [[ -f $STATE_DIR/created-bonds ]] || return 0
+  while read -r controller mac extra; do
+    [[ -z $extra ]] || return 1
+    valid_mac "$controller" || return 1
+    valid_mac "$mac" || return 1
+    [[ $mac == "$wanted" ]] || continue
+    if device_info_on_controller "$controller" "$mac" >/dev/null 2>&1 &&
+       ! remove_bluetooth_device_on_controller "$controller" "$mac"; then
+      warn "Could not remove A2DPilot-created bond $mac from controller $controller."
+      failed=1
+    fi
+  done < "$STATE_DIR/created-bonds"
+  (( failed == 0 )) || return 1
+  remove_created_bond_records_for_mac "$wanted"
+}
+
+append_speaker_to_config() {
+  local mac=$1 directory temp
+  parse_config "$CONFIG_FILE" || return 1
+  speaker_configured "$mac" && return 0
+  directory=$(dirname "$CONFIG_FILE")
+  temp=$(mktemp "$directory/.a2dpilot-config.XXXXXX") || return 1
+  cp -- "$CONFIG_FILE" "$temp"
+  printf '\nspeaker = %s\n' "$mac" >> "$temp"
+  parse_config "$temp" || {
+    rm -f -- "$temp"
+    return 1
+  }
+  atomic_install_file "$temp" "$CONFIG_FILE" 0644
+  local rc=$?
+  rm -f -- "$temp"
+  return "$rc"
+}
+
+remove_speaker_from_config() {
+  local wanted=$1 directory temp raw line key value
+  directory=$(dirname "$CONFIG_FILE")
+  temp=$(mktemp "$directory/.a2dpilot-config.XXXXXX") || return 1
+  while IFS= read -r raw || [[ -n $raw ]]; do
+    line=$(trim "$raw")
+    if [[ $line == *=* ]]; then
+      key=$(trim "${line%%=*}")
+      value=$(trim "${line#*=}")
+      if [[ $key == speaker ]] && valid_mac "$value" && [[ ${value^^} == "$wanted" ]]; then
+        continue
+      fi
+    fi
+    printf '%s\n' "$raw" >> "$temp"
+  done < "$CONFIG_FILE"
+  parse_config "$temp" || {
+    rm -f -- "$temp"
+    return 1
+  }
+  atomic_install_file "$temp" "$CONFIG_FILE" 0644
+  local rc=$?
+  rm -f -- "$temp"
+  return "$rc"
+}
+
+valid_agent() {
+  case $1 in
+    DisplayOnly|DisplayYesNo|KeyboardDisplay|KeyboardOnly|NoInputNoOutput) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+wait_for_device_connection() {
+  local mac=$1 deadline=${2:-}
+  [[ -n $deadline ]] || deadline=$(( $(now_seconds) + CONNECT_TIMEOUT ))
+  while true; do
+    device_connected "$mac" && return 0
+    (( $(now_seconds) < deadline )) || return 1
+    sleep 1
+  done
+}
+
+pair_on_controller() {
+  local mac=$1 agent=$2
+  if [[ $CFG_CONTROLLER == auto ]]; then
+    if has_tty; then
+      bluetoothctl --timeout 60 --agent "$agent" pair "$mac" < /dev/tty > /dev/tty
+    else
+      bluetoothctl --timeout 60 --agent "$agent" pair "$mac"
+    fi
+    return
+  fi
+  if ! has_tty; then
+    controller_agent_batch "$CFG_CONTROLLER" 60 "$agent" "pair $mac"
+    return
+  fi
+
+  local pair_pid input_fd output_fd tty_output forward_pid='' char output_buffer=''
+  local result=1 completed=0
+  coproc A2DPILOT_PAIR_SESSION {
+    run_bounded_bluetoothctl 60 --agent "$agent" 2>&1
+  }
+  pair_pid=$A2DPILOT_PAIR_SESSION_PID
+  exec {input_fd}>&"${A2DPILOT_PAIR_SESSION[1]}"
+  exec {output_fd}<&"${A2DPILOT_PAIR_SESSION[0]}"
+  exec {tty_output}> /dev/tty
+  printf 'select %s\npair %s\n' "$CFG_CONTROLLER" "$mac" >&"$input_fd"
+  cat /dev/tty >&"$input_fd" &
+  forward_pid=$!
+
+  while IFS= read -r -N 1 char <&"$output_fd"; do
+    printf '%s' "$char" >&"$tty_output"
+    output_buffer+=$char
+    (( ${#output_buffer} <= 512 )) || output_buffer=${output_buffer: -512}
+    if (( completed == 0 )) && [[ $output_buffer == *'Pairing successful'* ]]; then
+      result=0
+      completed=1
+    elif (( completed == 0 )) && \
+         [[ $output_buffer == *'Failed to pair'* || $output_buffer == *' not available'* ]]; then
+      completed=1
+    fi
+    if (( completed == 1 )); then
+      kill "$forward_pid" 2>/dev/null || true
+      wait "$forward_pid" 2>/dev/null || true
+      forward_pid=
+      printf 'quit\n' >&"$input_fd" || true
+      completed=2
+    fi
+  done
+  [[ -z $forward_pid ]] || {
+    kill "$forward_pid" 2>/dev/null || true
+    wait "$forward_pid" 2>/dev/null || true
+  }
+  exec {input_fd}>&-
+  exec {output_fd}<&-
+  exec {tty_output}>&-
+  wait "$pair_pid" 2>/dev/null || true
+  return "$result"
+}
+
+pair_one() {
+  local mac=$1 agent=$2 was_paired=0 deadline bond_controller=''
+  device_paired "$mac" && was_paired=1
+  if (( was_paired == 0 )); then
+    bond_controller=$(configured_controller_address) || return 1
+    note "Scanning for $mac; put the speaker in pairing mode..."
+    scan_bredr
+    pair_on_controller "$mac" "$agent" || return 1
+    device_paired "$mac" || return 1
+    append_unique_line "$STATE_DIR/created-bonds" "$bond_controller $mac" || return 1
+  fi
+  if ! device_trusted "$mac"; then
+    bluetooth_device_command 10 trust "$mac" >/dev/null 2>&1 || true
+    device_trusted "$mac" || return 1
+  fi
+  deadline=$(( $(now_seconds) + CONNECT_TIMEOUT ))
+  bluetooth_device_command "$CONNECT_TIMEOUT" connect "$mac" >/dev/null 2>&1 || true
+  device_paired "$mac" && device_trusted "$mac" && \
+    wait_for_device_connection "$mac" "$deadline" || return 1
+  append_speaker_to_config "$mac" || return 1
+  if (( was_paired )); then
+    note "Using existing trusted bond for $mac."
+  else
+    note "Paired and trusted $mac."
+  fi
+}
+
+interactive_pair_loop() {
+  local choice index mac agent=$1 line
+  local -a devices=()
+  while true; do
+    note "Scanning for Bluetooth Classic audio devices..."
+    scan_bredr
+    devices=()
+    while IFS= read -r line; do
+      [[ $line =~ ^Device[[:space:]]+(([[:xdigit:]]{2}:){5}[[:xdigit:]]{2})[[:space:]]+(.+)$ ]] || continue
+      devices+=("${BASH_REMATCH[1]^^}|${BASH_REMATCH[3]}")
+    done < <(configured_bluetooth_devices 2>/dev/null || true)
+    if (( ${#devices[@]} == 0 )); then
+      note "No devices were discovered."
+      return 0
+    fi
+    tty_print 'Discovered devices:\n'
+    for index in "${!devices[@]}"; do
+      tty_print '  %d) %s %s\n' "$((index + 1))" "${devices[$index]%%|*}" "${devices[$index]#*|}"
+    done
+    tty_print 'Select a device number, or press Enter to finish: '
+    tty_read choice || return 0
+    [[ -n $choice ]] || return 0
+    [[ $choice =~ ^[0-9]+$ ]] || {
+      warn "Invalid selection."
+      continue
+    }
+    index=$((choice - 1))
+    (( index >= 0 && index < ${#devices[@]} )) || {
+      warn "Invalid selection."
+      continue
+    }
+    mac=${devices[$index]%%|*}
+    pair_one "$mac" "$agent" || warn "Could not pair $mac; it was not added."
+  done
+}
+
+pair_action() {
+  require_root
+  [[ -f $STATE_FILE ]] || die "A2DPilot is not installed."
+  local mode=interactive mac='' agent=''
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --all) [[ $mode == interactive && -z $mac ]] || die "Specify either a MAC address or --all."; mode=all; shift ;;
+      --agent) [[ $# -ge 2 ]] || die "--agent requires a value."; agent=$2; shift 2 ;;
+      --*) die "Unknown pair option: $1" ;;
+      *) [[ -z $mac && $mode == interactive ]] || die "Only one MAC address may be paired at a time."; mac=$1; mode=one; shift ;;
+    esac
+  done
+  [[ -z $mac ]] || valid_mac "$mac" || die "Invalid Bluetooth MAC address: $mac"
+  [[ -z $mac ]] || mac=$(normalize_mac "$mac")
+  if [[ -z $agent ]]; then
+    if has_tty; then agent=KeyboardDisplay; else agent=NoInputNoOutput; fi
+  fi
+  valid_agent "$agent" || die "Unsupported BlueZ agent capability: $agent"
+  [[ $mode != interactive ]] || has_tty || die "Interactive pairing requires a terminal or an explicit MAC address."
+
+  acquire_lock
+  parse_config "$CONFIG_FILE" || {
+    local error=$CONFIG_ERROR
+    release_lock
+    die "$error"
+  }
+  power_controller || {
+    release_lock
+    die "No usable Bluetooth controller is available."
+  }
+
+  local failed=0 speaker
+  case $mode in
+    one) pair_one "$mac" "$agent" || failed=1 ;;
+    all)
+      for speaker in "${CFG_SPEAKERS[@]}"; do
+        pair_one "$speaker" "$agent" || {
+          warn "Could not provision $speaker."
+          failed=1
+        }
+      done
+      ;;
+    interactive) interactive_pair_loop "$agent" || failed=1 ;;
+  esac
+  release_lock
+  systemctl try-restart a2dpilot.service || failed=1
+  (( failed == 0 )) || die "One or more speakers could not be provisioned."
+}
+
+forget_action() {
+  require_root
+  [[ -f $STATE_FILE ]] || die "A2DPilot is not installed."
+  local mac='' assume_yes=0 answer
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --yes) assume_yes=1; shift ;;
+      --*) die "Unknown forget option: $1" ;;
+      *) [[ -z $mac ]] || die "Only one MAC address may be forgotten."; mac=$1; shift ;;
+    esac
+  done
+  [[ -n $mac ]] || die "forget requires a Bluetooth MAC address."
+  valid_mac "$mac" || die "Invalid Bluetooth MAC address: $mac"
+  mac=$(normalize_mac "$mac")
+  if (( assume_yes == 0 )); then
+    has_tty || die "Use --yes when forgetting a device non-interactively."
+    tty_print 'Forget %s and remove its Bluetooth bond? [y/N] ' "$mac"
+    tty_read answer || answer=
+    [[ $answer == y || $answer == Y || $answer == yes || $answer == YES ]] || {
+      note "Device was not forgotten."
+      return 0
+    }
+  fi
+
+  acquire_lock
+  parse_config "$CONFIG_FILE" || {
+    local error=$CONFIG_ERROR
+    release_lock
+    die "$error"
+  }
+  disconnect_bluetooth_device "$mac" || true
+  if device_info "$mac" >/dev/null 2>&1; then
+    remove_bluetooth_device "$mac" || {
+      release_lock
+      die "BlueZ could not remove $mac; configuration was left unchanged."
+    }
+  fi
+  remove_recorded_bonds_for_speaker "$mac" || {
+    release_lock
+    die "One or more A2DPilot-created bonds for $mac could not be removed."
+  }
+  remove_speaker_from_config "$mac" || {
+    release_lock
+    die "Could not remove $mac from the configuration."
+  }
+  release_lock
+  systemctl try-restart a2dpilot.service || true
+  note "Forgot $mac."
+}
+
+now_seconds() { date +%s; }
+
+connection_backoff() {
+  local failures=$1 interval=$2 count=1
+  local delay=$interval
+  while (( count < failures && delay < 60 )); do
+    delay=$((delay * 2))
+    (( delay > 60 )) && delay=60
+    count=$((count + 1))
+  done
+  printf '%s\n' "$delay"
+}
+
+wait_for_health() {
+  local mac=$1 deadline=${2:-}
+  [[ -n $deadline ]] || deadline=$(( $(now_seconds) + CONNECT_TIMEOUT ))
+  while true; do
+    device_healthy "$mac" && return 0
+    (( $(now_seconds) < deadline )) || return 1
+    sleep 1
+  done
+}
+
+disconnect_other_speakers() {
+  local winner=$1 mac
+  for mac in "${CFG_SPEAKERS[@]}"; do
+    [[ $mac == "$winner" ]] && continue
+    device_connected "$mac" || continue
+    disconnect_bluetooth_device "$mac" || warn "Could not disconnect stale speaker $mac."
+  done
+}
+
+daemon_log() {
+  printf '%s %s\n' "$(date -Is)" "$*"
+}
+
+remember_daemon_active() {
+  local mac=${1:-} path=$STATE_DIR/active-speaker temp
+  DAEMON_ACTIVE=$mac
+  if [[ -z $mac ]]; then
+    rm -f -- "$path"
+    return 0
+  fi
+  valid_mac "$mac" || return 1
+  temp=$(mktemp "$STATE_DIR/.active-speaker.XXXXXX") || return 1
+  printf '%s\n' "$mac" > "$temp"
+  chmod 0600 "$temp"
+  mv -f -- "$temp" "$path"
+}
+
+load_daemon_active() {
+  local path=$STATE_DIR/active-speaker saved
+  [[ -z $DAEMON_ACTIVE && -f $path && ! -L $path ]] || return 0
+  IFS= read -r saved < "$path" || saved=
+  if valid_mac "$saved"; then
+    DAEMON_ACTIVE=$(normalize_mac "$saved")
+  else
+    rm -f -- "$path"
+  fi
+}
+
+daemon_cycle() {
+  local mac now next failures delay deadline
+  now=$(now_seconds)
+
+  if [[ -n $DAEMON_ACTIVE ]]; then
+    if ! speaker_configured "$DAEMON_ACTIVE"; then
+      disconnect_bluetooth_device "$DAEMON_ACTIVE" || true
+      remember_daemon_active ''
+    elif device_healthy "$DAEMON_ACTIVE"; then
+      disconnect_other_speakers "$DAEMON_ACTIVE"
+      return 0
+    else
+      remember_daemon_active ''
+    fi
+  fi
+
+  # On restart, keep any already-healthy configured speaker instead of
+  # preempting it with a higher-priority device.
+  for mac in "${CFG_SPEAKERS[@]}"; do
+    if device_healthy "$mac"; then
+      remember_daemon_active "$mac"
+      disconnect_other_speakers "$mac"
+      return 0
+    fi
+  done
+
+  for mac in "${CFG_SPEAKERS[@]}"; do
+    next=${DAEMON_NEXT_ATTEMPT[$mac]:-0}
+    (( now >= next )) || continue
+    if ! device_paired "$mac"; then
+      daemon_log "$mac is not paired; run 'sudo a2dpilot pair $mac'."
+      DAEMON_NEXT_ATTEMPT[$mac]=$((now + 60))
+      continue
+    fi
+    if ! device_trusted "$mac"; then
+      bluetooth_device_command 5 trust "$mac" >/dev/null 2>&1 || true
+      if ! device_trusted "$mac"; then
+        daemon_log "could not trust paired speaker $mac"
+        DAEMON_NEXT_ATTEMPT[$mac]=$((now + 60))
+        continue
+      fi
+    fi
+    daemon_log "connecting $mac"
+    deadline=$(( $(now_seconds) + CONNECT_TIMEOUT ))
+    if bluetooth_device_command "$CONNECT_TIMEOUT" connect "$mac" >/dev/null 2>&1 && \
+       wait_for_health "$mac" "$deadline"; then
+      remember_daemon_active "$mac"
+      DAEMON_FAILURES[$mac]=0
+      DAEMON_NEXT_ATTEMPT[$mac]=0
+      disconnect_other_speakers "$mac"
+      daemon_log "connected $mac with codec $(a2dp_codec "$mac" 2>/dev/null || printf unknown)"
+      return 0
+    fi
+    failures=$(( ${DAEMON_FAILURES[$mac]:-0} + 1 ))
+    DAEMON_FAILURES[$mac]=$failures
+    delay=$(connection_backoff "$failures" "$CFG_RECONNECT_INTERVAL")
+    DAEMON_NEXT_ATTEMPT[$mac]=$((now + delay))
+    daemon_log "connection to $mac failed; retrying in ${delay}s"
+  done
+}
+
+daemon_action() {
+  require_root
+  trap 'exit 0' TERM INT
+  while true; do
+    if ! acquire_lock 1; then
+      sleep 1
+      continue
+    fi
+    if parse_config "$CONFIG_FILE"; then
+      DAEMON_HAVE_CONFIG=1
+      DAEMON_LAST_CONFIG_ERROR=
+      load_daemon_active
+      if ! reconcile_runtime_configuration; then
+        daemon_log "could not apply runtime configuration"
+      elif ! power_controller; then
+        daemon_log "no usable Bluetooth controller is available"
+      else
+        daemon_cycle
+      fi
+      release_lock
+      sleep "$CFG_RECONNECT_INTERVAL"
+    else
+      if [[ $CONFIG_ERROR != "$DAEMON_LAST_CONFIG_ERROR" ]]; then
+        daemon_log "$CONFIG_ERROR"
+        DAEMON_LAST_CONFIG_ERROR=$CONFIG_ERROR
+      fi
+      if (( DAEMON_HAVE_CONFIG )); then
+        daemon_cycle || true
+        release_lock
+        sleep "$CFG_RECONNECT_INTERVAL"
+      else
+        release_lock
+        sleep 5
+      fi
+    fi
+  done
+}
+
+media_url_for_key() {
+  local wanted=$1 index template url command_id
+  RESOLVED_MEDIA_URL=
+  MEDIA_STATE_ACTION=
+  for index in "${!CFG_MEDIA_KEYS[@]}"; do
+    [[ ${CFG_MEDIA_KEYS[$index]} == "$wanted" ]] || continue
+    command_id=$(date +%s%3N)
+    template=${CFG_MEDIA_URLS[$index]}
+    expand_player_state_tokens "$template" "$((10#$command_id - 1))" || return 1
+    template=$EXPANDED_MEDIA_TEMPLATE
+    if [[ $template == /* ]]; then
+      [[ -n $CFG_BASE_URL ]] || return 1
+      url=$CFG_BASE_URL$template
+    else
+      url=$template
+    fi
+    url=${url//\{command-id\}/$command_id}
+    valid_http_url "$url" || return 1
+    RESOLVED_MEDIA_URL=$url
+    return 0
+  done
+  return 1
+}
+
+media_key_is_stateful() {
+  local wanted=$1 index template
+  for index in "${!CFG_MEDIA_KEYS[@]}"; do
+    [[ ${CFG_MEDIA_KEYS[$index]} == "$wanted" ]] || continue
+    template=${CFG_MEDIA_URLS[$index]}
+    [[ $template == *'{volume-up}'* ||
+       $template == *'{volume-down}'* ||
+       $template == *'{mute-toggle}'* ||
+       $template == *'{shuffle-toggle}'* ||
+       $template == *'{repeat-cycle}'* ]]
+    return
+  done
+  return 1
+}
+
+media_mute_state_path() {
+  local digest
+  [[ -n $CFG_BASE_URL ]] || return 1
+  digest=$(printf '%s' "$CFG_BASE_URL" | sha256sum) || return 1
+  digest=${digest%% *}
+  [[ $digest =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s/mute-%s\n' "$MEDIA_STATE_DIR" "$digest"
+}
+
+prepare_media_state_directory() {
+  local owner runtime_uid media_group
+  runtime_uid=$(id -u "$MEDIA_RUNTIME_USER") || return 1
+  media_group=$(id -gn "$MEDIA_RUNTIME_USER") || return 1
+  validate_directory_chain "$MEDIA_STATE_DIR"
+  if [[ ! -e $MEDIA_STATE_DIR ]]; then
+    if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+      install -d -o "$MEDIA_RUNTIME_USER" -g "$media_group" -m 0700 "$MEDIA_STATE_DIR" || return 1
+    else
+      install -d -m 0700 "$MEDIA_STATE_DIR" || return 1
+    fi
+  fi
+  [[ -d $MEDIA_STATE_DIR && ! -L $MEDIA_STATE_DIR ]] || return 1
+  owner=$(stat -c %u "$MEDIA_STATE_DIR") || return 1
+  [[ $owner == "$runtime_uid" || $owner == "${EUID:-$(id -u)}" ]] || return 1
+  chmod 0700 "$MEDIA_STATE_DIR"
+}
+
+read_media_mute_volume() {
+  local path directory owner file_owner runtime_uid saved_base saved_volume _extra
+  runtime_uid=$(id -u "$MEDIA_RUNTIME_USER") || return 1
+  path=$(media_mute_state_path) || return 1
+  directory=$(dirname "$path")
+  [[ -e $directory || -L $directory ]] || return 2
+  validate_directory_chain "$directory"
+  owner=$(stat -c %u "$directory") || return 1
+  [[ $owner == "$runtime_uid" || $owner == "${EUID:-$(id -u)}" ]] || return 1
+  [[ -e $path || -L $path ]] || return 2
+  [[ -f $path && ! -L $path ]] || return 1
+  file_owner=$(stat -c %u "$path") || return 1
+  [[ $file_owner == "$runtime_uid" || $file_owner == "${EUID:-$(id -u)}" ]] || return 1
+  {
+    IFS= read -r saved_base
+    IFS= read -r saved_volume
+    if IFS= read -r _extra; then return 1; fi
+  } < "$path"
+  [[ $saved_base == "$CFG_BASE_URL" ]] || return 1
+  [[ $saved_volume =~ ^[1-9][0-9]*$ ]] && (( 10#$saved_volume <= 100 )) || return 1
+  printf '%s\n' "$saved_volume"
+}
+
+write_media_mute_volume() {
+  local volume=$1 path temp media_group
+  [[ $volume =~ ^[1-9][0-9]*$ ]] && (( 10#$volume <= 100 )) || return 1
+  prepare_media_state_directory || return 1
+  path=$(media_mute_state_path) || return 1
+  [[ ! -e $path || -f $path && ! -L $path ]] || return 1
+  temp=$(mktemp "$MEDIA_STATE_DIR/.mute.XXXXXX") || return 1
+  if ! printf '%s\n%s\n' "$CFG_BASE_URL" "$volume" > "$temp"; then
+    rm -f -- "$temp"
+    return 1
+  fi
+  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    if ! media_group=$(id -gn "$MEDIA_RUNTIME_USER") ||
+       ! chown "$MEDIA_RUNTIME_USER:$media_group" "$temp"; then
+      rm -f -- "$temp"
+      return 1
+    fi
+  fi
+  if ! chmod 0600 "$temp" || ! mv -f -- "$temp" "$path"; then
+    rm -f -- "$temp"
+    return 1
+  fi
+}
+
+clear_media_mute_volume() {
+  local path
+  path=$(media_mute_state_path) || return 1
+  validate_directory_chain "$(dirname "$path")"
+  [[ ! -e $path || -f $path && ! -L $path ]] || return 1
+  rm -f -- "$path"
+}
+
+plex_music_timeline_value() {
+  local attribute=$1 command_id=$2 poll_url response remaining element value
+  local timeline_pattern='<Timeline[[:space:]][^>]*>'
+  local music_pattern='(^|[[:space:]])type="music"([[:space:]/>])'
+  local attribute_pattern
+  [[ -n $CFG_BASE_URL ]] || return 1
+  poll_url="$CFG_BASE_URL/player/timeline/poll?wait=0&commandID=$command_id"
+  response=$(curl --fail --silent --show-error --max-time 3 \
+    --header 'X-Plex-Client-Identifier: a2dpilot' \
+    --header 'X-Plex-Device-Name: A2DPilot' \
+    "$poll_url") || return 1
+  attribute_pattern="(^|[[:space:]])${attribute}=\"([0-9]+)\"([[:space:]/>])"
+  remaining=$response
+  while [[ $remaining =~ $timeline_pattern ]]; do
+    element=${BASH_REMATCH[0]}
+    remaining=${remaining#*"$element"}
+    [[ $element =~ $music_pattern ]] || continue
+    if [[ $element =~ $attribute_pattern ]]; then
+      value=${BASH_REMATCH[2]}
+      printf '%s\n' "$value"
+      return 0
+    fi
+  done
+  return 1
+}
+
+expand_player_state_tokens() {
+  local template=$1 command_id=$2 value read_status
+  EXPANDED_MEDIA_TEMPLATE=
+  MEDIA_STATE_ACTION=
+  if [[ $template == *'{volume-up}'* || $template == *'{volume-down}'* ]]; then
+    value=$(plex_music_timeline_value volume "$command_id") || return 1
+    [[ $value =~ ^[0-9]+$ ]] && (( 10#$value <= 100 )) || return 1
+    if [[ $template == *'{volume-up}'* ]]; then
+      MEDIA_STATE_ACTION=clear
+      value=$((10#$value + VOLUME_STEP))
+      (( value <= 100 )) || value=100
+      template=${template//\{volume-up\}/$value}
+    fi
+    if [[ $template == *'{volume-down}'* ]]; then
+      (( 10#$value == 0 )) || MEDIA_STATE_ACTION=clear
+      value=$((10#$value - VOLUME_STEP))
+      (( value >= 0 )) || value=0
+      template=${template//\{volume-down\}/$value}
+    fi
+  fi
+  if [[ $template == *'{mute-toggle}'* ]]; then
+    value=$(plex_music_timeline_value volume "$command_id") || return 1
+    [[ $value =~ ^[0-9]+$ ]] && (( 10#$value <= 100 )) || return 1
+    if (( 10#$value > 0 )); then
+      MEDIA_STATE_ACTION=save:$((10#$value))
+      value=0
+    else
+      if value=$(read_media_mute_volume); then
+        MEDIA_STATE_ACTION=clear
+      else
+        read_status=$?
+        (( read_status == 2 )) || return 1
+        value=$((VOLUME_STEP * 3))
+      fi
+    fi
+    template=${template//\{mute-toggle\}/$value}
+  fi
+  if [[ $template == *'{shuffle-toggle}'* ]]; then
+    value=$(plex_music_timeline_value shuffle "$command_id") || return 1
+    [[ $value == 0 || $value == 1 ]] || return 1
+    value=$((1 - value))
+    template=${template//\{shuffle-toggle\}/$value}
+  fi
+  if [[ $template == *'{repeat-cycle}'* ]]; then
+    value=$(plex_music_timeline_value repeat "$command_id") || return 1
+    case $value in
+      0) value=2 ;;
+      2) value=1 ;;
+      1) value=0 ;;
+      *) return 1 ;;
+    esac
+    template=${template//\{repeat-cycle\}/$value}
+  fi
+  EXPANDED_MEDIA_TEMPLATE=$template
+}
+
+player_control_action() {
+  local media_key=${1:-} stateful=0
+  [[ $# -eq 1 ]] || die "Usage: a2dpilot player-control KEY_NAME"
+  [[ $media_key =~ ^KEY_[A-Z0-9_]+$ ]] || die "Invalid media key name: $media_key"
+  parse_config "$CONFIG_FILE" || die "$CONFIG_ERROR"
+  if media_key_is_stateful "$media_key"; then
+    stateful=1
+    acquire_media_lock || die "Could not acquire the media-control lock."
+  fi
+  if ! media_url_for_key "$media_key"; then
+    release_media_lock
+    die "No valid media URL is configured for $media_key"
+  fi
+  if [[ $MEDIA_STATE_ACTION == save:* ]]; then
+    write_media_mute_volume "${MEDIA_STATE_ACTION#save:}" || {
+      release_media_lock
+      die "Could not save the pre-mute volume."
+    }
+  fi
+  if ! curl --fail --silent --show-error --max-time 3 "$RESOLVED_MEDIA_URL"; then
+    release_media_lock
+    return 1
+  fi
+  if [[ $MEDIA_STATE_ACTION == clear ]]; then
+    clear_media_mute_volume || {
+      release_media_lock
+      die "Could not clear the pre-mute volume."
+    }
+  fi
+  (( stateful == 0 )) || release_media_lock
+}
+
+devices_action() {
+  require_root
+  [[ $# -eq 0 ]] || die "devices does not accept arguments."
+  parse_config "$CONFIG_FILE" || die "$CONFIG_ERROR"
+  local priority=0 mac paired trusted connected a2dp avrcp codec name
+  printf '%-4s %-17s %-7s %-7s %-9s %-5s %-6s %-10s %s\n' \
+    '#' ADDRESS PAIRED TRUSTED CONNECTED A2DP AVRCP CODEC NAME
+  for mac in "${CFG_SPEAKERS[@]}"; do
+    priority=$((priority + 1))
+    paired=no; trusted=no; connected=no; a2dp=no; avrcp=no; codec=-
+    device_paired "$mac" && paired=yes
+    device_trusted "$mac" && trusted=yes
+    device_connected "$mac" && connected=yes
+    if a2dp_connected "$mac"; then
+      a2dp=yes
+      codec=$(a2dp_codec "$mac" 2>/dev/null || printf unknown)
+    fi
+    avrcp_connected "$mac" && avrcp=yes
+    name=$(device_name "$mac")
+    printf '%-4s %-17s %-7s %-7s %-9s %-5s %-6s %-10s %s\n' \
+      "$priority" "$mac" "$paired" "$trusted" "$connected" "$a2dp" "$avrcp" "$codec" "$name"
+  done
+  (( priority > 0 )) || note "No speakers are configured."
+}
+
+status_action() {
+  require_root
+  [[ $# -eq 0 ]] || die "status does not accept arguments."
+  if [[ -f $STATE_FILE ]]; then
+    # SC1090: This is A2DPilot's generated state file in its root-only state
+    # directory; its variable path also permits isolated test fixtures.
+    # shellcheck disable=SC1090
+    source "$STATE_FILE"
+    note "Installation: ${INSTALL_PHASE:-unknown} ($STATE_FILE)"
+  else
+    note "Installation: absent"
+  fi
+  if parse_config "$CONFIG_FILE"; then
+    note "Audio user: $CFG_AUDIO_USER"
+    note "Controller: $CFG_CONTROLLER"
+    note "Reconnect interval: ${CFG_RECONNECT_INTERVAL}s"
+    note "Media controls: $CFG_MEDIA_CONTROLS"
+    note "Base URL: ${CFG_BASE_URL:-none}"
+    note "Media key mappings: ${#CFG_MEDIA_KEYS[@]}"
+    devices_action
+  else
+    warn "$CONFIG_ERROR"
+  fi
+  note ""
+  rfkill list bluetooth 2>&1 || true
+  systemctl --no-pager --full status bluetooth.service triggerhappy.service \
+    triggerhappy.socket a2dpilot.service 2>&1 || true
+  if [[ -n ${CFG_AUDIO_USER:-} ]] && id "$CFG_AUDIO_USER" >/dev/null 2>&1; then
+    as_user_systemctl "$CFG_AUDIO_USER" --no-pager --full status \
+      pipewire.service pipewire.socket pipewire-pulse.service pipewire-pulse.socket \
+      wireplumber.service 2>&1 || true
+  fi
+}
+
+rollback_failed_install() {
+  local rc=$1
+  trap - ERR INT TERM
+  release_lock
+  note "Installation failed; attempting automatic rollback..."
+  if "$SCRIPT_PATH" uninstall --keep-bonds; then
+    note "Automatic rollback succeeded."
+  else
+    if [[ -f $STATE_FILE ]] && ! write_state_file failed; then
+      warn "Could not mark the retained installation snapshot as failed."
+    fi
+    warn "Automatic rollback failed; recovery state remains at $STATE_DIR."
+  fi
+  exit "$rc"
+}
+
+infer_audio_user() {
+  local requested=${1:-}
+  if [[ -n $requested ]]; then
+    printf '%s\n' "$requested"
+  elif [[ -n ${SUDO_USER:-} && ${SUDO_USER:-} != root ]] && id "$SUDO_USER" >/dev/null 2>&1; then
+    printf '%s\n' "$SUDO_USER"
+  elif id pi >/dev/null 2>&1; then
+    printf 'pi\n'
+  else
+    return 1
+  fi
+}
+
+install_action() {
+  require_root
+  local requested_user='' non_interactive=0
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --user) [[ $# -ge 2 ]] || die "--user requires a value."; requested_user=$2; shift 2 ;;
+      --non-interactive) non_interactive=1; shift ;;
+      *) die "Unknown install option: $1" ;;
+    esac
+  done
+  acquire_lock
+
+  if [[ -e $STATE_FILE ]]; then
+    local existing_phase
+    existing_phase=$(
+      # SC1090: STATE_FILE is generated by render_state_file and stored beneath
+      # the validated root-only state directory, so it is safe to source here.
+      # shellcheck disable=SC1090
+      source "$STATE_FILE"
+      printf '%s\n' "${INSTALL_PHASE:-installed}"
+    ) || die "Could not read existing installation state."
+    case $existing_phase in
+      installing|failed)
+        note "Recovering interrupted installation before retrying..."
+        release_lock
+        "$SCRIPT_PATH" uninstall --keep-bonds || die "Could not recover the interrupted installation."
+        acquire_lock
+        ;;
+      *) release_lock; die "A2DPilot is already installed." ;;
+    esac
+  fi
+
+  validate_managed_paths "$INSTALLED_CLI" "$CONFIG_FILE" "$SYSTEMD_UNIT" "$WIREPLUMBER_CONF" "$TRIGGER_CONF"
+  [[ ! -e $STATE_DIR || -d $STATE_DIR && ! -L $STATE_DIR ]] || die "Unsafe state directory: $STATE_DIR"
+  [[ ! -e $BACKUP_DIR || -d $BACKUP_DIR && ! -L $BACKUP_DIR ]] || die "Unsafe backup directory: $BACKUP_DIR"
+  validate_directory_chain "$BACKUP_DIR"
+  install -d -m 0700 "$STATE_DIR" "$BACKUP_DIR"
+  chown root:root "$STATE_DIR" "$BACKUP_DIR"
+  chmod 0700 "$STATE_DIR" "$BACKUP_DIR"
+  : > "$STATE_DIR/created-files"
+  : > "$STATE_DIR/replaced-files"
+  : > "$STATE_DIR/new-packages"
+  : > "$STATE_DIR/created-bonds"
+
+  local audio_user config_seed package
+  if [[ -e $CONFIG_FILE || -L $CONFIG_FILE ]]; then
+    [[ -z $requested_user ]] || die "--user only applies when creating a new configuration."
+    parse_config "$CONFIG_FILE" || die "$CONFIG_ERROR"
+    audio_user=$CFG_AUDIO_USER
+  else
+    audio_user=$(infer_audio_user "$requested_user") || \
+      die "Could not infer an audio user; use install --user USER."
+    id "$audio_user" >/dev/null 2>&1 || die "Audio user does not exist: $audio_user"
+  fi
+
+  record_system_service_states
+  record_user_state "$audio_user"
+  record_rfkill_state
+  record_controller_state
+  for package in "${PACKAGES[@]}"; do
+    dpkg-query -W -f='${db:Status-Abbrev}' "$package" 2>/dev/null | grep -q '^ii' || \
+      printf '%s\n' "$package" >> "$STATE_DIR/new-packages"
+  done
+  backup_file "$INSTALLED_CLI"
+  backup_file "$CONFIG_FILE"
+  backup_file "$SYSTEMD_UNIT"
+  backup_file "$WIREPLUMBER_CONF"
+  backup_file "$TRIGGER_CONF"
+  write_state_file installing
+
+  trap 'rollback_failed_install $?' ERR
+  trap 'rollback_failed_install 130' INT
+  trap 'rollback_failed_install 143' TERM
+
+  note "Installing BlueZ, PipeWire, WirePlumber, Triggerhappy, and A2DP codec support..."
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${PACKAGES[@]}"
+
+  install -d -m 0755 "$(dirname "$INSTALLED_CLI")" "$(dirname "$SYSTEMD_UNIT")" \
+    "$(dirname "$WIREPLUMBER_CONF")" "$(dirname "$TRIGGER_CONF")" "$(dirname "$CONFIG_FILE")"
+  if [[ $SCRIPT_PATH != "$INSTALLED_CLI" ]]; then
+    prepare_file_target "$INSTALLED_CLI"
+    install -o root -g root -m 0755 "$SCRIPT_PATH" "$INSTALLED_CLI"
+  else
+    chmod 0755 "$INSTALLED_CLI"
+  fi
+
+  if [[ ! -e $CONFIG_FILE ]]; then
+    config_seed=$(mktemp "$(dirname "$CONFIG_FILE")/.a2dpilot-config.XXXXXX")
+    write_default_config "$config_seed" "$audio_user"
+    mv -f -- "$config_seed" "$CONFIG_FILE"
+  fi
+  chown root:root "$CONFIG_FILE"
+  chmod 0644 "$CONFIG_FILE"
+  parse_config "$CONFIG_FILE" || die "$CONFIG_ERROR"
+
+  prepare_file_target "$SYSTEMD_UNIT"
+  write_systemd_unit "$SYSTEMD_UNIT"
+  prepare_file_target "$WIREPLUMBER_CONF"
+  write_wireplumber_config "$WIREPLUMBER_CONF"
+  prepare_file_target "$TRIGGER_CONF"
+  write_trigger_config "$TRIGGER_CONF" "$CFG_MEDIA_CONTROLS"
+
+  systemctl daemon-reload
+  ensure_audio_user "$CFG_AUDIO_USER"
+  printf '%s\n' "$CFG_AUDIO_USER" > "$STATE_DIR/runtime-user"
+  systemctl enable --now bluetooth.service triggerhappy.service triggerhappy.socket a2dpilot.service
+  systemctl restart triggerhappy.service
+  power_controller || warn "No usable Bluetooth controller is currently available."
+
+  write_state_file installed
+  trap - ERR INT TERM
+  release_lock
+  note "A2DPilot installed successfully for audio user $CFG_AUDIO_USER."
+
+  if (( non_interactive == 0 )) && has_tty; then
+    if (( ${#CFG_SPEAKERS[@]} > 0 )); then
+      "$INSTALLED_CLI" pair --all || warn "Some configured speakers were not paired."
+    fi
+    "$INSTALLED_CLI" pair || warn "Interactive pairing did not complete."
+  elif (( ${#CFG_SPEAKERS[@]} == 0 )); then
+    note "No speakers are configured. Run 'sudo a2dpilot pair' or 'sudo a2dpilot config'."
+  fi
+}
+
+remove_created_bonds() {
+  local controller mac extra failed=0
+  [[ -s $STATE_DIR/created-bonds ]] || return 0
+  while read -r controller mac extra; do
+    if [[ -n $extra ]] || ! valid_mac "$controller" || ! valid_mac "$mac"; then
+      warn "Invalid A2DPilot bond provenance entry; refusing to guess its controller."
+      failed=1
+      continue
+    fi
+    if device_info_on_controller "$controller" "$mac" >/dev/null 2>&1 &&
+       ! remove_bluetooth_device_on_controller "$controller" "$mac"; then
+      warn "Could not remove A2DPilot-created bond $mac from controller $controller."
+      failed=1
+    else
+      note "Removed A2DPilot-created bond $mac from controller $controller."
+    fi
+  done < "$STATE_DIR/created-bonds"
+  (( failed == 0 ))
+}
+
+choose_bond_policy() {
+  local requested=$1 answer controller mac extra
+  if [[ $requested == keep || ! -s $STATE_DIR/created-bonds ]]; then
+    printf 'keep\n'
+    return 0
+  fi
+  if [[ $requested == remove ]]; then
+    printf 'remove\n'
+    return 0
+  fi
+  if ! has_tty; then
+    note "Keeping Bluetooth bonds (non-interactive uninstall)." >&2
+    printf 'keep\n'
+    return 0
+  fi
+  tty_print 'Bluetooth bonds created by A2DPilot:\n'
+  while read -r controller mac extra; do
+    [[ -z $extra ]] || continue
+    if ! valid_mac "$controller" || ! valid_mac "$mac"; then
+      continue
+    fi
+    tty_print '  %s via %s %s\n' "$mac" "$controller" \
+      "$(device_name_on_controller "$controller" "$mac")"
+  done < "$STATE_DIR/created-bonds"
+  tty_print 'Remove these bonds? [y/N] '
+  tty_read answer || answer=
+  if [[ $answer == y || $answer == Y || $answer == yes || $answer == YES ]]; then
+    printf 'remove\n'
+  else
+    printf 'keep\n'
+  fi
+}
+
+restore_managed_files() {
+  local path
+  if [[ -f $STATE_DIR/created-files ]]; then
+    while IFS= read -r path; do
+      [[ -n $path ]] || continue
+      allowed_managed_path "$path" || die "Refusing to remove unmanaged path during rollback: $path"
+      validate_directory_chain "$(dirname "$path")"
+      [[ ! -d $path || -L $path ]] || die "Refusing to remove a directory during rollback: $path"
+      rm -f -- "$path"
+    done < "$STATE_DIR/created-files"
+  fi
+  if [[ -f $STATE_DIR/replaced-files ]]; then
+    while IFS= read -r path; do
+      [[ -n $path ]] || continue
+      allowed_managed_path "$path" || die "Refusing to restore unmanaged path: $path"
+      [[ -e $BACKUP_DIR$path || -L $BACKUP_DIR$path ]] || die "Missing backup for $path"
+      validate_directory_chain "$(dirname "$path")"
+      [[ ! -d $path || -L $path ]] || die "Refusing to overwrite a directory during rollback: $path"
+      rm -f -- "$path"
+      install -d "$(dirname "$path")"
+      cp -a -- "$BACKUP_DIR$path" "$path"
+    done < "$STATE_DIR/replaced-files"
+  fi
+}
+
+uninstall_action() {
+  require_root
+  local bond_request=ask bond_policy bond_failure=0 rollback_failure=0
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --keep-bonds) [[ $bond_request == ask ]] || die "Bond-policy flags are mutually exclusive."; bond_request=keep; shift ;;
+      --remove-bonds) [[ $bond_request == ask ]] || die "Bond-policy flags are mutually exclusive."; bond_request=remove; shift ;;
+      *) die "Unknown uninstall option: $1" ;;
+    esac
+  done
+  [[ -f $STATE_FILE ]] || die "A2DPilot is not installed."
+  acquire_lock
+  bond_policy=$(choose_bond_policy "$bond_request")
+
+  if systemctl show a2dpilot.service -p LoadState --value 2>/dev/null | grep -qv '^not-found$'; then
+    systemctl disable --now a2dpilot.service || rollback_failure=1
+  fi
+  if [[ $bond_policy == remove ]]; then
+    remove_created_bonds || bond_failure=1
+  else
+    note "Bluetooth bonds were preserved."
+  fi
+
+  restore_managed_files || rollback_failure=1
+  systemctl daemon-reload || rollback_failure=1
+  restore_all_user_states || rollback_failure=1
+  restore_controller_state
+  restore_rfkill_state
+  restore_system_service_states || rollback_failure=1
+
+  if [[ -s $STATE_DIR/new-packages ]]; then
+    local -a new_packages=()
+    mapfile -t new_packages < "$STATE_DIR/new-packages"
+    DEBIAN_FRONTEND=noninteractive apt-get remove -y "${new_packages[@]}" || rollback_failure=1
+  fi
+
+  release_lock
+  if (( rollback_failure )); then
+    write_state_file failed || true
+    die "Rollback was incomplete; recovery state remains at $STATE_DIR."
+  fi
+  rm -rf -- "$STATE_DIR"
+  note "A2DPilot was uninstalled and prior system state was restored."
+  (( bond_failure == 0 )) || die "System rollback succeeded, but one or more Bluetooth bonds could not be removed."
+}
+
+main() {
+  local action=${1:-}
+  [[ $# -gt 0 ]] && shift
+  case $action in
+    install) install_action "$@" ;;
+    config) config_action "$@" ;;
+    devices) devices_action "$@" ;;
+    pair) pair_action "$@" ;;
+    forget) forget_action "$@" ;;
+    status) status_action "$@" ;;
+    uninstall) uninstall_action "$@" ;;
+    daemon) daemon_action "$@" ;;
+    player-control) player_control_action "$@" ;;
+    -h|--help|help|'') usage ;;
+    *) usage >&2; die "Unknown command: $action" ;;
+  esac
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi
