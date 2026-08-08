@@ -190,7 +190,7 @@ test_config_parser_and_normalization() {
     printf 'base-url = https://player.example:32500/api///\n'
     printf 'media-key = KEY_NEXTSONG /next?request={command-id}\n'
     printf 'media-key = KEY_PLAYPAUSE https://other.example/play?literal=yes\n'
-    printf 'speaker = aa:bb:cc:dd:ee:ff\n'
+    printf 'speaker = aa:bb:cc:dd:ee:ff aptx_hd aptx sbc_xq sbc\n'
     printf 'speaker = 10:20:30:40:50:60\n'
   } > "$CONFIG_FILE"
   parse_config "$CONFIG_FILE"
@@ -207,6 +207,38 @@ test_config_parser_and_normalization() {
   assert_eq 'https://other.example/play?literal=yes' "${CFG_MEDIA_URLS[1]}"
   assert_eq AA:BB:CC:DD:EE:FF "${CFG_SPEAKERS[0]}"
   assert_eq 10:20:30:40:50:60 "${CFG_SPEAKERS[1]}"
+  assert_eq 'aptx_hd aptx sbc_xq sbc' "${CFG_SPEAKER_CODECS[0]}"
+  assert_eq '' "${CFG_SPEAKER_CODECS[1]}"
+}
+
+test_speaker_codec_configuration() {
+  local user mac=AA:BB:CC:DD:EE:FF all_codecs codec codec_id
+  local -a supported=()
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  all_codecs='sbc sbc_xq aac aac_eld aptx aptx_hd ldac aptx_ll aptx_ll_duplex faststream faststream_duplex lc3plus_hr opus_05 opus_05_51 opus_05_71 opus_05_duplex opus_05_pro opus_g'
+  write_test_config "$CONFIG_FILE" "$user" "$mac $all_codecs"
+  parse_config "$CONFIG_FILE"
+  assert_eq "$all_codecs" "${CFG_SPEAKER_CODECS[0]}"
+  assert_eq "$all_codecs" "$(speaker_codec_policy "$mac")"
+  assert_contains "$(speaker_codec_policy_display "$mac")" 'aptx>aptx_hd>ldac'
+  read -r -a supported <<< "$all_codecs"
+  for codec in "${supported[@]}"; do
+    codec_id=$(a2dp_codec_id "$codec")
+    assert_eq "$codec" "$(a2dp_codec_name "$codec_id")"
+  done
+
+  write_test_config "$CONFIG_FILE" "$user" "$mac sbc sbc"
+  if parse_config "$CONFIG_FILE"; then fail 'duplicate speaker codec was accepted'; fi
+  assert_contains "$CONFIG_ERROR" 'duplicate codec'
+
+  for invalid in auto SBC sbc,sbc_xq lc3 aptx_adaptive unknown_codec; do
+    write_test_config "$CONFIG_FILE" "$user" "$mac $invalid"
+    if parse_config "$CONFIG_FILE"; then fail "invalid speaker codec was accepted: $invalid"; fi
+    assert_contains "$CONFIG_ERROR" 'unsupported A2DP codec'
+  done
 }
 
 test_onboard_audio_configuration() {
@@ -316,7 +348,7 @@ test_invalid_reload_retains_last_valid_configuration() {
   load_app
   configure_scratch_paths
   user=$(id -un)
-  write_test_config "$CONFIG_FILE" "$user" AA:BB:CC:DD:EE:FF
+  write_test_config "$CONFIG_FILE" "$user" 'AA:BB:CC:DD:EE:FF aptx sbc'
   parse_config "$CONFIG_FILE"
   printf 'this is not configuration\n' > "$CONFIG_FILE"
   if parse_config "$CONFIG_FILE"; then fail 'invalid reload unexpectedly succeeded'; fi
@@ -326,6 +358,7 @@ test_invalid_reload_retains_last_valid_configuration() {
   assert_eq KEY_PLAYCD "${CFG_MEDIA_KEYS[0]}"
   assert_eq '/player/playback/playPause?type=music&commandID={command-id}' "${CFG_MEDIA_URLS[0]}"
   assert_eq AA:BB:CC:DD:EE:FF "${CFG_SPEAKERS[0]}"
+  assert_eq 'aptx sbc' "${CFG_SPEAKER_CODECS[0]}"
 }
 
 test_config_parser_avoids_legacy_subshell_helpers() {
@@ -1859,6 +1892,7 @@ test_pairing_provenance_and_existing_bond() {
   assert_file_contains "$TEST_SCRATCH/bluetooth.log" "pair $mac"
   parse_config "$CONFIG_FILE"
   assert_eq "$mac" "${CFG_SPEAKERS[0]}"
+  assert_eq '' "${CFG_SPEAKER_CODECS[0]}"
 
   : > "$TEST_SCRATCH/bluetooth.log"
   : > "$STATE_DIR/created-bonds"
@@ -1876,7 +1910,7 @@ test_pair_all_attempts_every_configured_speaker() {
   configure_scratch_paths
   CFG_CONTROLLER=auto
   user=$(id -un)
-  write_test_config "$CONFIG_FILE" "$user" "$first" "$second"
+  write_test_config "$CONFIG_FILE" "$user" "$first aptx sbc" "$second sbc"
   : > "$STATE_FILE"
   require_root() { :; }
   acquire_lock() { :; }
@@ -1928,7 +1962,7 @@ test_forget_removes_config_and_provenance() {
   load_app
   configure_scratch_paths
   user=$(id -un)
-  write_test_config "$CONFIG_FILE" "$user" "$mac" 10:20:30:40:50:60
+  write_test_config "$CONFIG_FILE" "$user" "$mac aptx_hd aptx sbc" 10:20:30:40:50:60
   printf '12:34:56:78:9A:BC %s\n' "$mac" > "$STATE_DIR/created-bonds"
   : > "$STATE_FILE"
   require_root() { :; }
@@ -1988,19 +2022,194 @@ test_codec_reporting_is_optimistic() {
     output=$(devices_action)
     assert_contains "$output" "$candidate_codec"
     assert_contains "$output" 'yes'
+    assert_contains "$output" 'CODEC-POLICY'
+    assert_contains "$output" 'auto'
   done
+  write_test_config "$CONFIG_FILE" "$user" 'AA:BB:CC:DD:EE:FF aptx_hd aptx sbc'
+  output=$(devices_action)
+  assert_contains "$output" 'aptx_hd>aptx>sbc'
 }
 
 test_codec_property_parsing() {
-  local codec
+  local codec calls
+  setup_scratch_dir
   load_app
+  configure_scratch_paths
   CFG_AUDIO_USER=$(id -un)
-  find_a2dp_node_id() { printf '42\n'; }
-  user_wpctl() {
-    printf '  * api.bluez5.codec = "ldac"\n'
+  printf '99\n' > "$TEST_SCRATCH/clock"
+  now_seconds() {
+    local current
+    current=$(< "$TEST_SCRATCH/clock")
+    current=$((current + 1))
+    printf '%s\n' "$current" > "$TEST_SCRATCH/clock"
+    printf '%s\n' "$current"
   }
-  codec=$(a2dp_codec AA:BB:CC:DD:EE:FF)
+  bounded_user_wpctl() {
+    printf '%s %s\n' "$2" "${*:3}" >> "$TEST_SCRATCH/wpctl-calls"
+    case $3 in
+      status) printf '  42. bluez_output.AA_BB_CC_DD_EE_FF.1\n' ;;
+      inspect) printf '  * api.bluez5.codec = "ldac"\n' ;;
+    esac
+  }
+  codec=$(a2dp_codec AA:BB:CC:DD:EE:FF 5)
   assert_eq ldac "$codec"
+  calls=$(< "$TEST_SCRATCH/wpctl-calls")
+  assert_contains "$calls" '4 status --name'
+  assert_contains "$calls" '3 inspect 42'
+}
+
+mock_a2dp_enum_profiles() {
+  cat <<'EOF'
+  Object: size 256, type Spa:Pod:Object:Param:Profile, id EnumProfile
+  Prop: key Spa:Pod:Object:Param:Profile:index (1), flags 00000000
+    Int 131079
+  Prop: key Spa:Pod:Object:Param:Profile:name (2), flags 00000000
+    String "a2dp-sink"
+  Object: size 256, type Spa:Pod:Object:Param:Profile, id EnumProfile
+  Prop: key Spa:Pod:Object:Param:Profile:index (1), flags 00000000
+    Int 131078
+  Prop: key Spa:Pod:Object:Param:Profile:name (2), flags 00000000
+    String "a2dp-sink-aptx"
+  Object: size 256, type Spa:Pod:Object:Param:Profile, id EnumProfile
+  Prop: key Spa:Pod:Object:Param:Profile:index (1), flags 00000000
+    Int 131073
+  Prop: key Spa:Pod:Object:Param:Profile:name (2), flags 00000000
+    String "a2dp-sink-sbc"
+  Object: size 256, type Spa:Pod:Object:Param:Profile, id EnumProfile
+  Prop: key Spa:Pod:Object:Param:Profile:index (1), flags 00000000
+    Int 131078
+  Prop: key Spa:Pod:Object:Param:Profile:name (2), flags 00000000
+    String "a2dp-sink-ldac"
+  Object: size 256, type Spa:Pod:Object:Param:Profile, id EnumProfile
+  Prop: key Spa:Pod:Object:Param:Profile:index (1), flags 00000000
+    Int 131584
+  Prop: key Spa:Pod:Object:Param:Profile:name (2), flags 00000000
+    String "bap-sink"
+EOF
+}
+
+test_pipewire_codec_profile_discovery() {
+  local output profiles
+  load_app
+  id() {
+    if [[ ${1:-} == -u && ${2:-} == audio ]]; then
+      printf '1234\n'
+    else
+      /usr/bin/id "$@"
+    fi
+  }
+  user_home() { printf '/srv/audio\n'; }
+  runuser() { printf '%s\n' "$*"; }
+  output=$(bounded_user_pw_cli audio 3 enum-params 55 EnumProfile)
+  assert_contains "$output" '-u audio -- env HOME=/srv/audio'
+  assert_contains "$output" 'XDG_RUNTIME_DIR=/run/user/1234'
+  assert_contains "$output" 'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1234/bus'
+  assert_contains "$output" 'timeout --signal=TERM --kill-after=1 3 pw-cli enum-params 55 EnumProfile'
+  output=$(bounded_user_wpctl audio 2 status --name)
+  assert_contains "$output" 'timeout --signal=TERM --kill-after=1 2 wpctl status --name'
+
+  CFG_AUDIO_USER=audio
+  bounded_user_wpctl() {
+    printf '  44. bluez_card.00_11_22_33_44_55\n'
+    printf '  55. bluez_card.AA_BB_CC_DD_EE_FF\n'
+  }
+  assert_eq 55 "$(find_a2dp_device_id AA:BB:CC:DD:EE:FF 3)"
+  bounded_user_pw_cli() { mock_a2dp_enum_profiles; }
+  profiles=$(enumerate_a2dp_profiles 55 3)
+  assert_eq $'aptx_hd 131079\naptx 131078\nsbc 131073' "$profiles"
+
+  bounded_user_pw_cli() { printf 'EnumProfile output changed shape\n'; }
+  if enumerate_a2dp_profiles 55 3 >/dev/null; then
+    fail 'unrecognized pw-cli output was accepted'
+  fi
+}
+
+test_per_speaker_codec_selection() {
+  local mac=AA:BB:CC:DD:EE:FF user state_file command_log rc
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  state_file=$TEST_SCRATCH/codec-state
+  command_log=$TEST_SCRATCH/pw-cli.log
+  CFG_AUDIO_USER=$user
+  CFG_MEDIA_CONTROLS=auto
+  CFG_SPEAKERS=("$mac")
+  CFG_SPEAKER_CODECS=('ldac aptx sbc')
+  find_a2dp_device_id() { printf '55\n'; }
+  device_connected() { return 0; }
+  a2dp_connected() { return 0; }
+  device_healthy() { return 0; }
+  now_seconds() { printf '100\n'; }
+  a2dp_codec() {
+    local codec_state
+    if [[ -f $state_file ]]; then
+      IFS= read -r codec_state < "$state_file"
+      printf '%s\n' "$codec_state"
+    else
+      printf 'sbc_xq\n'
+    fi
+  }
+  bounded_user_pw_cli() {
+    if [[ $3 == enum-params ]]; then
+      mock_a2dp_enum_profiles
+    else
+      printf '%s\n' "$*" >> "$command_log"
+      if [[ $* == *'131078'* ]]; then printf 'aptx\n' > "$state_file"; fi
+      if [[ $* == *'131073'* ]]; then printf 'sbc\n' > "$state_file"; fi
+    fi
+  }
+
+  apply_speaker_codec_policy "$mac" 110
+  assert_eq aptx "$(< "$state_file")"
+  assert_file_contains "$command_log" "set-param 55 Profile { index: 131078, save: false }"
+  assert_eq aptx "${DAEMON_CODEC_TARGET[$mac]}"
+  assert_eq 'ldac aptx sbc' "${DAEMON_CODEC_POLICY[$mac]}"
+
+  : > "$command_log"
+  apply_speaker_codec_policy "$mac" 110
+  [[ ! -s $command_log ]] || fail 'cached compliant codec was selected again'
+
+  CFG_SPEAKER_CODECS=('sbc')
+  apply_speaker_codec_policy "$mac" 110
+  assert_eq sbc "$(< "$state_file")"
+  assert_file_contains "$command_log" "set-param 55 Profile { index: 131073, save: false }"
+
+  : > "$command_log"
+  CFG_SPEAKER_CODECS=('ldac')
+  if apply_speaker_codec_policy "$mac" 110; then
+    fail 'speaker without a configured available codec became healthy'
+  else
+    rc=$?
+  fi
+  assert_eq 2 "$rc"
+  assert_contains "$CODEC_POLICY_ERROR" 'requested: ldac; available: aptx_hd aptx sbc'
+  [[ ! -s $command_log ]] || fail 'unavailable codec caused a profile change'
+
+  CFG_SPEAKER_CODECS=('aptx')
+  printf 'sbc\n' > "$state_file"
+  bounded_user_pw_cli() {
+    if [[ $3 == enum-params ]]; then mock_a2dp_enum_profiles; else return 1; fi
+  }
+  if apply_speaker_codec_policy "$mac" 110; then fail 'failed profile command was accepted'; fi
+  assert_contains "$CODEC_POLICY_ERROR" 'could not select aptx'
+
+  bounded_user_pw_cli() {
+    if [[ $3 == enum-params ]]; then
+      mock_a2dp_enum_profiles
+    else
+      : > "$TEST_SCRATCH/deadline-expired"
+    fi
+  }
+  now_seconds() {
+    if [[ -e $TEST_SCRATCH/deadline-expired ]]; then printf '110\n'; else printf '100\n'; fi
+  }
+  set +e
+  apply_speaker_codec_policy "$mac" 110 >/dev/null 2>&1
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'unverified profile switch was accepted'
+  assert_contains "$CODEC_POLICY_ERROR" 'codec aptx did not become healthy'
 }
 
 test_daemon_nonpreemption_and_failover_order() {
@@ -2014,6 +2223,8 @@ test_daemon_nonpreemption_and_failover_order() {
   CFG_CONTROLLER=auto
   DAEMON_ACTIVE=$second
   device_healthy() { [[ $1 == "$second" ]]; }
+  device_connected() { [[ $1 == "$second" ]]; }
+  a2dp_connected() { [[ $1 == "$second" ]]; }
   disconnect_other_speakers() { printf '%s\n' "$1" > "$TEST_SCRATCH/stale-cleanup"; }
   bluetoothctl() { printf '%s\n' "$*" >> "$TEST_SCRATCH/bluetooth.log"; }
   daemon_cycle
@@ -2081,7 +2292,7 @@ test_daemon_reuses_connection_deadline() {
   device_trusted() { return 0; }
   now_seconds() { printf '100\n'; }
   bluetooth_device_command() {
-    printf '%s %s %s\n' "$1" "$2" "$3" > "$TEST_SCRATCH/connect-command"
+    [[ $2 != connect ]] || printf '%s %s %s\n' "$1" "$2" "$3" > "$TEST_SCRATCH/connect-command"
   }
   wait_for_health() {
     printf '%s\n' "${2:-missing}" > "$TEST_SCRATCH/health-deadline"
@@ -2091,6 +2302,70 @@ test_daemon_reuses_connection_deadline() {
   daemon_cycle >/dev/null
   assert_eq "${CONNECT_TIMEOUT} connect $mac" "$(< "$TEST_SCRATCH/connect-command")"
   assert_eq "$((100 + CONNECT_TIMEOUT))" "$(< "$TEST_SCRATCH/health-deadline")"
+}
+
+test_daemon_codec_policy_failover() {
+  local first=AA:BB:CC:DD:EE:01 second=AA:BB:CC:DD:EE:02 output
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  CFG_SPEAKERS=("$first" "$second")
+  CFG_SPEAKER_CODECS=('ldac' 'sbc')
+  CFG_RECONNECT_INTERVAL=5
+  CFG_MEDIA_CONTROLS=auto
+  CFG_CONTROLLER=auto
+  DAEMON_ACTIVE=
+  DAEMON_FAILURES=()
+  DAEMON_NEXT_ATTEMPT=()
+  device_healthy() { return 1; }
+  device_connected() { return 1; }
+  device_paired() { return 0; }
+  device_trusted() { return 0; }
+  now_seconds() { printf '100\n'; }
+  bluetooth_device_command() {
+    [[ $2 != connect ]] || printf '%s\n' "$3" >> "$TEST_SCRATCH/connect-order"
+  }
+  apply_speaker_codec_policy() {
+    if [[ $1 == "$first" ]]; then
+      CODEC_POLICY_ERROR="none of the configured codecs for $first are available (requested: ldac; available: sbc)"
+      return 2
+    fi
+    return 0
+  }
+  disconnect_bluetooth_device() { printf '%s\n' "$1" >> "$TEST_SCRATCH/disconnected"; }
+  disconnect_other_speakers() { :; }
+  a2dp_codec() { printf 'sbc\n'; }
+
+  daemon_cycle > "$TEST_SCRATCH/daemon-output"
+  output=$(< "$TEST_SCRATCH/daemon-output")
+  assert_contains "$output" "requested: ldac; available: sbc"
+  assert_contains "$output" 'retrying in 5s'
+  assert_eq "$first" "$(sed -n '1p' "$TEST_SCRATCH/connect-order")"
+  assert_eq "$second" "$(sed -n '2p' "$TEST_SCRATCH/connect-order")"
+  assert_file_contains "$TEST_SCRATCH/disconnected" "$first"
+  assert_eq 105 "${DAEMON_NEXT_ATTEMPT[$first]}"
+  assert_eq "$second" "$DAEMON_ACTIVE"
+
+  : > "$TEST_SCRATCH/connect-order"
+  : > "$TEST_SCRATCH/first-policy-attempts"
+  DAEMON_ACTIVE=$first
+  DAEMON_FAILURES=()
+  DAEMON_NEXT_ATTEMPT=()
+  device_connected() { [[ $1 == "$first" ]]; }
+  a2dp_connected() { [[ $1 == "$first" ]]; }
+  device_healthy() { [[ $1 == "$first" ]]; }
+  apply_speaker_codec_policy() {
+    if [[ $1 == "$first" ]]; then
+      printf 'attempt\n' >> "$TEST_SCRATCH/first-policy-attempts"
+      CODEC_POLICY_ERROR="none of the configured codecs for $first are available (requested: ldac; available: sbc)"
+      return 2
+    fi
+    return 0
+  }
+  daemon_cycle >/dev/null
+  assert_eq 1 "$(wc -l < "$TEST_SCRATCH/first-policy-attempts")"
+  assert_eq "$second" "$(< "$TEST_SCRATCH/connect-order")"
+  assert_eq "$second" "$DAEMON_ACTIVE"
 }
 
 test_daemon_cooldown_and_backoff() {
@@ -2547,6 +2822,7 @@ run_test 'syntax, help, and streamed bootstrap' test_syntax_help_and_stream_boot
 run_test 'managed dependency list' test_managed_package_list
 run_test 'configuration parsing and normalization' test_config_parser_and_normalization
 run_test 'onboard-audio configuration and defaults' test_onboard_audio_configuration
+run_test 'per-speaker codec configuration' test_speaker_codec_configuration
 run_test 'default media-key mappings' test_default_media_key_mappings
 run_test 'configuration rejection and non-evaluation' test_config_parser_rejections_and_no_eval
 run_test 'invalid reload retains last valid configuration' test_invalid_reload_retains_last_valid_configuration
@@ -2586,9 +2862,12 @@ run_test 'forget removes config and provenance' test_forget_removes_config_and_p
 run_test 'media-control health modes' test_media_control_health_modes
 run_test 'optimistic codec reporting' test_codec_reporting_is_optimistic
 run_test 'PipeWire codec property parsing' test_codec_property_parsing
+run_test 'PipeWire codec profile discovery' test_pipewire_codec_profile_discovery
+run_test 'per-speaker codec selection' test_per_speaker_codec_selection
 run_test 'non-preemptive failover order' test_daemon_nonpreemption_and_failover_order
 run_test 'healthy active speaker disconnects new stale connections' test_daemon_disconnects_new_stale_connection
 run_test 'connection health reuses the original deadline' test_daemon_reuses_connection_deadline
+run_test 'strict codec policy fails over to next speaker' test_daemon_codec_policy_failover
 run_test 'daemon cooldown and bounded backoff' test_daemon_cooldown_and_backoff
 run_test 'removed active speaker is disconnected after restart' test_daemon_disconnects_removed_active_speaker
 run_test 'audio-user reconciliation' test_audio_user_reconciliation

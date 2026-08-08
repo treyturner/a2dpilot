@@ -11,7 +11,7 @@ The project is delivered as one Bash program. The same `a2dpilot` file installs 
 - Non-preemptive failover: a working fallback is not interrupted merely because a preferred speaker reappears.
 - Automatic controller soft-unblock and power-on at boot and after adapter loss.
 - BlueZ, PipeWire A2DP, and optional AVRCP health checks.
-- Automatic codec negotiation through PipeWire, including SBC, SBC-XQ, aptX, aptX HD, and LDAC when supported by the speaker.
+- Automatic PipeWire codec negotiation by default, with optional ordered codec preferences for each speaker.
 - Responsive media-key routing with broad Linux transport-key coverage, relative volume control, configurable HTTP(S) URLs, and one bounded action deadline.
 - Reversible live suppression of Raspberry Pi onboard analogue and HDMI audio devices without disabling HDMI video.
 - Safe configuration editing and validation through the CLI.
@@ -20,7 +20,7 @@ The project is delivered as one Bash program. The same `a2dpilot` file installs 
 - Transactional installation with restoration of files, services, user services, linger, rfkill, and controller state.
 - Optional removal of only the Bluetooth bonds that A2DPilot itself created.
 
-LE Audio/BAP, aptX Adaptive, and codec forcing are not currently supported.
+LE Audio/BAP and aptX Adaptive are not currently supported.
 
 ## Bundled and managed components
 
@@ -162,7 +162,8 @@ media-key = KEY_MEDIA_REPEAT player/playback/setParameters?type=music&repeat={re
 
 # Attempted in this order
 speaker = AA:BB:CC:DD:EE:FF
-speaker = 11:22:33:44:55:66
+speaker = 11:22:33:44:55:66 aptx_hd aptx sbc_xq sbc
+speaker = 22:33:44:55:66:77 sbc
 ```
 
 Open it safely with:
@@ -179,7 +180,7 @@ Validate without editing:
 sudo a2dpilot config --check
 ```
 
-The format supports blank lines, full-line `#` comments, whitespace around `=`, repeated `speaker` and `media-key` entries, and no shell evaluation. Unknown settings, duplicated scalar settings, duplicated speakers, and duplicated media keys are rejected.
+The format supports blank lines, full-line `#` comments, whitespace around `=`, repeated `speaker` and `media-key` entries, and no shell evaluation. Unknown settings, duplicated scalar settings, duplicated speakers, duplicated speaker codecs, and duplicated media keys are rejected.
 
 ### Raspberry Pi onboard audio
 
@@ -204,6 +205,21 @@ Speakers are attempted from top to bottom whenever there is no healthy connectio
 
 Priority is intentionally non-preemptive. Once any configured speaker has a healthy A2DP connection, A2DPilot leaves it alone. A preferred device is reconsidered only after the current connection is lost or removed from the configuration.
 
+### Per-speaker codecs
+
+A speaker line containing only a MAC address uses PipeWire's automatic codec negotiation. Optional codec names after the MAC form a strict preference list:
+
+```ini
+speaker = AA:BB:CC:DD:EE:FF aptx_hd aptx sbc_xq sbc
+speaker = 11:22:33:44:55:66 sbc
+```
+
+A2DPilot selects the first listed codec that PipeWire advertises for that speaker and verifies the negotiated result. If none is available, the speaker is disconnected and put into its normal retry cooldown while A2DPilot tries the next speaker. Include `sbc` explicitly when the policy should always permit the standard A2DP baseline. Changing the list for an active speaker applies the new policy without recreating its BlueZ bond.
+
+Configuration validation checks codec names but does not require the speaker to be online, so actual mutual support is determined when the device connects.
+
+Accepted Trixie A2DP identifiers are `sbc`, `sbc_xq`, `aac`, `aac_eld`, `aptx`, `aptx_hd`, `ldac`, `aptx_ll`, `aptx_ll_duplex`, `faststream`, `faststream_duplex`, `lc3plus_hr`, `opus_05`, `opus_05_51`, `opus_05_71`, `opus_05_duplex`, `opus_05_pro`, and `opus_g`. They are lowercase and whitespace-separated; `auto`, commas, LC3/BAP, aptX Adaptive, and unknown names are rejected.
+
 ### Controller selection
 
 `controller = auto` uses the first controller BlueZ presents. On machines with multiple adapters, use the desired controller's MAC address:
@@ -216,9 +232,9 @@ controller = 12:34:56:78:9A:BC
 
 `media-controls` accepts:
 
-- `auto` — map available media buttons, but do not consider missing AVRCP a broken audio connection. This is the default.
-- `required` — require AVRCP as well as BlueZ and A2DP; reconnect if media control is absent.
-- `off` — install no active Triggerhappy mappings and do not check AVRCP.
+- `auto`: map available media buttons, but do not consider missing AVRCP a broken audio connection. This is the default.
+- `required`: require AVRCP as well as BlueZ and A2DP; reconnect if media control is absent.
+- `off`: install no active Triggerhappy mappings and do not check AVRCP.
 
 Mappings remain in the configuration when controls are `off` and become active again if the mode changes. An empty mapping list is valid; A2DPilot then installs an inert Triggerhappy fragment even in `auto` or `required` mode.
 
@@ -255,7 +271,7 @@ sudo a2dpilot status
 sudo a2dpilot audio onboard status
 ```
 
-`devices` prints priority, pairing, trust, BlueZ connection, A2DP, AVRCP, negotiated codec, and device name for every configured speaker. `status` adds installation, controller, rfkill, base URL, media-key count, onboard-audio policy and visibility, system-service, and audio-user service diagnostics.
+`devices` prints priority, pairing, trust, BlueZ connection, A2DP, AVRCP, negotiated codec, configured codec policy, and device name for every speaker. A policy appears as `auto` or an ordered value such as `aptx_hd>aptx>sbc`. `status` adds installation, controller, rfkill, base URL, media-key count, onboard-audio policy and visibility, system-service, and audio-user service diagnostics.
 
 ### Add or repair speakers
 
@@ -316,9 +332,11 @@ Do not manually delete `/var/lib/a2dpilot` before uninstalling; it contains the 
 
 ## Audio codecs
 
-A2DPilot does not force a codec. Debian Trixie's `libspa-0.2-bluetooth` package contains PipeWire plugins for SBC, aptX, LDAC, LC3, and other codecs, and depends on the aptX and LDAC encoder libraries. WirePlumber enables all available A2DP codecs by default. The speaker and PipeWire therefore negotiate the best mutually supported profile and can fall back to SBC normally.
+Debian Trixie's `libspa-0.2-bluetooth` package contains PipeWire plugins for SBC, aptX, LDAC, and other codecs and depends on the aptX and LDAC encoder libraries. WirePlumber keeps all available A2DP codecs enabled globally. Bare speaker entries therefore negotiate automatically, while entries with codec preferences select a per-device PipeWire profile after connection.
 
-A2DPilot accepts any resulting `bluez_output` node as healthy and reports PipeWire's `api.bluez5.codec` value in `devices` and `status`. LDAC remains at PipeWire's adaptive-quality default. Radio congestion, Wi-Fi coexistence, speaker capabilities, and adapter quality can all affect the selected codec and stability.
+A2DPilot reads PipeWire's `api.bluez5.codec` value and reports the negotiated result in `devices` and `status`. Automatic entries accept any codec PipeWire exposes, including identifiers newer than A2DPilot. Strict entries accept only their selected configured codec. A2DPilot reapplies strict selection after reconnects but does not save a profile into WirePlumber's user state.
+
+LDAC remains at PipeWire's adaptive-quality default. A successful negotiation only proves that both endpoints accepted a codec; it does not prove that the adapter, radio environment, and speaker can carry it reliably. A2DPilot cannot measure audible dropouts or automatically downgrade an unstable link. Remove the unreliable codec from that speaker's list or configure `sbc` alone to choose a more conservative transport.
 
 aptX Adaptive is not currently exposed by this PipeWire stack. Although the LC3 library is installed transitively, A2DPilot does not enable or manage LE Audio/BAP, experimental ISO sockets, coordinated earbud sets, or LE media controls.
 
@@ -326,6 +344,7 @@ aptX Adaptive is not currently exposed by this PipeWire stack. Although the LC3 
 
 - The daemon reloads the central configuration while running. If a direct manual edit becomes invalid, it retains the last valid configuration and logs the error once per distinct failure.
 - Connection health requires BlueZ `Connected: yes` and a matching PipeWire `bluez_output` node. `media-controls = required` additionally checks BlueZ's `MediaControl1` AVRCP state.
+- PipeWire lookups run with finite deadlines. Codec-profile discovery parses Trixie's `pw-cli EnumProfile` diagnostic format because that query has no structured CLI output; unrecognized output fails closed as a discovery error rather than selecting a guessed profile.
 - Mutating commands and daemon connection cycles serialize through the root-owned `/run/lock/a2dpilot/lock`. Stateful media controls use a separate short-lived lock beneath `/run/a2dpilot/media`, within the same two-second action deadline, so a configuration editor cannot block button handling.
 - Root-managed configuration is parsed as data and never sourced as shell code.
 - Triggerhappy receives only validated key names; URL resolution and placeholder expansion happen inside `player-control` immediately before `curl` runs. Stateful volume, mute, shuffle, and repeat mappings first poll the player's music timeline. Systemd owns `/run/a2dpilot` and creates its mode-`0700` `media` child for Debian's unprivileged Triggerhappy handler; root CLI requests drop to that handler identity before opening its lock or state files, and per-player pre-mute volumes stored there expire on reboot.
@@ -333,7 +352,7 @@ aptX Adaptive is not currently exposed by this PipeWire stack. Although the LC3 
 - Install records its managed-state rollback snapshot before APT and service mutations. A failed or interrupted installation invokes uninstall automatically; APT-managed packages are retained, and a failed rollback keeps the snapshot for recovery.
 - Update preserves that snapshot and replaces only the installed executable; an active daemon is restarted, while an inactive daemon remains stopped.
 - Pairing happens after installation commits, so a speaker being unavailable does not erase a valid system setup.
-- The system-wide WirePlumber fragment disables seat monitoring and, when requested, hides narrowly matched Raspberry Pi onboard ALSA devices. It deliberately does not override `bluez5.codecs`.
+- The system-wide WirePlumber fragment disables seat monitoring and, when requested, hides narrowly matched Raspberry Pi onboard ALSA devices. It deliberately does not override `bluez5.codecs`; per-speaker selection uses advertised PipeWire profile indices with `save: false`.
 
 ## Tests
 
@@ -411,16 +430,26 @@ sudo loginctl show-user pi -p Linger
 sudo systemctl status "user@$(id -u pi).service"
 ```
 
-### aptX or LDAC was not selected
+### A preferred codec was not selected
 
-Run `sudo a2dpilot devices`. A reported SBC or SBC-XQ codec is a valid negotiated fallback, not an A2DPilot failure. Confirm the exact speaker model supports the desired codec and inspect the associated PipeWire object:
+Run `sudo a2dpilot devices` and compare `CODEC` with `CODEC-POLICY`. For an automatic entry, SBC or SBC-XQ is a valid negotiated fallback. For a strict entry, the journal reports the requested and advertised codec sets when they do not overlap. Confirm the exact speaker model supports the desired codec and inspect the associated PipeWire object:
 
 ```sh
 sudo -u pi env XDG_RUNTIME_DIR="/run/user/$(id -u pi)" \
   wpctl status --name
 ```
 
-LDAC can fall back under poor radio conditions. A2DPilot intentionally does not force a high-bitrate profile.
+Add lower-priority choices explicitly, normally ending with `sbc`. A2DPilot will not escape a strict list automatically because that could silently re-enable the unstable codec the policy was meant to avoid.
+
+### A negotiated high-definition codec is unreliable
+
+A2DPilot cannot infer stability from successful negotiation. Remove the problematic codec from that speaker's line and leave the reliable choices in preference order:
+
+```ini
+speaker = AA:BB:CC:DD:EE:FF aptx sbc_xq sbc
+```
+
+For the most conservative test, use `speaker = AA:BB:CC:DD:EE:FF sbc`, apply it with `sudo a2dpilot config`, and confirm `CODEC` reports `sbc`. Also investigate Wi-Fi coexistence, distance, interference, adapter firmware, and USB placement before concluding that the codec itself is unusable.
 
 ### Audio works but media buttons do not
 
@@ -443,7 +472,7 @@ Run:
 sudo a2dpilot config --check
 ```
 
-The error includes the file and line when possible. Use one instance of every required scalar key, a valid local `audio-user`, `auto` or a controller MAC, a positive interval, `auto|required|off`, optional `enabled|disabled` onboard-audio policies, unique speaker MAC addresses, and unique `KEY_*` media mappings. A relative mapping needs `base-url`; an absolute mapping must use HTTP(S). The accepted URL placeholders are `{command-id}`, `{volume-up}`, `{volume-down}`, `{mute-toggle}`, `{shuffle-toggle}`, and `{repeat-cycle}`; stateful placeholders require `base-url` and cannot be mixed in one mapping.
+The error includes the file and line when possible. Use one instance of every required scalar key, a valid local `audio-user`, `auto` or a controller MAC, a positive interval, `auto|required|off`, optional `enabled|disabled` onboard-audio policies, unique speaker MAC addresses, unique lowercase codecs per speaker, and unique `KEY_*` media mappings. A relative mapping needs `base-url`; an absolute mapping must use HTTP(S). The accepted URL placeholders are `{command-id}`, `{volume-up}`, `{volume-down}`, `{mute-toggle}`, `{shuffle-toggle}`, and `{repeat-cycle}`; stateful placeholders require `base-url` and cannot be mixed in one mapping.
 
 ### An onboard audio device did not disappear
 
@@ -458,7 +487,7 @@ The rule intentionally ignores USB and HAT devices and only matches internal Ras
 
 ### Installation or uninstall failed
 
-A2DPilot normally rolls failed installation back automatically. If restoration cannot finish, `/var/lib/a2dpilot/state` is marked `failed` and retained. Correct the reported service, package, or filesystem problem and run:
+A2DPilot normally rolls failed installation back automatically. If restoration can't finish, `/var/lib/a2dpilot/state` is marked `failed` and retained. Correct the reported service, package, or filesystem problem and run:
 
 ```sh
 sudo /usr/local/sbin/a2dpilot uninstall --keep-bonds
