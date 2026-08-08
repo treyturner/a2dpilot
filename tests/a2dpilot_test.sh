@@ -3,9 +3,10 @@
 # executable or verify that shell-like configuration text is not evaluated.
 # SC2034: Tests inject application globals that are consumed after sourcing;
 # ShellCheck cannot follow those assignments across the test/app boundary.
-# SC2329: Test cases use dynamic dispatch, and command mocks override functions
-# called indirectly by the sourced application.
-# shellcheck disable=SC2016,SC2034,SC2329
+# SC2317 (ShellCheck 0.9) and SC2329 (newer releases): Test cases use
+# dynamic dispatch, and command mocks override functions called indirectly by
+# the sourced application. Both diagnostics are false positives in this file.
+# shellcheck disable=SC2016,SC2034,SC2317,SC2329
 set -uo pipefail
 
 TEST_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
