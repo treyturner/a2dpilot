@@ -806,11 +806,12 @@ test_update_rejects_bad_candidates_and_targets() {
     case $mode in
       fail) return 22 ;;
       empty) : > "$output_path" ;;
-      invalid) printf 'if broken syntax\n' > "$output_path" ;;
+      no-shebang) printf 'printf "valid Bash without a shebang"\n' > "$output_path" ;;
+      invalid) printf '#!/usr/bin/env bash\nif broken syntax\n' > "$output_path" ;;
     esac
   }
 
-  for mode in fail empty invalid; do
+  for mode in fail empty no-shebang invalid; do
     : > "$TEST_SCRATCH/lock.log"
     set +e
     output=$(update_action 2>&1)
@@ -820,6 +821,7 @@ test_update_rejects_bad_candidates_and_targets() {
     case $mode in
       fail) assert_contains "$output" 'Could not download A2DPilot' ;;
       empty) assert_contains "$output" 'empty or unsafe' ;;
+      no-shebang) assert_contains "$output" 'lacks the expected Bash shebang' ;;
       invalid) assert_contains "$output" 'failed Bash syntax validation' ;;
     esac
     candidate=$(< "$TEST_SCRATCH/candidate-path")

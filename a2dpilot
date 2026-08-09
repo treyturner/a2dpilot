@@ -610,6 +610,12 @@ update_source_url() {
   esac
 }
 
+update_candidate_has_bash_shebang() {
+  local shebang
+  IFS= read -r shebang < "$1" || return 1
+  [[ $shebang == '#!/usr/bin/env bash' ]]
+}
+
 validate_managed_paths() {
   local path
   local -A seen=()
@@ -2353,6 +2359,8 @@ update_action() {
   fi
   [[ -f $UPDATE_CANDIDATE && ! -L $UPDATE_CANDIDATE && -s $UPDATE_CANDIDATE ]] || \
     rollback_failed_update 1 "The downloaded A2DPilot executable is empty or unsafe."
+  update_candidate_has_bash_shebang "$UPDATE_CANDIDATE" || \
+    rollback_failed_update 1 "The downloaded A2DPilot executable lacks the expected Bash shebang."
   bash -n "$UPDATE_CANDIDATE" || \
     rollback_failed_update 1 "The downloaded A2DPilot executable failed Bash syntax validation."
 
