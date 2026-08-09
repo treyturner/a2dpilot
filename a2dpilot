@@ -2173,17 +2173,59 @@ list_present_packages() {
     LC_ALL=C sort -u
 }
 
+write_package_snapshot_hook() {
+  local hook=$STATE_DIR/package-snapshot-hook candidate
+  [[ $hook =~ ^[A-Za-z0-9_./-]+$ ]] || return 1
+  candidate=$(mktemp "$STATE_DIR/.package-snapshot-hook.XXXXXX") || return 1
+  if ! cat > "$candidate" <<'EOF'
+#!/bin/sh
+set -eu
+
+state_dir=${0%/*}
+
+snapshot_packages() {
+  name=$1
+  candidate=$(mktemp "$state_dir/.$name.XXXXXX")
+  trap 'rm -f -- "$candidate"' EXIT HUP INT TERM
+  dpkg-query -W -f='${binary:Package}\t${db:Status-Abbrev}\n' 2>/dev/null |
+    awk -F '\t' 'length($2) >= 2 && substr($2, 2, 1) !~ /^[nc]$/ { print $1 }' |
+    LC_ALL=C sort -u > "$candidate"
+  mv -f -- "$candidate" "$state_dir/$name"
+  trap - EXIT HUP INT TERM
+}
+
+case ${1:-} in
+  before)
+    [ -e "$state_dir/packages-before" ] || snapshot_packages packages-before
+    ;;
+  after)
+    snapshot_packages packages-after
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+EOF
+  then
+    rm -f -- "$candidate"
+    return 1
+  fi
+  chmod 0700 "$candidate" || {
+    rm -f -- "$candidate"
+    return 1
+  }
+  mv -f -- "$candidate" "$hook"
+}
+
 record_new_packages() {
-  local before=$STATE_DIR/packages-before current=$STATE_DIR/packages-current
+  local before=$STATE_DIR/packages-before after=$STATE_DIR/packages-after
   local replacement=$STATE_DIR/new-packages.tmp
-  [[ -f $before ]] || return 1
-  if ! list_present_packages > "$current" ||
-     ! comm -13 "$before" "$current" > "$replacement"; then
-    rm -f -- "$current" "$replacement"
+  [[ -f $before && -f $after ]] || return 1
+  if ! comm -13 "$before" "$after" > "$replacement"; then
+    rm -f -- "$replacement"
     return 1
   fi
   mv -f -- "$replacement" "$STATE_DIR/new-packages"
-  rm -f -- "$current"
 }
 
 remove_recorded_packages() {
@@ -2321,8 +2363,8 @@ install_action() {
   : > "$STATE_DIR/replaced-files"
   : > "$STATE_DIR/new-packages"
   : > "$STATE_DIR/created-bonds"
-  list_present_packages > "$STATE_DIR/packages-before" || \
-    die "Could not snapshot installed packages."
+  rm -f -- "$STATE_DIR/packages-before" "$STATE_DIR/packages-after" \
+    "$STATE_DIR/package-snapshot-hook"
 
   local audio_user config_seed
   if [[ -e $CONFIG_FILE || -L $CONFIG_FILE ]]; then
@@ -2352,8 +2394,19 @@ install_action() {
 
   note "Installing BlueZ, PipeWire, WirePlumber, Triggerhappy, and A2DP codec support..."
   apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${PACKAGES[@]}"
+  write_package_snapshot_hook || die "Could not prepare package transaction tracking."
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    -o "DPkg::Pre-Invoke::=$STATE_DIR/package-snapshot-hook before" \
+    -o "DPkg::Post-Invoke::=$STATE_DIR/package-snapshot-hook after" \
+    "${PACKAGES[@]}"
+  if [[ ! -e $STATE_DIR/packages-before && ! -e $STATE_DIR/packages-after ]]; then
+    # APT does not invoke DPkg hooks when every requested package is already
+    # present, which is a successful transaction with an empty package delta.
+    : > "$STATE_DIR/packages-before"
+    : > "$STATE_DIR/packages-after"
+  fi
   record_new_packages
+  rm -f -- "$STATE_DIR/package-snapshot-hook"
 
   install -d -m 0755 "$(dirname "$INSTALLED_CLI")" "$(dirname "$SYSTEMD_UNIT")" \
     "$(dirname "$WIREPLUMBER_CONF")" "$(dirname "$TRIGGER_CONF")" "$(dirname "$CONFIG_FILE")"

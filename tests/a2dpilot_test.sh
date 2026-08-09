@@ -489,7 +489,11 @@ test_noninteractive_install_and_uninstall_fixture() {
   }
   apt-get() {
     printf '%s\n' "$*" >> "$apt_log"
-    [[ ${1:-} != install ]] || : > "$TEST_SCRATCH/apt-installed"
+    if [[ ${1:-} == install ]]; then
+      printf 'base-package\n' > "$STATE_DIR/packages-before"
+      : > "$TEST_SCRATCH/apt-installed"
+      printf 'base-package\npipewire\npipewire-bin\nrfkill\n' > "$STATE_DIR/packages-after"
+    fi
   }
   systemctl() {
     printf '%s\n' "$*" >> "$TEST_SCRATCH/systemctl.log"
@@ -520,6 +524,10 @@ test_noninteractive_install_and_uninstall_fixture() {
   assert_file_not_contains "$TRIGGER_CONF" 'commandID='
   assert_file_contains "$STATE_FILE" 'INSTALL_PHASE=installed'
   assert_file_contains "$apt_log" 'install -y --no-install-recommends'
+  assert_file_contains "$apt_log" \
+    "DPkg::Pre-Invoke::=$STATE_DIR/package-snapshot-hook before"
+  assert_file_contains "$apt_log" \
+    "DPkg::Post-Invoke::=$STATE_DIR/package-snapshot-hook after"
   assert_file_contains "$STATE_DIR/new-packages" rfkill
   assert_file_contains "$STATE_DIR/new-packages" pipewire-bin
   assert_file_contains "$TEST_SCRATCH/systemctl.log" \
@@ -545,11 +553,32 @@ test_noninteractive_install_and_uninstall_fixture() {
 }
 
 test_package_transaction_tracking() {
-  local output
+  local output mock_bin
   setup_scratch_dir
   load_app
   configure_scratch_paths
-  printf 'base-package\npartial-before\n' > "$STATE_DIR/packages-before"
+  mock_bin=$TEST_SCRATCH/mock-bin
+  install -d "$mock_bin"
+  cat > "$mock_bin/dpkg-query" <<'EOF'
+#!/bin/sh
+printf 'base-package\tii \n'
+printf 'partial-before\tiU \n'
+printf 'unrelated-during-update\tii \n'
+if [ "$(cat "$PACKAGE_PHASE_FILE")" = after ]; then
+  printf 'new-direct\tii \n'
+  printf 'new-dependency:armhf\tiU \n'
+fi
+EOF
+  chmod +x "$mock_bin/dpkg-query"
+  PACKAGE_PHASE_FILE=$TEST_SCRATCH/package-phase
+  export PACKAGE_PHASE_FILE
+  printf 'before\n' > "$PACKAGE_PHASE_FILE"
+  write_package_snapshot_hook
+  PATH=$mock_bin:$PATH "$STATE_DIR/package-snapshot-hook" before
+  printf 'after\n' > "$PACKAGE_PHASE_FILE"
+  # Repeated DPkg::Pre-Invoke hooks must retain the start of the transaction.
+  PATH=$mock_bin:$PATH "$STATE_DIR/package-snapshot-hook" before
+  PATH=$mock_bin:$PATH "$STATE_DIR/package-snapshot-hook" after
   dpkg-query() {
     printf 'base-package\tii \n'
     printf 'partial-before\tiU \n'
@@ -568,6 +597,7 @@ test_package_transaction_tracking() {
   assert_file_contains "$STATE_DIR/new-packages" 'new-dependency:armhf'
   assert_file_not_contains "$STATE_DIR/new-packages" 'base-package'
   assert_file_not_contains "$STATE_DIR/new-packages" 'partial-before'
+  assert_file_not_contains "$STATE_DIR/new-packages" 'unrelated-during-update'
 }
 
 test_uninstall_dependency_and_empty_bond_policy() {
