@@ -142,7 +142,8 @@ test_syntax_help_and_stream_bootstrap() {
   assert_eq "$local_help" "$streamed_help"
   assert_contains "$local_help" 'a2dpilot install [--user USER] [--non-interactive]'
   assert_contains "$local_help" 'a2dpilot config [--check]'
-  assert_contains "$local_help" 'uninstall [--keep-bonds | --remove-bonds] [--with-dependencies]'
+  assert_contains "$local_help" 'uninstall [--keep-bonds | --remove-bonds]'
+  assert_not_contains "$local_help" '--with-dependencies'
   assert_not_contains "$local_help" 'update --mac'
   assert_not_contains "$local_help" '--control-helper'
   set +e
@@ -546,7 +547,7 @@ test_noninteractive_install_and_uninstall_fixture() {
   restore_rfkill_state() { :; }
   restore_system_service_states() { :; }
   output=$(uninstall_action --keep-bonds)
-  assert_contains "$output" 'Packages installed for A2DPilot were preserved.'
+  assert_contains "$output" 'APT-managed packages were retained.'
   assert_contains "$output" 'managed system state was restored'
   [[ ! -e $INSTALLED_CLI ]] || fail 'created executable survived uninstall'
   [[ ! -e $CONFIG_FILE ]] || fail 'created configuration survived uninstall'
@@ -619,14 +620,13 @@ EOF
   [[ ! -e $STATE_DIR/packages-before ]] || fail 'failed package snapshot was installed'
 }
 
-test_uninstall_dependency_and_empty_bond_policy() {
+test_uninstall_keeps_packages_and_reports_empty_bond_policy() {
   local output
   setup_scratch_dir
   load_app
   configure_scratch_paths
   : > "$STATE_FILE"
   : > "$STATE_DIR/created-bonds"
-  printf 'pipewire\npipewire-bin\nlibspa-0.2-bluetooth:armhf\n' > "$STATE_DIR/new-packages"
   require_root() { :; }
   acquire_lock() { :; }
   release_lock() { :; }
@@ -637,51 +637,14 @@ test_uninstall_dependency_and_empty_bond_policy() {
       printf '%s\n' "$*" >> "$TEST_SCRATCH/systemctl.log"
     fi
   }
-  list_present_packages() {
-    printf 'pipewire\npipewire-bin\nlibspa-0.2-bluetooth:armhf\n'
-  }
   apt-get() {
     printf '%s\n' "$*" >> "$TEST_SCRATCH/apt.log"
-    if [[ $1 == --simulate ]]; then
-      printf 'Remv pipewire [1.0]\n'
-      printf 'Remv pipewire-bin [1.0]\n'
-      printf 'Remv libspa-0.2-bluetooth:armhf [1.0]\n'
-    fi
   }
-  output=$(uninstall_action --remove-bonds --with-dependencies)
+  output=$(uninstall_action --remove-bonds)
   assert_contains "$output" 'No A2DPilot-created bonds were recorded.'
-  assert_contains "$output" 'Removing packages installed for A2DPilot...'
-  assert_file_contains "$TEST_SCRATCH/apt.log" \
-    'remove -y pipewire pipewire-bin libspa-0.2-bluetooth:armhf'
-  assert_eq 1 "$(grep -Fxc \
-    'remove -y pipewire pipewire-bin libspa-0.2-bluetooth:armhf' \
-    "$TEST_SCRATCH/apt.log")"
-  assert_file_not_contains "$TEST_SCRATCH/apt.log" 'autoremove'
-  [[ ! -e $STATE_DIR ]] || fail 'dependency-removing uninstall retained state'
-}
-
-test_package_removal_rejects_unrecorded_dependents() {
-  local output rc
-  setup_scratch_dir
-  load_app
-  configure_scratch_paths
-  printf 'pipewire\n' > "$STATE_DIR/new-packages"
-  list_present_packages() { printf 'later-player\npipewire\n'; }
-  apt-get() {
-    if [[ $1 == --simulate ]]; then
-      printf 'Remv pipewire [1.0]\n'
-      printf 'Remv later-player [2.0]\n'
-    else
-      : > "$TEST_SCRATCH/real-removal"
-    fi
-  }
-  set +e
-  output=$(remove_recorded_packages 2>&1)
-  rc=$?
-  set -e
-  (( rc != 0 )) || fail 'unsafe APT removal plan was accepted'
-  assert_contains "$output" 'APT would also remove unrecorded packages: later-player'
-  [[ ! -e $TEST_SCRATCH/real-removal ]] || fail 'unsafe APT removal was executed'
+  assert_contains "$output" 'APT-managed packages were retained.'
+  [[ ! -e $TEST_SCRATCH/apt.log ]] || fail 'uninstall invoked APT'
+  [[ ! -e $STATE_DIR ]] || fail 'package-retaining uninstall retained state'
 }
 
 test_failed_install_rollback_removes_dependencies() {
@@ -1619,8 +1582,8 @@ test_bond_policy_and_removal_aggregation() {
   require_root() { :; }
   : > "$STATE_FILE"
   expect_failure_contains 'mutually exclusive' uninstall_action --keep-bonds --remove-bonds
-  expect_failure_contains 'only be specified once' \
-    uninstall_action --with-dependencies --with-dependencies
+  expect_failure_contains 'Unknown uninstall option: --with-dependencies' \
+    uninstall_action --with-dependencies
 }
 
 test_managed_paths_and_state_serialization() {
@@ -1768,8 +1731,7 @@ run_test 'generated system integration files' test_generated_integration_files
 run_test 'Triggerhappy config rejects symlinked parent' test_trigger_config_rejects_symlinked_parent
 run_test 'non-interactive install and uninstall fixture' test_noninteractive_install_and_uninstall_fixture
 run_test 'APT transaction package tracking' test_package_transaction_tracking
-run_test 'opt-in dependency removal and empty bond policy' test_uninstall_dependency_and_empty_bond_policy
-run_test 'APT removal rejects unrecorded dependents' test_package_removal_rejects_unrecorded_dependents
+run_test 'uninstall keeps packages and reports empty bond policy' test_uninstall_keeps_packages_and_reports_empty_bond_policy
 run_test 'failed install rollback removes dependencies' test_failed_install_rollback_removes_dependencies
 run_test 'failed-state recovery preserves package provenance' test_failed_state_recovery_preserves_recorded_packages
 run_test 'safe config editor success and validation failure' test_config_editor_success_and_validation_failure
