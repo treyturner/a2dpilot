@@ -1129,43 +1129,21 @@ test_update_daemon_verifier_runs_one_iteration() {
   load_app
   INSTALLED_CLI=$TEST_SCRATCH/installed-a2dpilot
   VERIFY_LOG=$TEST_SCRATCH/verification.log
+  VERIFY_PARSE_FAIL=0
   export VERIFY_LOG
+  export VERIFY_PARSE_FAIL
   cat > "$INSTALLED_CLI" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
-acquire_lock() { exit 90; }
-release_lock() { exit 91; }
-sleep() { exit 92; }
-require_root() { :; }
-parse_config() { printf 'parse\n' >> "$VERIFY_LOG"; }
+parse_config() {
+  printf 'parse\n' >> "$VERIFY_LOG"
+  [[ $VERIFY_PARSE_FAIL == 0 ]]
+}
 load_daemon_active() { :; }
-reconcile_runtime_configuration() { :; }
-power_controller() { :; }
 daemon_cycle() {
   printf 'cycle-start\n' >> "$VERIFY_LOG"
-  sleep 1
+  /usr/bin/sleep 1
   printf 'cycle-finished\n' >> "$VERIFY_LOG"
-}
-daemon_action() {
-  require_root
-  while true; do
-    if ! acquire_lock 1; then
-      sleep 1
-      continue
-    fi
-    if parse_config; then
-      load_daemon_active
-      if ! reconcile_runtime_configuration; then
-        :
-      elif ! power_controller; then
-        :
-      else
-        daemon_cycle
-      fi
-      release_lock
-      sleep 5
-    fi
-  done
 }
 EOF
   chmod 0755 "$INSTALLED_CLI"
@@ -1173,6 +1151,14 @@ EOF
 
   verify_updated_daemon
   assert_eq $'parse\ncycle-start\ncycle-finished' "$(< "$VERIFY_LOG")"
+
+  : > "$VERIFY_LOG"
+  VERIFY_PARSE_FAIL=1
+  export VERIFY_PARSE_FAIL
+  if verify_updated_daemon; then
+    fail 'daemon verification accepted an unparseable configuration'
+  fi
+  assert_eq parse "$(< "$VERIFY_LOG")"
 }
 
 test_config_editor_success_and_validation_failure() {

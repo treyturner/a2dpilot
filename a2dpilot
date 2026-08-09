@@ -2288,14 +2288,11 @@ restore_previous_update() {
 verify_updated_daemon() {
   timeout --signal=TERM --kill-after=1 "$UPDATE_TOTAL_TIMEOUT" bash -c '
     source /proc/self/fd/3
-    A2DPILOT_UPDATE_ITERATION_DONE=0
-    acquire_lock() { return 0; }
-    release_lock() { A2DPILOT_UPDATE_ITERATION_DONE=1; }
-    sleep() {
-      if (( A2DPILOT_UPDATE_ITERATION_DONE )); then exit 0; fi
-      /usr/bin/sleep 1
-    }
-    daemon_action
+    parse_config /etc/a2dpilot.conf || exit 1
+    DAEMON_HAVE_CONFIG=1
+    DAEMON_LAST_CONFIG_ERROR=
+    load_daemon_active
+    daemon_cycle
   ' a2dpilot-update-verifier 3< "$INSTALLED_CLI"
 }
 
