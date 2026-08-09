@@ -1864,7 +1864,7 @@ test_status_reports_media_url_configuration() {
 }
 
 test_pairing_provenance_and_existing_bond() {
-  local user mac=AA:BB:CC:DD:EE:FF paired=0 trusted=0 paired_file
+  local user mac=AA:BB:CC:DD:EE:FF paired=0 paired_file trusted_file
   setup_scratch_dir
   load_app
   configure_scratch_paths
@@ -1872,13 +1872,14 @@ test_pairing_provenance_and_existing_bond() {
   write_test_config "$CONFIG_FILE" "$user"
   parse_config "$CONFIG_FILE"
   paired_file=$TEST_SCRATCH/paired
+  trusted_file=$TEST_SCRATCH/trusted
   : > "$STATE_DIR/created-bonds"
   atomic_install_file() { cp "$1" "$2"; }
   has_tty() { return 1; }
   scan_bredr() { :; }
   configured_controller_address() { printf '12:34:56:78:9A:BC\n'; }
   device_paired() { (( paired )) || [[ -f $paired_file ]]; }
-  device_trusted() { (( trusted )); }
+  device_trusted() { [[ -f $trusted_file ]]; }
   wait_for_device_connection() { return 0; }
   systemctl() { :; }
   bluetoothctl() {
@@ -1894,8 +1895,10 @@ test_pairing_provenance_and_existing_bond() {
       done
       return 0
     fi
-    printf '%s\n' "$*" >> "$TEST_SCRATCH/bluetooth.log"
-    if [[ $* == *' trust '* ]]; then trusted=1; fi
+    while IFS= read -r input; do
+      printf '%s\n' "$input" >> "$TEST_SCRATCH/bluetooth.log"
+      [[ $input != "trust $mac" ]] || : > "$trusted_file"
+    done
     return 0
   }
 
@@ -1908,7 +1911,7 @@ test_pairing_provenance_and_existing_bond() {
 
   : > "$TEST_SCRATCH/bluetooth.log"
   : > "$STATE_DIR/created-bonds"
-  trusted=0
+  rm -f -- "$trusted_file"
   pair_one "$mac" NoInputNoOutput
   assert_file_not_contains "$TEST_SCRATCH/bluetooth.log" "pair $mac"
   assert_file_contains "$TEST_SCRATCH/bluetooth.log" "trust $mac"
@@ -2321,12 +2324,13 @@ test_daemon_nonpreemption_and_failover_order() {
   a2dp_codec() { printf 'ldac\n'; }
   now_seconds() { printf '100\n'; }
   bluetoothctl() {
-    if [[ $* == *' connect '* ]]; then
-      printf '%s\n' "${*: -1}" >> "$TEST_SCRATCH/connect-order"
-      [[ ${*: -1} == "$second" ]]
-    else
-      return 0
-    fi
+    local command attempted=
+    while IFS= read -r command; do
+      [[ $command != connect\ * ]] || attempted=${command#connect }
+    done
+    [[ -n $attempted ]] || return 0
+    printf '%s\n' "$attempted" >> "$TEST_SCRATCH/connect-order"
+    [[ $attempted == "$second" ]]
   }
   daemon_cycle >/dev/null
   assert_eq "$first" "$(sed -n '1p' "$TEST_SCRATCH/connect-order")"
@@ -2463,7 +2467,10 @@ test_daemon_cooldown_and_backoff() {
   device_trusted() { return 0; }
   now_seconds() { printf '100\n'; }
   bluetoothctl() {
-    [[ $* == *' connect '* ]] && printf 'attempt\n' >> "$TEST_SCRATCH/attempts"
+    local command
+    while IFS= read -r command; do
+      [[ $command != connect\ * ]] || printf 'attempt\n' >> "$TEST_SCRATCH/attempts"
+    done
     return 1
   }
   daemon_cycle >/dev/null
@@ -2666,6 +2673,21 @@ test_controller_selection_and_power() {
   assert_file_contains "$TEST_SCRATCH/rfkill.log" 'unblock bluetooth'
   assert_file_contains "$TEST_SCRATCH/controller-input" "select $controller"
   assert_file_contains "$TEST_SCRATCH/controller-input" 'power on'
+}
+
+test_automatic_controller_device_commands_exit_after_result() {
+  local mac=AA:BB:CC:DD:EE:FF
+  setup_scratch_dir
+  load_app
+  bluetoothctl() {
+    printf 'args: %s\n' "$*" > "$TEST_SCRATCH/automatic-controller-session"
+    cat >> "$TEST_SCRATCH/automatic-controller-session"
+  }
+
+  bluetooth_device_command_on_controller auto 5 connect "$mac"
+
+  assert_eq $'args: --timeout 5\nconnect AA:BB:CC:DD:EE:FF\nquit' \
+    "$(< "$TEST_SCRATCH/automatic-controller-session")"
 }
 
 test_explicit_controller_scopes_device_operations() {
@@ -2962,6 +2984,7 @@ run_test 'audio-user units are unmasked before enablement' test_audio_user_units
 run_test 'user socket enablement is restored after services' test_user_unit_enablement_restores_sockets_last
 run_test 'rfkill snapshot, restore, and hard blocks' test_rfkill_snapshot_restore_and_hard_block
 run_test 'controller selection and power control' test_controller_selection_and_power
+run_test 'automatic controller device commands exit after result' test_automatic_controller_device_commands_exit_after_result
 run_test 'explicit controller scopes device operations' test_explicit_controller_scopes_device_operations
 run_test 'bond policy and removal aggregation' test_bond_policy_and_removal_aggregation
 run_test 'managed path and private state safety' test_managed_paths_and_state_serialization
