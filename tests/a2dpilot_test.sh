@@ -1876,6 +1876,7 @@ test_pairing_provenance_and_existing_bond() {
   : > "$STATE_DIR/created-bonds"
   atomic_install_file() { cp "$1" "$2"; }
   has_tty() { return 1; }
+  note() { printf '%s\n' "$*" >> "$TEST_SCRATCH/pairing-notes"; }
   scan_bredr() { :; }
   configured_controller_address() { printf '12:34:56:78:9A:BC\n'; }
   device_paired() { (( paired )) || [[ -f $paired_file ]]; }
@@ -1905,6 +1906,7 @@ test_pairing_provenance_and_existing_bond() {
   pair_one "$mac" NoInputNoOutput
   assert_file_contains "$STATE_DIR/created-bonds" "12:34:56:78:9A:BC $mac"
   assert_file_contains "$TEST_SCRATCH/bluetooth.log" "pair $mac"
+  assert_file_contains "$TEST_SCRATCH/pairing-notes" 'Pairing succeeded; finalizing trust and connection...'
   parse_config "$CONFIG_FILE"
   assert_eq "$mac" "${CFG_SPEAKERS[0]}"
   assert_eq '' "${CFG_SPEAKER_CODECS[0]}"
@@ -1918,28 +1920,23 @@ test_pairing_provenance_and_existing_bond() {
   [[ ! -s $STATE_DIR/created-bonds ]] || fail 'existing bond was recorded as A2DPilot-created'
 }
 
-test_pairing_session_keeps_controller_pairable() {
+test_pairing_session_terminates_after_bonding() {
   local mac=AA:BB:CC:DD:EE:FF controller=12:34:56:78:9A:BC
   setup_scratch_dir
   load_app
   configure_scratch_paths
   has_tty() { return 1; }
+  kill() {
+    [[ ${1:-} =~ ^[0-9]+$ ]] && printf '%s\n' "$1" >> "$TEST_SCRATCH/terminated-pair-sessions"
+    builtin kill "$@"
+  }
   bluetoothctl() {
-    local command input_closed=1
+    local command
     printf 'args: %s\n' "$*" >> "$TEST_SCRATCH/pair-sessions"
     while IFS= read -r command; do
       printf '%s\n' "$command" >> "$TEST_SCRATCH/pair-sessions"
-      if [[ $command == quit ]]; then
-        input_closed=0
-        break
-      fi
       [[ $command != "pair $mac" ]] || printf 'Pairing successful\n'
     done
-    if (( input_closed )); then
-      printf 'agent-input-closed\n' >> "$TEST_SCRATCH/pair-sessions"
-    else
-      printf 'agent-received-quit\n' >> "$TEST_SCRATCH/pair-sessions"
-    fi
   }
 
   CFG_CONTROLLER=auto
@@ -1952,11 +1949,11 @@ test_pairing_session_keeps_controller_pairable() {
   assert_eq 2 "$(grep -Fc 'pairable on' "$TEST_SCRATCH/pair-sessions")"
   assert_eq 2 "$(grep -Fc "pair $mac" "$TEST_SCRATCH/pair-sessions")"
   assert_file_not_contains "$TEST_SCRATCH/pair-sessions" 'quit'
-  assert_eq 2 "$(grep -Fc 'agent-input-closed' "$TEST_SCRATCH/pair-sessions")"
+  assert_eq 2 "$(wc -l < "$TEST_SCRATCH/terminated-pair-sessions")"
   assert_eq 1 "$(grep -Fc "select $controller" "$TEST_SCRATCH/pair-sessions")"
-  assert_eq $'args: --agent NoInputNoOutput\npairable on\npair AA:BB:CC:DD:EE:FF\nagent-input-closed' \
+  assert_eq $'args: --agent NoInputNoOutput\npairable on\npair AA:BB:CC:DD:EE:FF' \
     "$(sed -n '1,/session-end/{ /session-end/d; p; }' "$TEST_SCRATCH/pair-sessions")"
-  assert_eq $'args: --agent NoInputNoOutput\nselect 12:34:56:78:9A:BC\npairable on\npair AA:BB:CC:DD:EE:FF\nagent-input-closed' \
+  assert_eq $'args: --agent NoInputNoOutput\nselect 12:34:56:78:9A:BC\npairable on\npair AA:BB:CC:DD:EE:FF' \
     "$(sed -n '/session-end/,$ { /session-end/d; p; }' "$TEST_SCRATCH/pair-sessions")"
 }
 
@@ -2705,15 +2702,13 @@ test_explicit_controller_scopes_device_operations() {
       return 0
     fi
     if [[ $* == *'--agent '* ]]; then
-      input=
       while IFS= read -r line; do
-        input+="${input:+$'\n'}$line"
+        printf '%s\n' "$line" >> "$TEST_SCRATCH/controller-sessions"
         [[ $line != "pair $mac" ]] || printf 'Pairing successful\n'
-        [[ $line != quit ]] || break
       done
-    else
-      input=$(cat)
+      return 0
     fi
+    input=$(cat)
     printf '%s\n---\n' "$input" >> "$TEST_SCRATCH/controller-sessions"
     case $input in
       *"info $mac"*) printf 'Device %s Test Speaker\n\tPaired: yes\n' "$mac" ;;
@@ -2964,7 +2959,7 @@ run_test 'media state rejects unprivileged parent for root' \
 run_test 'media state rejects the wrong identity' test_media_state_rejects_wrong_identity
 run_test 'status reports media URL configuration' test_status_reports_media_url_configuration
 run_test 'pairing provenance and existing bonds' test_pairing_provenance_and_existing_bond
-run_test 'pairing session keeps controller pairable' test_pairing_session_keeps_controller_pairable
+run_test 'pairing session terminates after bonding' test_pairing_session_terminates_after_bonding
 run_test 'pair --all attempts every configured speaker' test_pair_all_attempts_every_configured_speaker
 run_test 'interactive scan selection' test_interactive_scan_selection
 run_test 'forget removes config and provenance' test_forget_removes_config_and_provenance

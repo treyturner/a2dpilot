@@ -2062,12 +2062,22 @@ pair_on_controller() {
       completed=1
     fi
     if (( completed == 1 )); then
-      kill "$forward_pid" 2>/dev/null || true
-      wait "$forward_pid" 2>/dev/null || true
+      if (( interactive )); then
+        printf '\n' >&"$tty_output"
+      else
+        printf '\n'
+      fi
+      if [[ -n $forward_pid ]]; then
+        kill "$forward_pid" 2>/dev/null || true
+        wait "$forward_pid" 2>/dev/null || true
+      fi
       forward_pid=
       exec {input_fd}>&-
       input_fd=
-      completed=2
+      exec {output_fd}<&-
+      output_fd=
+      kill "$pair_pid" 2>/dev/null || true
+      break
     fi
   done
   [[ -z $forward_pid ]] || {
@@ -2075,7 +2085,7 @@ pair_on_controller() {
     wait "$forward_pid" 2>/dev/null || true
   }
   [[ -z $input_fd ]] || exec {input_fd}>&-
-  exec {output_fd}<&-
+  [[ -z $output_fd ]] || exec {output_fd}<&-
   (( interactive == 0 )) || exec {tty_output}>&-
   wait "$pair_pid" 2>/dev/null || true
   return "$result"
@@ -2089,6 +2099,7 @@ pair_one() {
     note "Scanning for $mac; put the speaker in pairing mode..."
     scan_bredr
     pair_on_controller "$mac" "$agent" || return 1
+    note "Pairing succeeded; finalizing trust and connection..."
     device_paired "$mac" || return 1
     append_unique_line "$STATE_DIR/created-bonds" "$bond_controller $mac" || return 1
   fi
