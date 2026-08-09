@@ -1455,16 +1455,6 @@ controller_batch() {
   } | run_bounded_bluetoothctl "$timeout" --timeout "$timeout"
 }
 
-controller_agent_batch() {
-  local controller=$1 timeout=$2 agent=$3
-  shift 3
-  {
-    [[ $controller == auto ]] || printf 'select %s\n' "$controller"
-    printf '%s\n' "$@"
-    printf 'quit\n'
-  } | run_bounded_bluetoothctl "$timeout" --timeout "$timeout" --agent "$agent"
-}
-
 run_bounded_bluetoothctl() {
   local timeout=$1
   shift
@@ -2036,34 +2026,31 @@ wait_for_device_connection() {
 
 pair_on_controller() {
   local mac=$1 agent=$2
-  if [[ $CFG_CONTROLLER == auto ]]; then
-    if has_tty; then
-      bluetoothctl --timeout 60 --agent "$agent" pair "$mac" < /dev/tty > /dev/tty
-    else
-      bluetoothctl --timeout 60 --agent "$agent" pair "$mac"
-    fi
-    return
-  fi
-  if ! has_tty; then
-    controller_agent_batch "$CFG_CONTROLLER" 60 "$agent" "pair $mac"
-    return
-  fi
-
-  local pair_pid input_fd output_fd tty_output forward_pid='' char output_buffer=''
-  local result=1 completed=0
+  local pair_pid input_fd output_fd tty_output='' forward_pid='' char output_buffer=''
+  local result=1 completed=0 interactive=0
+  has_tty && interactive=1
   coproc A2DPILOT_PAIR_SESSION {
     run_bounded_bluetoothctl 60 --agent "$agent" 2>&1
   }
   pair_pid=$A2DPILOT_PAIR_SESSION_PID
   exec {input_fd}>&"${A2DPILOT_PAIR_SESSION[1]}"
   exec {output_fd}<&"${A2DPILOT_PAIR_SESSION[0]}"
-  exec {tty_output}> /dev/tty
-  printf 'select %s\npair %s\n' "$CFG_CONTROLLER" "$mac" >&"$input_fd"
-  cat /dev/tty >&"$input_fd" &
-  forward_pid=$!
+  if (( interactive )); then
+    exec {tty_output}> /dev/tty
+  fi
+  [[ $CFG_CONTROLLER == auto ]] || printf 'select %s\n' "$CFG_CONTROLLER" >&"$input_fd"
+  printf 'pairable on\npair %s\n' "$mac" >&"$input_fd"
+  if (( interactive )); then
+    cat /dev/tty >&"$input_fd" &
+    forward_pid=$!
+  fi
 
   while IFS= read -r -N 1 char <&"$output_fd"; do
-    printf '%s' "$char" >&"$tty_output"
+    if (( interactive )); then
+      printf '%s' "$char" >&"$tty_output"
+    else
+      printf '%s' "$char"
+    fi
     output_buffer+=$char
     (( ${#output_buffer} <= 512 )) || output_buffer=${output_buffer: -512}
     if (( completed == 0 )) && [[ $output_buffer == *'Pairing successful'* ]]; then
@@ -2087,7 +2074,7 @@ pair_on_controller() {
   }
   exec {input_fd}>&-
   exec {output_fd}<&-
-  exec {tty_output}>&-
+  (( interactive == 0 )) || exec {tty_output}>&-
   wait "$pair_pid" 2>/dev/null || true
   return "$result"
 }

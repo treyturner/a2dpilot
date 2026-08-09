@@ -1864,25 +1864,37 @@ test_status_reports_media_url_configuration() {
 }
 
 test_pairing_provenance_and_existing_bond() {
-  local user mac=AA:BB:CC:DD:EE:FF paired=0 trusted=0
+  local user mac=AA:BB:CC:DD:EE:FF paired=0 trusted=0 paired_file
   setup_scratch_dir
   load_app
   configure_scratch_paths
   user=$(id -un)
   write_test_config "$CONFIG_FILE" "$user"
   parse_config "$CONFIG_FILE"
+  paired_file=$TEST_SCRATCH/paired
   : > "$STATE_DIR/created-bonds"
   atomic_install_file() { cp "$1" "$2"; }
   has_tty() { return 1; }
   scan_bredr() { :; }
   configured_controller_address() { printf '12:34:56:78:9A:BC\n'; }
-  device_paired() { (( paired )); }
+  device_paired() { (( paired )) || [[ -f $paired_file ]]; }
   device_trusted() { (( trusted )); }
   wait_for_device_connection() { return 0; }
   systemctl() { :; }
   bluetoothctl() {
+    local input=''
+    if [[ $* == *'--agent '* ]]; then
+      while IFS= read -r input; do
+        printf '%s\n' "$input" >> "$TEST_SCRATCH/bluetooth.log"
+        [[ $input != quit ]] || break
+        if [[ $input == "pair $mac" ]]; then
+          : > "$paired_file"
+          printf 'Pairing successful\n'
+        fi
+      done
+      return 0
+    fi
     printf '%s\n' "$*" >> "$TEST_SCRATCH/bluetooth.log"
-    if [[ $* == *' pair '* ]]; then paired=1; trusted=1; fi
     if [[ $* == *' trust '* ]]; then trusted=1; fi
     return 0
   }
@@ -1901,6 +1913,39 @@ test_pairing_provenance_and_existing_bond() {
   assert_file_not_contains "$TEST_SCRATCH/bluetooth.log" "pair $mac"
   assert_file_contains "$TEST_SCRATCH/bluetooth.log" "trust $mac"
   [[ ! -s $STATE_DIR/created-bonds ]] || fail 'existing bond was recorded as A2DPilot-created'
+}
+
+test_pairing_session_keeps_controller_pairable() {
+  local mac=AA:BB:CC:DD:EE:FF controller=12:34:56:78:9A:BC
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  has_tty() { return 1; }
+  bluetoothctl() {
+    local command
+    printf 'args: %s\n' "$*" >> "$TEST_SCRATCH/pair-sessions"
+    while IFS= read -r command; do
+      printf '%s\n' "$command" >> "$TEST_SCRATCH/pair-sessions"
+      [[ $command != quit ]] || break
+      [[ $command != "pair $mac" ]] || printf 'Pairing successful\n'
+    done
+  }
+
+  CFG_CONTROLLER=auto
+  pair_on_controller "$mac" NoInputNoOutput >/dev/null
+  printf '%s\n' session-end >> "$TEST_SCRATCH/pair-sessions"
+  CFG_CONTROLLER=$controller
+  pair_on_controller "$mac" NoInputNoOutput >/dev/null
+
+  assert_eq 2 "$(grep -Fc 'args: --agent NoInputNoOutput' "$TEST_SCRATCH/pair-sessions")"
+  assert_eq 2 "$(grep -Fc 'pairable on' "$TEST_SCRATCH/pair-sessions")"
+  assert_eq 2 "$(grep -Fc "pair $mac" "$TEST_SCRATCH/pair-sessions")"
+  assert_eq 2 "$(grep -Fc 'quit' "$TEST_SCRATCH/pair-sessions")"
+  assert_eq 1 "$(grep -Fc "select $controller" "$TEST_SCRATCH/pair-sessions")"
+  assert_eq $'args: --agent NoInputNoOutput\npairable on\npair AA:BB:CC:DD:EE:FF\nquit' \
+    "$(sed -n '1,/session-end/{ /session-end/d; p; }' "$TEST_SCRATCH/pair-sessions")"
+  assert_eq $'args: --agent NoInputNoOutput\nselect 12:34:56:78:9A:BC\npairable on\npair AA:BB:CC:DD:EE:FF\nquit' \
+    "$(sed -n '/session-end/,$ { /session-end/d; p; }' "$TEST_SCRATCH/pair-sessions")"
 }
 
 test_pair_all_attempts_every_configured_speaker() {
@@ -2622,18 +2667,26 @@ test_explicit_controller_scopes_device_operations() {
   CFG_CONTROLLER=$controller
   has_tty() { return 1; }
   bluetoothctl() {
-    local input
+    local input line
     if [[ ${1:-} == list ]]; then
       printf 'Controller 00:11:22:33:44:55 First Adapter\n'
       printf 'Controller %s Selected Adapter [default]\n' "$controller"
       return 0
     fi
-    input=$(cat)
+    if [[ $* == *'--agent '* ]]; then
+      input=
+      while IFS= read -r line; do
+        input+="${input:+$'\n'}$line"
+        [[ $line != "pair $mac" ]] || printf 'Pairing successful\n'
+        [[ $line != quit ]] || break
+      done
+    else
+      input=$(cat)
+    fi
     printf '%s\n---\n' "$input" >> "$TEST_SCRATCH/controller-sessions"
     case $input in
       *"info $mac"*) printf 'Device %s Test Speaker\n\tPaired: yes\n' "$mac" ;;
       *devices*) printf 'Device %s Test Speaker\n' "$mac" ;;
-      *"pair $mac"*) printf 'Pairing successful\n' ;;
     esac
   }
   busctl() {
@@ -2880,6 +2933,7 @@ run_test 'media state rejects unprivileged parent for root' \
 run_test 'media state rejects the wrong identity' test_media_state_rejects_wrong_identity
 run_test 'status reports media URL configuration' test_status_reports_media_url_configuration
 run_test 'pairing provenance and existing bonds' test_pairing_provenance_and_existing_bond
+run_test 'pairing session keeps controller pairable' test_pairing_session_keeps_controller_pairable
 run_test 'pair --all attempts every configured speaker' test_pair_all_attempts_every_configured_speaker
 run_test 'interactive scan selection' test_interactive_scan_selection
 run_test 'forget removes config and provenance' test_forget_removes_config_and_provenance
