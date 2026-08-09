@@ -1922,13 +1922,21 @@ test_pairing_session_keeps_controller_pairable() {
   configure_scratch_paths
   has_tty() { return 1; }
   bluetoothctl() {
-    local command
+    local command input_closed=1
     printf 'args: %s\n' "$*" >> "$TEST_SCRATCH/pair-sessions"
     while IFS= read -r command; do
       printf '%s\n' "$command" >> "$TEST_SCRATCH/pair-sessions"
-      [[ $command != quit ]] || break
+      if [[ $command == quit ]]; then
+        input_closed=0
+        break
+      fi
       [[ $command != "pair $mac" ]] || printf 'Pairing successful\n'
     done
+    if (( input_closed )); then
+      printf 'agent-input-closed\n' >> "$TEST_SCRATCH/pair-sessions"
+    else
+      printf 'agent-received-quit\n' >> "$TEST_SCRATCH/pair-sessions"
+    fi
   }
 
   CFG_CONTROLLER=auto
@@ -1940,11 +1948,12 @@ test_pairing_session_keeps_controller_pairable() {
   assert_eq 2 "$(grep -Fc 'args: --agent NoInputNoOutput' "$TEST_SCRATCH/pair-sessions")"
   assert_eq 2 "$(grep -Fc 'pairable on' "$TEST_SCRATCH/pair-sessions")"
   assert_eq 2 "$(grep -Fc "pair $mac" "$TEST_SCRATCH/pair-sessions")"
-  assert_eq 2 "$(grep -Fc 'quit' "$TEST_SCRATCH/pair-sessions")"
+  assert_file_not_contains "$TEST_SCRATCH/pair-sessions" 'quit'
+  assert_eq 2 "$(grep -Fc 'agent-input-closed' "$TEST_SCRATCH/pair-sessions")"
   assert_eq 1 "$(grep -Fc "select $controller" "$TEST_SCRATCH/pair-sessions")"
-  assert_eq $'args: --agent NoInputNoOutput\npairable on\npair AA:BB:CC:DD:EE:FF\nquit' \
+  assert_eq $'args: --agent NoInputNoOutput\npairable on\npair AA:BB:CC:DD:EE:FF\nagent-input-closed' \
     "$(sed -n '1,/session-end/{ /session-end/d; p; }' "$TEST_SCRATCH/pair-sessions")"
-  assert_eq $'args: --agent NoInputNoOutput\nselect 12:34:56:78:9A:BC\npairable on\npair AA:BB:CC:DD:EE:FF\nquit' \
+  assert_eq $'args: --agent NoInputNoOutput\nselect 12:34:56:78:9A:BC\npairable on\npair AA:BB:CC:DD:EE:FF\nagent-input-closed' \
     "$(sed -n '/session-end/,$ { /session-end/d; p; }' "$TEST_SCRATCH/pair-sessions")"
 }
 
