@@ -2221,7 +2221,7 @@ record_new_packages() {
   local before=$STATE_DIR/packages-before after=$STATE_DIR/packages-after
   local replacement=$STATE_DIR/new-packages.tmp
   [[ -f $before && -f $after ]] || return 1
-  if ! comm -13 "$before" "$after" > "$replacement"; then
+  if ! LC_ALL=C comm -13 "$before" "$after" > "$replacement"; then
     rm -f -- "$replacement"
     return 1
   fi

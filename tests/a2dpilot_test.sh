@@ -592,6 +592,10 @@ EOF
   assert_contains "$output" 'new-dependency:armhf'
   assert_not_contains "$output" 'removed-package'
   assert_not_contains "$output" 'absent-package'
+  comm() {
+    [[ ${LC_ALL:-} == C ]] || fail 'comm did not use the package snapshot collation'
+    command comm "$@"
+  }
   record_new_packages
   assert_file_contains "$STATE_DIR/new-packages" 'new-direct'
   assert_file_contains "$STATE_DIR/new-packages" 'new-dependency:armhf'
