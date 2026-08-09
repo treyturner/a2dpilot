@@ -712,17 +712,23 @@ record_user_state() {
   : > "$directory/recorded"
 }
 
+scoped_systemctl() {
+  local scope=$1 user=$2
+  shift 2
+  if [[ $scope == system ]]; then
+    systemctl "$@"
+  else
+    as_user_systemctl "$user" "$@"
+  fi
+}
+
 set_unit_enabled_state() {
   local scope=$1 user=$2 unit=$3 state=$4
   local -a command=()
 
   # Disabled and masked are distinct systemd states. Always clear the state
   # A2DPilot needed while installed before recreating the recorded state.
-  if [[ $scope == system ]]; then
-    systemctl unmask "$unit" || return 1
-  else
-    as_user_systemctl "$user" unmask "$unit" || return 1
-  fi
+  scoped_systemctl "$scope" "$user" unmask "$unit" || return 1
 
   case $state in
     enabled) command=(enable "$unit") ;;
@@ -733,10 +739,22 @@ set_unit_enabled_state() {
     static|indirect|generated|transient|alias) return 0 ;;
     *) return 1 ;;
   esac
-  if [[ $scope == system ]]; then
-    systemctl "${command[@]}"
+  scoped_systemctl "$scope" "$user" "${command[@]}"
+}
+
+restore_unit_state_and_activity() {
+  local scope=$1 user=$2 unit=$3 state=$4 active=$5 action=$6
+  local -a mask_command=(mask "$unit")
+  # Masking does not stop a running unit, but it does prevent a later start.
+  # Recreate the recorded active-and-masked state in that required order.
+  if [[ $active == 1 && ( $state == masked || $state == masked-runtime ) ]]; then
+    [[ $state != masked-runtime ]] || mask_command=(mask --runtime "$unit")
+    scoped_systemctl "$scope" "$user" unmask "$unit" || return 1
+    scoped_systemctl "$scope" "$user" "$action" "$unit" || return 1
+    scoped_systemctl "$scope" "$user" "${mask_command[@]}"
   else
-    as_user_systemctl "$user" "${command[@]}"
+    set_unit_enabled_state "$scope" "$user" "$unit" "$state" || return 1
+    scoped_systemctl "$scope" "$user" "$action" "$unit"
   fi
 }
 
@@ -754,11 +772,10 @@ restore_user_state() {
       continue
     fi
     [[ $load_state != not-found ]] || return 1
-    set_unit_enabled_state user "$user" "$unit" "$enabled" || return 1
     action=stop
     [[ $active == 1 ]] && action=start
     [[ $unit == wireplumber.service && $active == 1 ]] && action=restart
-    as_user_systemctl "$user" "$action" "$unit" || return 1
+    restore_unit_state_and_activity user "$user" "$unit" "$enabled" "$active" "$action" || return 1
   done < "$directory/service-states"
   linger=$(< "$directory/linger")
   if [[ $linger != yes ]]; then
@@ -823,13 +840,12 @@ restore_system_service_states() {
       # restoring the original socket-activated service state.
       systemctl stop triggerhappy.service || return 1
     fi
-    set_unit_enabled_state system '' "$unit" "$enabled" || return 1
     action=stop
     [[ $active == 1 ]] && action=start
     case $unit:$active in
       triggerhappy.service:1) action=restart ;;
     esac
-    systemctl "$action" "$unit" || return 1
+    restore_unit_state_and_activity system '' "$unit" "$enabled" "$active" "$action" || return 1
   done < "$STATE_DIR/system-service-states"
 }
 

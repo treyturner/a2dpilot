@@ -1326,7 +1326,7 @@ test_audio_user_reconciliation() {
 }
 
 test_audio_user_units_are_unmasked_before_enablement() {
-  local user unmask_line enable_line
+  local user unmask_line enable_line expected
   setup_scratch_dir
   load_app
   configure_scratch_paths
@@ -1341,6 +1341,15 @@ test_audio_user_units_are_unmasked_before_enablement() {
   unmask_line=$(grep -n ' unmask ' "$TEST_SCRATCH/user-systemctl.log" | cut -d: -f1)
   enable_line=$(grep -n ' enable --now ' "$TEST_SCRATCH/user-systemctl.log" | cut -d: -f1)
   (( unmask_line < enable_line )) || fail 'user units were enabled before being unmasked'
+
+  restore_unit_state_and_activity user "$user" masked-user.service masked 1 start
+  expected=$TEST_SCRATCH/expected-user-restore
+  cat > "$expected" <<EOF
+$user unmask masked-user.service
+$user start masked-user.service
+$user mask masked-user.service
+EOF
+  tail -n 3 "$TEST_SCRATCH/user-systemctl.log" | diff -u "$expected" -
 }
 
 test_rfkill_snapshot_restore_and_hard_block() {
@@ -1527,6 +1536,8 @@ enabled.service enabled 1
 disabled.service disabled 0
 static.service static 1
 masked.service masked 0
+active-masked.service masked 1
+runtime-masked.service masked-runtime 1
 missing.service not-found 0
 EOF
   systemctl() {
@@ -1551,6 +1562,12 @@ start static.service
 unmask masked.service
 mask masked.service
 stop masked.service
+unmask active-masked.service
+start active-masked.service
+mask active-masked.service
+unmask runtime-masked.service
+start runtime-masked.service
+mask --runtime runtime-masked.service
 EOF
   diff -u "$expected" "$TEST_SCRATCH/systemctl.log"
 
