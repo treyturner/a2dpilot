@@ -588,14 +588,51 @@ test_uninstall_dependency_and_empty_bond_policy() {
       printf '%s\n' "$*" >> "$TEST_SCRATCH/systemctl.log"
     fi
   }
-  apt-get() { printf '%s\n' "$*" >> "$TEST_SCRATCH/apt.log"; }
+  list_present_packages() {
+    printf 'pipewire\npipewire-bin\nlibspa-0.2-bluetooth:armhf\n'
+  }
+  apt-get() {
+    printf '%s\n' "$*" >> "$TEST_SCRATCH/apt.log"
+    if [[ $1 == --simulate ]]; then
+      printf 'Remv pipewire [1.0]\n'
+      printf 'Remv pipewire-bin [1.0]\n'
+      printf 'Remv libspa-0.2-bluetooth:armhf [1.0]\n'
+    fi
+  }
   output=$(uninstall_action --remove-bonds --with-dependencies)
   assert_contains "$output" 'No A2DPilot-created bonds were recorded.'
   assert_contains "$output" 'Removing packages installed for A2DPilot...'
   assert_file_contains "$TEST_SCRATCH/apt.log" \
     'remove -y pipewire pipewire-bin libspa-0.2-bluetooth:armhf'
+  assert_eq 1 "$(grep -Fxc \
+    'remove -y pipewire pipewire-bin libspa-0.2-bluetooth:armhf' \
+    "$TEST_SCRATCH/apt.log")"
   assert_file_not_contains "$TEST_SCRATCH/apt.log" 'autoremove'
   [[ ! -e $STATE_DIR ]] || fail 'dependency-removing uninstall retained state'
+}
+
+test_package_removal_rejects_unrecorded_dependents() {
+  local output rc
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  printf 'pipewire\n' > "$STATE_DIR/new-packages"
+  list_present_packages() { printf 'later-player\npipewire\n'; }
+  apt-get() {
+    if [[ $1 == --simulate ]]; then
+      printf 'Remv pipewire [1.0]\n'
+      printf 'Remv later-player [2.0]\n'
+    else
+      : > "$TEST_SCRATCH/real-removal"
+    fi
+  }
+  set +e
+  output=$(remove_recorded_packages 2>&1)
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'unsafe APT removal plan was accepted'
+  assert_contains "$output" 'APT would also remove unrecorded packages: later-player'
+  [[ ! -e $TEST_SCRATCH/real-removal ]] || fail 'unsafe APT removal was executed'
 }
 
 test_failed_install_rollback_removes_dependencies() {
@@ -1578,6 +1615,7 @@ run_test 'Triggerhappy config rejects symlinked parent' test_trigger_config_reje
 run_test 'non-interactive install and uninstall fixture' test_noninteractive_install_and_uninstall_fixture
 run_test 'APT transaction package tracking' test_package_transaction_tracking
 run_test 'opt-in dependency removal and empty bond policy' test_uninstall_dependency_and_empty_bond_policy
+run_test 'APT removal rejects unrecorded dependents' test_package_removal_rejects_unrecorded_dependents
 run_test 'failed install rollback removes dependencies' test_failed_install_rollback_removes_dependencies
 run_test 'failed-state recovery preserves package provenance' test_failed_state_recovery_preserves_recorded_packages
 run_test 'safe config editor success and validation failure' test_config_editor_success_and_validation_failure

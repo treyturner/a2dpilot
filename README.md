@@ -267,7 +267,7 @@ sudo a2dpilot uninstall --remove-bonds --with-dependencies
 
 `--remove-bonds` affects only bonds A2DPilot created. A device that was already paired before A2DPilot touched it is never automatically removed.
 
-Uninstall restores replaced files, original system and user unit states, linger settings for every audio user A2DPilot managed, and controller power and rfkill state when the hardware is still present. Packages are kept by default. Add `--with-dependencies` to remove only packages added by the current A2DPilot installation, including its newly installed transitive dependencies. Packages retained by an earlier uninstall are treated as user-owned by later installations.
+Uninstall restores replaced files, original system and user unit states, linger settings for every audio user A2DPilot managed, and controller power and rfkill state when the hardware is still present. Packages are kept by default. Add `--with-dependencies` to remove only packages added by the current A2DPilot installation, including its newly installed transitive dependencies. Packages retained by an earlier uninstall are treated as user-owned by later installations. A2DPilot simulates removal first and aborts if APT would also remove an unrecorded package.
 
 A2DPilot never runs unrestricted `apt autoremove`. Automatic rollback after a failed or interrupted installation does remove that installation's newly added packages.
 

@@ -2151,8 +2151,10 @@ record_new_packages() {
 }
 
 remove_recorded_packages() {
-  local package
+  local package action planned_package plan current
   local -a packages=()
+  local -a unexpected=() missing=()
+  local -A recorded=() present=() planned=()
   [[ -s $STATE_DIR/new-packages ]] || return 0
   while IFS= read -r package; do
     [[ -n $package ]] || continue
@@ -2161,8 +2163,44 @@ remove_recorded_packages() {
       return 1
     }
     packages+=("$package")
+    recorded[$package]=1
   done < "$STATE_DIR/new-packages"
   (( ${#packages[@]} > 0 )) || return 0
+
+  plan=$(mktemp "$STATE_DIR/.package-removal-plan.XXXXXX") || return 1
+  current=$(mktemp "$STATE_DIR/.present-packages.XXXXXX") || {
+    rm -f -- "$plan"
+    return 1
+  }
+  if ! list_present_packages > "$current" ||
+     ! DEBIAN_FRONTEND=noninteractive apt-get --simulate remove -y "${packages[@]}" > "$plan"; then
+    rm -f -- "$plan" "$current"
+    warn "Could not verify APT's package-removal plan."
+    return 1
+  fi
+  while IFS= read -r package; do
+    [[ -n $package ]] && present[$package]=1
+  done < "$current"
+  while read -r action planned_package _; do
+    [[ $action == Remv && -n $planned_package ]] || continue
+    planned[$planned_package]=1
+    [[ ${recorded[$planned_package]+present} ]] || unexpected+=("$planned_package")
+  done < "$plan"
+  for package in "${packages[@]}"; do
+    if [[ ${present[$package]+present} && ! ${planned[$package]+present} ]]; then
+      missing+=("$package")
+    fi
+  done
+  rm -f -- "$plan" "$current"
+  if (( ${#unexpected[@]} > 0 )); then
+    warn "APT would also remove unrecorded packages: ${unexpected[*]}"
+    return 1
+  fi
+  if (( ${#missing[@]} > 0 )); then
+    warn "Could not verify removal of recorded packages: ${missing[*]}"
+    return 1
+  fi
+
   note "Removing packages installed for A2DPilot..."
   DEBIAN_FRONTEND=noninteractive apt-get remove -y "${packages[@]}"
 }
