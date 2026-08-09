@@ -2285,6 +2285,20 @@ restore_previous_update() {
   fi
 }
 
+verify_updated_daemon() {
+  timeout --signal=TERM --kill-after=1 "$UPDATE_TOTAL_TIMEOUT" bash -c '
+    source /proc/self/fd/3
+    A2DPILOT_UPDATE_ITERATION_DONE=0
+    acquire_lock() { return 0; }
+    release_lock() { A2DPILOT_UPDATE_ITERATION_DONE=1; }
+    sleep() {
+      if (( A2DPILOT_UPDATE_ITERATION_DONE )); then exit 0; fi
+      /usr/bin/sleep 1
+    }
+    daemon_action
+  ' a2dpilot-update-verifier 3< "$INSTALLED_CLI"
+}
+
 rollback_failed_update() {
   local rc=$1 message=$2 restored=1 retained_previous=
   trap - HUP INT TERM
@@ -2403,10 +2417,15 @@ update_action() {
     rollback_failed_update 1 "Could not replace the A2DPilot executable."
 
   if (( UPDATE_WAS_ACTIVE )); then
-    if ! systemctl restart a2dpilot.service || \
-       [[ $(system_unit_active_bit a2dpilot.service) != 1 ]]; then
+    systemctl restart a2dpilot.service || \
       rollback_failed_update 1 "The updated A2DPilot service did not become active."
-    fi
+    # Type=simple reports startup before the daemon can pass this updater's
+    # lock. Exercise the new executable's lock-protected iteration explicitly
+    # before accepting it, while the parent updater preserves serialization.
+    verify_updated_daemon || \
+      rollback_failed_update 1 "The updated A2DPilot daemon failed its first runtime cycle."
+    [[ $(system_unit_active_bit a2dpilot.service) == 1 ]] || \
+      rollback_failed_update 1 "The updated A2DPilot service did not remain active."
   fi
 
   trap '' HUP INT TERM
