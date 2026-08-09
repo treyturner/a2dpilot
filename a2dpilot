@@ -51,10 +51,11 @@ PACKAGES=(
 )
 
 USER_UNITS=(
-  pipewire.service
+  # Stop activation paths before their services while restoring inactive units.
   pipewire.socket
-  pipewire-pulse.service
+  pipewire.service
   pipewire-pulse.socket
+  pipewire-pulse.service
   wireplumber.service
 )
 
@@ -96,7 +97,7 @@ Usage:
   sudo a2dpilot pair [MAC | --all] [--agent CAPABILITY]
   sudo a2dpilot forget MAC [--yes]
   sudo a2dpilot status
-  sudo a2dpilot uninstall [--keep-bonds | --remove-bonds]
+  sudo a2dpilot uninstall [--keep-bonds | --remove-bonds] [--with-dependencies]
 
 Internal integration commands:
   a2dpilot daemon
@@ -714,6 +715,15 @@ record_user_state() {
 set_unit_enabled_state() {
   local scope=$1 user=$2 unit=$3 state=$4
   local -a command=()
+
+  # Disabled and masked are distinct systemd states. Always clear the state
+  # A2DPilot needed while installed before recreating the recorded state.
+  if [[ $scope == system ]]; then
+    systemctl unmask "$unit" || return 1
+  else
+    as_user_systemctl "$user" unmask "$unit" || return 1
+  fi
+
   case $state in
     enabled) command=(enable "$unit") ;;
     enabled-runtime) command=(enable --runtime "$unit") ;;
@@ -765,6 +775,7 @@ ensure_audio_user() {
   uid=$(id -u "$user")
   loginctl enable-linger "$user" || return 1
   systemctl start "user@$uid.service" || return 1
+  as_user_systemctl "$user" unmask "${USER_UNITS[@]}" || return 1
   as_user_systemctl "$user" enable --now pipewire.service pipewire-pulse.service wireplumber.service || return 1
   as_user_systemctl "$user" restart wireplumber.service || return 1
 }
@@ -2120,12 +2131,53 @@ status_action() {
   fi
 }
 
+list_present_packages() {
+  dpkg-query -W -f='${binary:Package}\t${db:Status-Abbrev}\n' 2>/dev/null |
+    awk -F '\t' 'length($2) >= 2 && substr($2, 2, 1) !~ /^[nc]$/ { print $1 }' |
+    LC_ALL=C sort -u
+}
+
+record_new_packages() {
+  local before=$STATE_DIR/packages-before current=$STATE_DIR/packages-current
+  local replacement=$STATE_DIR/new-packages.tmp
+  [[ -f $before ]] || return 1
+  if ! list_present_packages > "$current" ||
+     ! comm -13 "$before" "$current" > "$replacement"; then
+    rm -f -- "$current" "$replacement"
+    return 1
+  fi
+  mv -f -- "$replacement" "$STATE_DIR/new-packages"
+  rm -f -- "$current"
+}
+
+remove_recorded_packages() {
+  local package
+  local -a packages=()
+  [[ -s $STATE_DIR/new-packages ]] || return 0
+  while IFS= read -r package; do
+    [[ -n $package ]] || continue
+    [[ $package =~ ^[a-z0-9][a-z0-9+.-]*(:[a-z0-9][a-z0-9-]*)?$ ]] || {
+      warn "Invalid recorded package name: $package"
+      return 1
+    }
+    packages+=("$package")
+  done < "$STATE_DIR/new-packages"
+  (( ${#packages[@]} > 0 )) || return 0
+  note "Removing packages installed for A2DPilot..."
+  DEBIAN_FRONTEND=noninteractive apt-get remove -y "${packages[@]}"
+}
+
 rollback_failed_install() {
   local rc=$1
   trap - ERR INT TERM
-  release_lock
   note "Installation failed; attempting automatic rollback..."
-  if "$SCRIPT_PATH" uninstall --keep-bonds; then
+  if ! record_new_packages; then
+    write_state_file failed || true
+    warn "Could not determine which packages were added; recovery state remains at $STATE_DIR."
+    exit "$rc"
+  fi
+  release_lock
+  if "$SCRIPT_PATH" uninstall --keep-bonds --with-dependencies; then
     note "Automatic rollback succeeded."
   else
     if [[ -f $STATE_FILE ]] && ! write_state_file failed; then
@@ -2173,8 +2225,9 @@ install_action() {
     case $existing_phase in
       installing|failed)
         note "Recovering interrupted installation before retrying..."
+        record_new_packages || die "Could not determine which packages were added during the interrupted installation."
         release_lock
-        "$SCRIPT_PATH" uninstall --keep-bonds || die "Could not recover the interrupted installation."
+        "$SCRIPT_PATH" uninstall --keep-bonds --with-dependencies || die "Could not recover the interrupted installation."
         acquire_lock
         ;;
       *) release_lock; die "A2DPilot is already installed." ;;
@@ -2192,8 +2245,10 @@ install_action() {
   : > "$STATE_DIR/replaced-files"
   : > "$STATE_DIR/new-packages"
   : > "$STATE_DIR/created-bonds"
+  list_present_packages > "$STATE_DIR/packages-before" || \
+    die "Could not snapshot installed packages."
 
-  local audio_user config_seed package
+  local audio_user config_seed
   if [[ -e $CONFIG_FILE || -L $CONFIG_FILE ]]; then
     [[ -z $requested_user ]] || die "--user only applies when creating a new configuration."
     parse_config "$CONFIG_FILE" || die "$CONFIG_ERROR"
@@ -2208,10 +2263,6 @@ install_action() {
   record_user_state "$audio_user"
   record_rfkill_state
   record_controller_state
-  for package in "${PACKAGES[@]}"; do
-    dpkg-query -W -f='${db:Status-Abbrev}' "$package" 2>/dev/null | grep -q '^ii' || \
-      printf '%s\n' "$package" >> "$STATE_DIR/new-packages"
-  done
   backup_file "$INSTALLED_CLI"
   backup_file "$CONFIG_FILE"
   backup_file "$SYSTEMD_UNIT"
@@ -2226,6 +2277,7 @@ install_action() {
   note "Installing BlueZ, PipeWire, WirePlumber, Triggerhappy, and A2DP codec support..."
   apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${PACKAGES[@]}"
+  record_new_packages
 
   install -d -m 0755 "$(dirname "$INSTALLED_CLI")" "$(dirname "$SYSTEMD_UNIT")" \
     "$(dirname "$WIREPLUMBER_CONF")" "$(dirname "$TRIGGER_CONF")" "$(dirname "$CONFIG_FILE")"
@@ -2253,6 +2305,7 @@ install_action() {
   write_trigger_config "$TRIGGER_CONF" "$CFG_MEDIA_CONTROLS"
 
   systemctl daemon-reload
+  systemctl unmask "${SYSTEM_UNITS[@]}"
   ensure_audio_user "$CFG_AUDIO_USER"
   printf '%s\n' "$CFG_AUDIO_USER" > "$STATE_DIR/runtime-user"
   # Debian ships triggerhappy.socket as an alternative activation path for
@@ -2287,8 +2340,9 @@ remove_created_bonds() {
       failed=1
       continue
     fi
-    if device_info_on_controller "$controller" "$mac" >/dev/null 2>&1 &&
-       ! remove_bluetooth_device_on_controller "$controller" "$mac"; then
+    if ! device_info_on_controller "$controller" "$mac" >/dev/null 2>&1; then
+      note "A2DPilot-created bond $mac is already absent from controller $controller."
+    elif ! remove_bluetooth_device_on_controller "$controller" "$mac"; then
       warn "Could not remove A2DPilot-created bond $mac from controller $controller."
       failed=1
     else
@@ -2300,7 +2354,11 @@ remove_created_bonds() {
 
 choose_bond_policy() {
   local requested=$1 answer controller mac extra
-  if [[ $requested == keep || ! -s $STATE_DIR/created-bonds ]]; then
+  if [[ ! -s $STATE_DIR/created-bonds ]]; then
+    printf 'none\n'
+    return 0
+  fi
+  if [[ $requested == keep ]]; then
     printf 'keep\n'
     return 0
   fi
@@ -2359,10 +2417,12 @@ restore_managed_files() {
 uninstall_action() {
   require_root
   local bond_request=ask bond_policy bond_failure=0 rollback_failure=0
+  local with_dependencies=0
   while [[ $# -gt 0 ]]; do
     case $1 in
       --keep-bonds) [[ $bond_request == ask ]] || die "Bond-policy flags are mutually exclusive."; bond_request=keep; shift ;;
       --remove-bonds) [[ $bond_request == ask ]] || die "Bond-policy flags are mutually exclusive."; bond_request=remove; shift ;;
+      --with-dependencies) (( with_dependencies == 0 )) || die "--with-dependencies may only be specified once."; with_dependencies=1; shift ;;
       *) die "Unknown uninstall option: $1" ;;
     esac
   done
@@ -2375,6 +2435,8 @@ uninstall_action() {
   fi
   if [[ $bond_policy == remove ]]; then
     remove_created_bonds || bond_failure=1
+  elif [[ $bond_policy == none ]]; then
+    note "No A2DPilot-created bonds were recorded."
   else
     note "Bluetooth bonds were preserved."
   fi
@@ -2386,10 +2448,10 @@ uninstall_action() {
   restore_rfkill_state
   restore_system_service_states || rollback_failure=1
 
-  if [[ -s $STATE_DIR/new-packages ]]; then
-    local -a new_packages=()
-    mapfile -t new_packages < "$STATE_DIR/new-packages"
-    DEBIAN_FRONTEND=noninteractive apt-get remove -y "${new_packages[@]}" || rollback_failure=1
+  if (( with_dependencies )); then
+    remove_recorded_packages || rollback_failure=1
+  elif [[ -s $STATE_DIR/new-packages ]]; then
+    note "Packages installed for A2DPilot were preserved."
   fi
 
   release_lock
@@ -2398,7 +2460,7 @@ uninstall_action() {
     die "Rollback was incomplete; recovery state remains at $STATE_DIR."
   fi
   rm -rf -- "$STATE_DIR"
-  note "A2DPilot was uninstalled and prior system state was restored."
+  note "A2DPilot was uninstalled and managed system state was restored."
   (( bond_failure == 0 )) || die "System rollback succeeded, but one or more Bluetooth bonds could not be removed."
 }
 

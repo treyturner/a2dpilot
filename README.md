@@ -15,7 +15,7 @@ The project is delivered as one Bash program. The same `a2dpilot` file installs 
 - Configurable media-key routing with broad Linux transport-key coverage, relative volume control, and relative or absolute HTTP(S) player URLs.
 - Safe configuration editing and validation through the CLI.
 - Headless PipeWire/WirePlumber operation using systemd linger.
-- Transactional installation with restoration of files, packages, services, user services, linger, rfkill, and controller state.
+- Transactional installation with restoration of files, services, user services, linger, rfkill, and controller state, plus optional removal of installed packages.
 - Optional removal of only the Bluetooth bonds that A2DPilot itself created.
 
 LE Audio/BAP, aptX Adaptive, and codec forcing are not currently supported.
@@ -262,11 +262,14 @@ Interactive uninstall lists bonds created by A2DPilot and asks whether to remove
 ```sh
 sudo a2dpilot uninstall --keep-bonds
 sudo a2dpilot uninstall --remove-bonds
+sudo a2dpilot uninstall --remove-bonds --with-dependencies
 ```
 
 `--remove-bonds` affects only bonds A2DPilot created. A device that was already paired before A2DPilot touched it is never automatically removed.
 
-Uninstall restores replaced files, original system and user unit states, linger settings for every audio user A2DPilot managed, controller power and rfkill state when the hardware is still present, and packages that were explicitly absent before installation. It does not run `apt autoremove`.
+Uninstall restores replaced files, original system and user unit states, linger settings for every audio user A2DPilot managed, and controller power and rfkill state when the hardware is still present. Packages are kept by default. Add `--with-dependencies` to remove only packages added by the current A2DPilot installation, including its newly installed transitive dependencies. Packages retained by an earlier uninstall are treated as user-owned by later installations.
+
+A2DPilot never runs unrestricted `apt autoremove`. Automatic rollback after a failed or interrupted installation does remove that installation's newly added packages.
 
 Do not manually delete `/var/lib/a2dpilot` before uninstalling; it contains the rollback snapshot.
 
@@ -286,7 +289,7 @@ aptX Adaptive is not currently exposed by this PipeWire stack. Although the LC3 
 - Root-managed configuration is parsed as data and never sourced as shell code.
 - Triggerhappy receives only validated key names; URL resolution and placeholder expansion happen inside `player-control` immediately before `curl` runs. Stateful volume, mute, shuffle, and repeat mappings first poll the player's music timeline. Systemd recreates `/run/a2dpilot` for Debian's unprivileged Triggerhappy handler; per-player pre-mute volumes stored there expire on reboot.
 - A2DPilot runs Triggerhappy through its direct service and disables the competing socket-activation unit while installed. Uninstall restores the original state of both units.
-- Install records its rollback snapshot before APT and service mutations. A failed or interrupted installation invokes uninstall automatically; failed rollback retains the snapshot for recovery.
+- Install records its rollback snapshot before APT and service mutations, including the complete package set added by its APT transaction. A failed or interrupted installation invokes uninstall with dependency removal automatically; failed rollback retains the snapshot for recovery.
 - Pairing happens after installation commits, so a speaker being unavailable does not erase a valid system setup.
 - The system-wide WirePlumber fragment only disables seat monitoring. It deliberately does not override `bluez5.codecs`.
 
@@ -397,7 +400,7 @@ The error includes the file and line when possible. Use one instance of every re
 A2DPilot normally rolls failed installation back automatically. If restoration cannot finish, `/var/lib/a2dpilot/state` is marked `failed` and retained. Correct the reported service, package, or filesystem problem and run:
 
 ```sh
-sudo /usr/local/sbin/a2dpilot uninstall --keep-bonds
+sudo /usr/local/sbin/a2dpilot uninstall --keep-bonds --with-dependencies
 ```
 
 If the installed command was one of the files already restored, rerun the downloaded repository script's `uninstall` command while preserving `/var/lib/a2dpilot`.
