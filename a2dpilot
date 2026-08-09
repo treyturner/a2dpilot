@@ -2372,9 +2372,11 @@ update_action() {
   install -o root -g root -m 0700 "$INSTALLED_CLI" "$UPDATE_PREVIOUS" || \
     rollback_failed_update 1 "Could not preserve the current A2DPilot executable."
   UPDATE_WAS_ACTIVE=$(system_unit_active_bit a2dpilot.service)
+  # Bash may defer a trapped signal until the replacement command returns, so
+  # mark the transaction for rollback before entering the atomic operation.
+  UPDATE_REPLACED=1
   atomic_install_file "$UPDATE_CANDIDATE" "$INSTALLED_CLI" 0755 || \
     rollback_failed_update 1 "Could not replace the A2DPilot executable."
-  UPDATE_REPLACED=1
 
   if (( UPDATE_WAS_ACTIVE )); then
     if ! systemctl restart a2dpilot.service || \

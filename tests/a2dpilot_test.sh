@@ -946,6 +946,39 @@ test_update_activation_rollback_and_interruption() {
   assert_contains "$output" 'Could not fully restore the previous A2DPilot executable and service'
   assert_file_contains "$INSTALLED_CLI" '# new executable'
 
+  printf '#!/usr/bin/env bash\n# old executable before signal\n' > "$INSTALLED_CLI"
+  printf '0\n' > "$atomic_count"
+  : > "$TEST_SCRATCH/replacement-state.log"
+  systemctl() {
+    case $1 in
+      is-active) printf 'active\n' ;;
+      restart) : ;;
+    esac
+  }
+  atomic_install_file() {
+    local count
+    count=$(< "$atomic_count")
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$atomic_count"
+    printf '%s\n' "$UPDATE_REPLACED" >> "$TEST_SCRATCH/replacement-state.log"
+    cp "$1" "$2"
+    chmod "$3" "$2"
+    if (( count == 1 )); then
+      kill -TERM "$BASHPID"
+    fi
+  }
+  set +e
+  output=$(update_action 2>&1)
+  rc=$?
+  set -e
+  assert_eq 143 "$rc"
+  assert_contains "$output" 'A2DPilot update was terminated'
+  assert_contains "$output" 'previous A2DPilot executable was restored'
+  assert_eq 1 "$(head -n 1 "$TEST_SCRATCH/replacement-state.log")"
+  assert_file_contains "$INSTALLED_CLI" '# old executable before signal'
+  [[ -z $(find "$TEST_SCRATCH" -maxdepth 1 -name 'a2dpilot-update.*' -o \
+    -name 'a2dpilot-previous.*') ]] || fail 'interrupted replacement retained temporary files'
+
   UPDATE_PREVIOUS=$TEST_SCRATCH/interrupted-previous
   UPDATE_CANDIDATE=$TEST_SCRATCH/interrupted-candidate
   printf '#!/usr/bin/env bash\n# interrupted old\n' > "$UPDATE_PREVIOUS"
