@@ -722,6 +722,16 @@ system_unit_active_bit() {
   [[ $(systemctl is-active "$1" 2>/dev/null || true) == active ]] && printf '1\n' || printf '0\n'
 }
 
+checked_system_unit_active_bit() {
+  local state
+  state=$(systemctl is-active "$1" 2>/dev/null) || true
+  case $state in
+    active|reloading) printf '1\n' ;;
+    inactive|failed) printf '0\n' ;;
+    *) return 1 ;;
+  esac
+}
+
 user_unit_enabled_state() {
   local user=$1 unit=$2 home
   home=$(user_home "$user")
@@ -2371,7 +2381,8 @@ update_action() {
   umask "$previous_umask"
   install -o root -g root -m 0700 "$INSTALLED_CLI" "$UPDATE_PREVIOUS" || \
     rollback_failed_update 1 "Could not preserve the current A2DPilot executable."
-  UPDATE_WAS_ACTIVE=$(system_unit_active_bit a2dpilot.service)
+  UPDATE_WAS_ACTIVE=$(checked_system_unit_active_bit a2dpilot.service) || \
+    rollback_failed_update 1 "Could not determine the A2DPilot service state."
   # Bash may defer a trapped signal until the replacement command returns, so
   # mark the transaction for rollback before entering the atomic operation.
   UPDATE_REPLACED=1

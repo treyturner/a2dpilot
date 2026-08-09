@@ -996,6 +996,29 @@ test_update_activation_rollback_and_interruption() {
   assert_file_contains "$INSTALLED_CLI" '# interrupted old'
   [[ ! -e $UPDATE_PREVIOUS && ! -e $UPDATE_CANDIDATE ]] || \
     fail 'interrupted update retained temporary files'
+
+  printf '#!/usr/bin/env bash\n# old executable before query failure\n' > "$INSTALLED_CLI"
+  printf '#!/usr/bin/env bash\n# candidate before query failure\n' > "$payload"
+  rm -f -- "$TEST_SCRATCH/unexpected-replacement"
+  systemctl() {
+    case $1 in
+      is-active) return 1 ;;
+      restart) fail 'service-state query failure attempted a restart' ;;
+    esac
+  }
+  atomic_install_file() {
+    : > "$TEST_SCRATCH/unexpected-replacement"
+    return 1
+  }
+  set +e
+  output=$(update_action 2>&1)
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'indeterminate service state reported update success'
+  assert_contains "$output" 'Could not determine the A2DPilot service state'
+  assert_file_contains "$INSTALLED_CLI" '# old executable before query failure'
+  [[ ! -e $TEST_SCRATCH/unexpected-replacement ]] || \
+    fail 'indeterminate service state replaced the executable'
 }
 
 test_config_editor_success_and_validation_failure() {
