@@ -2281,7 +2281,7 @@ restore_previous_update() {
 
 rollback_failed_update() {
   local rc=$1 message=$2 restored=1
-  trap - INT TERM
+  trap - HUP INT TERM
   printf 'ERROR: %s\n' "$message" >&2
   if (( UPDATE_REPLACED )); then
     note "Restoring the previous A2DPilot executable..."
@@ -2340,6 +2340,7 @@ update_action() {
     die "Could not create a temporary update file."
   fi
   umask "$previous_umask"
+  trap 'rollback_failed_update 129 "A2DPilot update was interrupted by a hangup."' HUP
   trap 'rollback_failed_update 130 "A2DPilot update was interrupted."' INT
   trap 'rollback_failed_update 143 "A2DPilot update was terminated."' TERM
 
@@ -2364,10 +2365,10 @@ update_action() {
     rollback_failed_update 1 "The installed executable became unsafe during the update."
 
   if cmp -s -- "$UPDATE_CANDIDATE" "$INSTALLED_CLI" && update_target_metadata_current; then
-    trap '' INT TERM
+    trap '' HUP INT TERM
     cleanup_update_temps
     release_lock
-    trap - INT TERM
+    trap - HUP INT TERM
     note "A2DPilot is already current for $selector '$ref'."
     return 0
   fi
@@ -2396,11 +2397,11 @@ update_action() {
     fi
   fi
 
-  trap '' INT TERM
+  trap '' HUP INT TERM
   UPDATE_REPLACED=0
   cleanup_update_temps
   release_lock
-  trap - INT TERM
+  trap - HUP INT TERM
   note "A2DPilot was updated successfully from $selector '$ref'."
 }
 

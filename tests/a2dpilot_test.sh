@@ -854,7 +854,7 @@ test_update_rejects_bad_candidates_and_targets() {
 }
 
 test_update_activation_rollback_and_interruption() {
-  local payload output rc restart_count atomic_count
+  local payload output rc restart_count atomic_count test_signal=TERM
   setup_scratch_dir
   load_app
   configure_scratch_paths
@@ -964,7 +964,7 @@ test_update_activation_rollback_and_interruption() {
     cp "$1" "$2"
     chmod "$3" "$2"
     if (( count == 1 )); then
-      kill -TERM "$BASHPID"
+      kill "-$test_signal" "$BASHPID"
     fi
   }
   set +e
@@ -978,6 +978,22 @@ test_update_activation_rollback_and_interruption() {
   assert_file_contains "$INSTALLED_CLI" '# old executable before signal'
   [[ -z $(find "$TEST_SCRATCH" -maxdepth 1 -name 'a2dpilot-update.*' -o \
     -name 'a2dpilot-previous.*') ]] || fail 'interrupted replacement retained temporary files'
+
+  test_signal=HUP
+  printf '#!/usr/bin/env bash\n# old executable before hangup\n' > "$INSTALLED_CLI"
+  printf '0\n' > "$atomic_count"
+  : > "$TEST_SCRATCH/replacement-state.log"
+  set +e
+  output=$(update_action 2>&1)
+  rc=$?
+  set -e
+  assert_eq 129 "$rc"
+  assert_contains "$output" 'interrupted by a hangup'
+  assert_contains "$output" 'previous A2DPilot executable was restored'
+  assert_eq 1 "$(head -n 1 "$TEST_SCRATCH/replacement-state.log")"
+  assert_file_contains "$INSTALLED_CLI" '# old executable before hangup'
+  [[ -z $(find "$TEST_SCRATCH" -maxdepth 1 -name 'a2dpilot-update.*' -o \
+    -name 'a2dpilot-previous.*') ]] || fail 'hangup rollback retained temporary files'
 
   UPDATE_PREVIOUS=$TEST_SCRATCH/interrupted-previous
   UPDATE_CANDIDATE=$TEST_SCRATCH/interrupted-candidate
