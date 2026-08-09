@@ -2129,7 +2129,7 @@ test_pipewire_codec_profile_discovery() {
 }
 
 test_per_speaker_codec_selection() {
-  local mac=AA:BB:CC:DD:EE:FF user state_file command_log rc
+  local mac=AA:BB:CC:DD:EE:FF user state_file command_log rc connected=1
   setup_scratch_dir
   load_app
   configure_scratch_paths
@@ -2141,9 +2141,9 @@ test_per_speaker_codec_selection() {
   CFG_SPEAKERS=("$mac")
   CFG_SPEAKER_CODECS=('ldac aptx sbc')
   find_a2dp_device_id() { printf '55\n'; }
-  device_connected() { return 0; }
-  a2dp_connected() { return 0; }
-  device_healthy() { return 0; }
+  device_connected() { (( connected == 1 )); }
+  a2dp_connected() { (( connected == 1 )); }
+  device_healthy() { (( connected == 1 )); }
   now_seconds() { printf '100\n'; }
   a2dp_codec() {
     local codec_state
@@ -2178,6 +2178,26 @@ test_per_speaker_codec_selection() {
   apply_speaker_codec_policy "$mac" 110
   assert_eq sbc "$(< "$state_file")"
   assert_file_contains "$command_log" "set-param 55 Profile { index: 131073, save: false }"
+
+  remember_daemon_active "$mac"
+  DAEMON_ACTIVE=
+  DAEMON_CODEC_POLICY=()
+  DAEMON_CODEC_TARGET=()
+  load_daemon_active
+  assert_eq sbc "${DAEMON_CODEC_POLICY[$mac]}"
+  bluetooth_device_command() {
+    printf '%s\n' "$*" >> "$TEST_SCRATCH/bluetooth-codec-reset.log"
+    case $2 in
+      disconnect) connected=0 ;;
+      connect) connected=1 ;;
+    esac
+  }
+  CFG_SPEAKER_CODECS=('')
+  apply_speaker_codec_policy "$mac" 110
+  assert_file_contains "$TEST_SCRATCH/bluetooth-codec-reset.log" '10 disconnect AA:BB:CC:DD:EE:FF'
+  assert_file_contains "$TEST_SCRATCH/bluetooth-codec-reset.log" '10 connect AA:BB:CC:DD:EE:FF'
+  [[ ! -e $STATE_DIR/active-codec-policy ]] || fail 'cleared codec policy remained recorded'
+  [[ ! ${DAEMON_CODEC_POLICY[$mac]+present} ]] || fail 'cleared codec policy remained cached'
 
   : > "$command_log"
   CFG_SPEAKER_CODECS=('ldac')

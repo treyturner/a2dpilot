@@ -1746,11 +1746,46 @@ wait_for_a2dp_transport() {
   done
 }
 
+restore_automatic_codec_negotiation() {
+  local mac=$1 deadline=$2 remaining
+  remaining=$(seconds_until_deadline "$deadline") || {
+    CODEC_POLICY_ERROR="automatic codec reset for $mac exceeded the connection deadline"
+    return 1
+  }
+  bluetooth_device_command "$remaining" disconnect "$mac" >/dev/null 2>&1 || true
+  while device_connected "$mac"; do
+    seconds_until_deadline "$deadline" >/dev/null || {
+      CODEC_POLICY_ERROR="could not disconnect $mac to restore automatic codec negotiation"
+      return 1
+    }
+    sleep 1
+  done
+  remaining=$(seconds_until_deadline "$deadline") || {
+    CODEC_POLICY_ERROR="automatic codec reset for $mac exceeded the connection deadline"
+    return 1
+  }
+  bluetooth_device_command "$remaining" connect "$mac" >/dev/null 2>&1 || {
+    CODEC_POLICY_ERROR="could not reconnect $mac for automatic codec negotiation"
+    return 1
+  }
+  wait_for_health "$mac" "$deadline" || {
+    CODEC_POLICY_ERROR="automatic codec negotiation did not become healthy for $mac"
+    return 1
+  }
+}
+
 apply_speaker_codec_policy() {
   local mac=$1 deadline=$2 policy current remaining profile_json result
   CODEC_POLICY_ERROR=
   policy=$(speaker_codec_policy "$mac") || return 1
   if [[ -z $policy ]]; then
+    if [[ -n ${DAEMON_CODEC_POLICY[$mac]:-} ]]; then
+      restore_automatic_codec_negotiation "$mac" "$deadline" || return 1
+      remember_daemon_codec_policy "$mac" '' || {
+        CODEC_POLICY_ERROR="could not clear the recorded codec policy for $mac"
+        return 1
+      }
+    fi
     unset "DAEMON_CODEC_POLICY[$mac]" "DAEMON_CODEC_TARGET[$mac]"
     wait_for_health "$mac" "$deadline"
     return
@@ -1817,6 +1852,10 @@ apply_speaker_codec_policy() {
       return 1
     }
     if [[ $current == "$SELECTED_A2DP_CODEC" ]] && device_healthy "$mac" "$remaining"; then
+      remember_daemon_codec_policy "$mac" "$policy" || {
+        CODEC_POLICY_ERROR="could not record the active codec policy for $mac"
+        return 1
+      }
       DAEMON_CODEC_POLICY[$mac]=$policy
       DAEMON_CODEC_TARGET[$mac]=$SELECTED_A2DP_CODEC
       return 0
@@ -2262,11 +2301,56 @@ daemon_log() {
   printf '%s %s\n' "$(date -Is)" "$*"
 }
 
+remember_daemon_codec_policy() {
+  local mac=$1 policy=${2:-} path=$STATE_DIR/active-codec-policy temp codec
+  local -a codecs=()
+  if [[ -z $policy ]]; then
+    rm -f -- "$path"
+    return 0
+  fi
+  valid_mac "$mac" || return 1
+  read -r -a codecs <<< "$policy"
+  (( ${#codecs[@]} > 0 )) || return 1
+  for codec in "${codecs[@]}"; do
+    valid_a2dp_codec "$codec" || return 1
+  done
+  temp=$(mktemp "$STATE_DIR/.active-codec-policy.XXXXXX") || return 1
+  printf '%s\t%s\n' "$mac" "$policy" > "$temp"
+  chmod 0600 "$temp"
+  mv -f -- "$temp" "$path"
+}
+
+load_daemon_codec_policy() {
+  local path=$STATE_DIR/active-codec-policy mac policy extra codec
+  local -a codecs=()
+  [[ -e $path || -L $path ]] || return 0
+  if [[ ! -f $path || -L $path ]] ||
+     ! IFS=$'\t' read -r mac policy extra < "$path" ||
+     [[ -n $extra || -z $policy ]] ||
+     ! valid_mac "$mac" || [[ $mac != "$DAEMON_ACTIVE" ]]; then
+    rm -f -- "$path"
+    return 0
+  fi
+  read -r -a codecs <<< "$policy"
+  (( ${#codecs[@]} > 0 )) || {
+    rm -f -- "$path"
+    return 0
+  }
+  for codec in "${codecs[@]}"; do
+    if ! valid_a2dp_codec "$codec"; then
+      rm -f -- "$path"
+      return 0
+    fi
+  done
+  DAEMON_CODEC_POLICY[$mac]=$policy
+}
+
 remember_daemon_active() {
   local mac=${1:-} path=$STATE_DIR/active-speaker temp
   DAEMON_ACTIVE=$mac
   if [[ -z $mac ]]; then
     rm -f -- "$path"
+    remember_daemon_codec_policy '' ''
     return 0
   fi
   valid_mac "$mac" || return 1
@@ -2282,8 +2366,10 @@ load_daemon_active() {
   IFS= read -r saved < "$path" || saved=
   if valid_mac "$saved"; then
     DAEMON_ACTIVE=$(normalize_mac "$saved")
+    load_daemon_codec_policy
   else
     rm -f -- "$path"
+    remember_daemon_codec_policy '' ''
   fi
 }
 

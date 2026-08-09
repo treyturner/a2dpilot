@@ -214,7 +214,7 @@ speaker = AA:BB:CC:DD:EE:FF aptx_hd aptx sbc_xq sbc
 speaker = 11:22:33:44:55:66 sbc
 ```
 
-A2DPilot selects the first listed codec that PipeWire advertises for that speaker and verifies the negotiated result. If none is available, the speaker is disconnected and put into its normal retry cooldown while A2DPilot tries the next speaker. Include `sbc` explicitly when the policy should always permit the standard A2DP baseline. Changing the list for an active speaker applies the new policy without recreating its BlueZ bond.
+A2DPilot selects the first listed codec that PipeWire advertises for that speaker and verifies the negotiated result. If none is available, the speaker is disconnected and put into its normal retry cooldown while A2DPilot tries the next speaker. Include `sbc` explicitly when the policy should always permit the standard A2DP baseline. Changing the list for an active speaker applies the new policy without recreating its BlueZ bond; clearing a strict list reconnects that speaker once so PipeWire resumes automatic negotiation.
 
 Configuration validation checks codec names but does not require the speaker to be online, so actual mutual support is determined when the device connects.
 
