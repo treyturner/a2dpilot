@@ -1352,6 +1352,73 @@ EOF
   tail -n 3 "$TEST_SCRATCH/user-systemctl.log" | diff -u "$expected" -
 }
 
+test_user_unit_enablement_restores_sockets_last() {
+  local user directory expected pipewire_socket_enabled=1 pulse_socket_enabled=1
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  directory=$(user_state_dir "$user")
+  install -d "$directory"
+  printf '%s\n' "$user" > "$directory/user"
+  printf 'yes\n' > "$directory/linger"
+  cat > "$directory/service-states" <<'EOF'
+pipewire.socket disabled 0
+pipewire.service enabled 0
+pipewire-pulse.socket disabled 0
+pipewire-pulse.service enabled 0
+wireplumber.service disabled 0
+EOF
+  : > "$directory/recorded"
+  loginctl() { :; }
+  systemctl() { :; }
+  as_user_systemctl() {
+    local run_user=$1 action unit
+    shift
+    action=$1
+    unit=${2:-}
+    if [[ $action == show ]]; then
+      printf 'loaded\n'
+      return 0
+    fi
+    printf '%s %s\n' "$run_user" "$*" >> "$TEST_SCRATCH/user-systemctl.log"
+    case "$action $unit" in
+      'enable pipewire.service') pipewire_socket_enabled=1 ;;
+      'disable pipewire.socket') pipewire_socket_enabled=0 ;;
+      'enable pipewire-pulse.service') pulse_socket_enabled=1 ;;
+      'disable pipewire-pulse.socket') pulse_socket_enabled=0 ;;
+    esac
+  }
+
+  restore_user_state "$user"
+  assert_eq 0 "$pipewire_socket_enabled"
+  assert_eq 0 "$pulse_socket_enabled"
+  expected=$TEST_SCRATCH/expected-user-restore
+  cat > "$expected" <<EOF
+$user unmask pipewire.socket
+$user stop pipewire.socket
+$user unmask pipewire.service
+$user stop pipewire.service
+$user unmask pipewire-pulse.socket
+$user stop pipewire-pulse.socket
+$user unmask pipewire-pulse.service
+$user stop pipewire-pulse.service
+$user unmask wireplumber.service
+$user stop wireplumber.service
+$user unmask pipewire.service
+$user enable pipewire.service
+$user unmask pipewire.socket
+$user disable pipewire.socket
+$user unmask pipewire-pulse.service
+$user enable pipewire-pulse.service
+$user unmask pipewire-pulse.socket
+$user disable pipewire-pulse.socket
+$user unmask wireplumber.service
+$user disable wireplumber.service
+EOF
+  diff -u "$expected" "$TEST_SCRATCH/user-systemctl.log"
+}
+
 test_rfkill_snapshot_restore_and_hard_block() {
   local sysfs
   setup_scratch_dir
@@ -1656,6 +1723,7 @@ run_test 'daemon cooldown and bounded backoff' test_daemon_cooldown_and_backoff
 run_test 'removed active speaker is disconnected after restart' test_daemon_disconnects_removed_active_speaker
 run_test 'audio-user reconciliation' test_audio_user_reconciliation
 run_test 'audio-user units are unmasked before enablement' test_audio_user_units_are_unmasked_before_enablement
+run_test 'user socket enablement is restored after services' test_user_unit_enablement_restores_sockets_last
 run_test 'rfkill snapshot, restore, and hard blocks' test_rfkill_snapshot_restore_and_hard_block
 run_test 'controller selection and power control' test_controller_selection_and_power
 run_test 'explicit controller scopes device operations' test_explicit_controller_scopes_device_operations

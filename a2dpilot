@@ -59,6 +59,16 @@ USER_UNITS=(
   wireplumber.service
 )
 
+USER_ENABLEMENT_UNITS=(
+  # PipeWire services use Also= to enable their sockets, so restore each
+  # service before its socket can re-establish the socket's exact state.
+  pipewire.service
+  pipewire.socket
+  pipewire-pulse.service
+  pipewire-pulse.socket
+  wireplumber.service
+)
+
 SYSTEM_UNITS=(
   bluetooth.service
   # Restoration must activate the socket before its associated service.
@@ -760,6 +770,7 @@ restore_unit_state_and_activity() {
 
 restore_user_state() {
   local user=$1 directory unit enabled active uid linger load_state action
+  local -A enabled_states=() restorable=()
   directory=$(user_state_dir "$user")
   [[ -f $directory/recorded ]] || return 0
   uid=$(id -u "$user")
@@ -772,11 +783,20 @@ restore_user_state() {
       continue
     fi
     [[ $load_state != not-found ]] || return 1
+    enabled_states[$unit]=$enabled
+    restorable[$unit]=1
     action=stop
     [[ $active == 1 ]] && action=start
     [[ $unit == wireplumber.service && $active == 1 ]] && action=restart
-    restore_unit_state_and_activity user "$user" "$unit" "$enabled" "$active" "$action" || return 1
+    # Restore activity in snapshot order so sockets are stopped before the
+    # services they can activate. Enablement is restored separately below.
+    scoped_systemctl user "$user" unmask "$unit" || return 1
+    scoped_systemctl user "$user" "$action" "$unit" || return 1
   done < "$directory/service-states"
+  for unit in "${USER_ENABLEMENT_UNITS[@]}"; do
+    [[ ${restorable[$unit]+present} ]] || continue
+    set_unit_enabled_state user "$user" "$unit" "${enabled_states[$unit]}" || return 1
+  done
   linger=$(< "$directory/linger")
   if [[ $linger != yes ]]; then
     loginctl disable-linger "$user" || return 1
