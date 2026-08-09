@@ -2286,7 +2286,7 @@ restore_previous_update() {
 }
 
 rollback_failed_update() {
-  local rc=$1 message=$2 restored=1
+  local rc=$1 message=$2 restored=1 retained_previous=
   trap - HUP INT TERM
   printf 'ERROR: %s\n' "$message" >&2
   if (( UPDATE_REPLACED )); then
@@ -2294,6 +2294,10 @@ rollback_failed_update() {
     restore_previous_update || restored=0
     if (( restored )); then
       note "The previous A2DPilot executable was restored."
+    elif (( UPDATE_REPLACED )) && [[ -f $UPDATE_PREVIOUS && ! -L $UPDATE_PREVIOUS ]]; then
+      retained_previous=$UPDATE_PREVIOUS
+      UPDATE_PREVIOUS=
+      warn "Could not restore the previous A2DPilot executable; rollback copy retained at $retained_previous."
     else
       warn "Could not fully restore the previous A2DPilot executable and service."
     fi

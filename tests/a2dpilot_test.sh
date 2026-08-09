@@ -856,7 +856,7 @@ test_update_rejects_bad_candidates_and_targets() {
 }
 
 test_update_activation_rollback_and_interruption() {
-  local payload output rc restart_count atomic_count test_signal=TERM
+  local payload output rc restart_count atomic_count test_signal=TERM retained_previous
   setup_scratch_dir
   load_app
   configure_scratch_paths
@@ -945,8 +945,15 @@ test_update_activation_rollback_and_interruption() {
   rc=$?
   set -e
   (( rc != 0 )) || fail 'failed executable restoration reported success'
-  assert_contains "$output" 'Could not fully restore the previous A2DPilot executable and service'
+  retained_previous=$(find "$TEST_SCRATCH" -maxdepth 1 -name 'a2dpilot-previous.*' -type f)
+  [[ -n $retained_previous && $retained_previous != *$'\n'* ]] || \
+    fail 'failed executable restoration did not retain exactly one rollback copy'
+  assert_contains "$output" "rollback copy retained at $retained_previous"
+  assert_file_contains "$retained_previous" '# old executable'
+  [[ -z $(find "$TEST_SCRATCH" -maxdepth 1 -name 'a2dpilot-update.*') ]] || \
+    fail 'failed executable restoration retained its downloaded candidate'
   assert_file_contains "$INSTALLED_CLI" '# new executable'
+  rm -f -- "$retained_previous"
 
   printf '#!/usr/bin/env bash\n# old executable before signal\n' > "$INSTALLED_CLI"
   printf '0\n' > "$atomic_count"
