@@ -726,6 +726,7 @@ test_update_executable_only_transaction() {
   write_systemd_unit() { fail 'update regenerated its systemd unit'; }
   write_wireplumber_config() { fail 'update regenerated WirePlumber configuration'; }
   write_trigger_config() { fail 'update regenerated Triggerhappy configuration'; }
+  update_daemon_verification_timeout() { printf '60\n'; }
   verify_updated_daemon() { printf 'verify\n' >> "$TEST_SCRATCH/daemon-verification.log"; }
 
   output=$(update_action)
@@ -917,6 +918,7 @@ test_update_activation_rollback_and_interruption() {
         ;;
     esac
   }
+  update_daemon_verification_timeout() { printf '60\n'; }
 
   set +e
   output=$(update_action 2>&1)
@@ -1107,6 +1109,7 @@ test_update_runtime_verification_rollback() {
         ;;
     esac
   }
+  update_daemon_verification_timeout() { printf '60\n'; }
   verify_updated_daemon() {
     printf 'attempted\n' > "$TEST_SCRATCH/daemon-verification.log"
     return 1
@@ -1159,7 +1162,7 @@ EOF
   chmod 0755 "$INSTALLED_CLI"
   UPDATE_TOTAL_TIMEOUT=3
 
-  verify_updated_daemon
+  verify_updated_daemon 3
   assert_eq $'parse\ncycle-start\ncycle-finished' "$(< "$VERIFY_LOG")"
   [[ ! -e $VERIFY_SIDE_EFFECT_LOG ]] || \
     fail 'daemon verification invoked a managed-state or controller reconciliation path'
@@ -1167,10 +1170,32 @@ EOF
   : > "$VERIFY_LOG"
   VERIFY_PARSE_FAIL=1
   export VERIFY_PARSE_FAIL
-  if verify_updated_daemon; then
+  if verify_updated_daemon 3; then
     fail 'daemon verification accepted an unparseable configuration'
   fi
   assert_eq parse "$(< "$VERIFY_LOG")"
+}
+
+test_update_daemon_verification_timeout_scales() {
+  local user
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+
+  write_test_config "$CONFIG_FILE" "$user"
+  assert_eq 60 "$(update_daemon_verification_timeout)"
+
+  write_test_config "$CONFIG_FILE" "$user" \
+    AA:BB:CC:DD:EE:01 AA:BB:CC:DD:EE:02 AA:BB:CC:DD:EE:03 \
+    AA:BB:CC:DD:EE:04 AA:BB:CC:DD:EE:05 AA:BB:CC:DD:EE:06 \
+    AA:BB:CC:DD:EE:07
+  assert_eq 130 "$(update_daemon_verification_timeout)"
+
+  printf 'invalid configuration\n' > "$CONFIG_FILE"
+  if update_daemon_verification_timeout >/dev/null; then
+    fail 'verification timeout accepted an invalid configuration'
+  fi
 }
 
 test_config_editor_success_and_validation_failure() {
@@ -2209,6 +2234,7 @@ run_test 'update rejects bad candidates and targets' test_update_rejects_bad_can
 run_test 'update activation rollback and interruption' test_update_activation_rollback_and_interruption
 run_test 'update runtime verification rollback' test_update_runtime_verification_rollback
 run_test 'update daemon verifier runs one iteration' test_update_daemon_verifier_runs_one_iteration
+run_test 'update daemon verification timeout scales' test_update_daemon_verification_timeout_scales
 run_test 'safe config editor success and validation failure' test_config_editor_success_and_validation_failure
 run_test 'config editor installs a protected snapshot' test_config_editor_installs_protected_snapshot
 run_test 'failed config application restores previous config' test_config_application_rolls_back

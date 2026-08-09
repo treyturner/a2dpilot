@@ -2286,9 +2286,11 @@ restore_previous_update() {
 }
 
 verify_updated_daemon() {
+  local seconds=$1
+  [[ $seconds =~ ^[1-9][0-9]*$ ]] || return 1
   # Do not call daemon_action here: its reconciliation path can rewrite
   # managed integration files that an executable-only update must not touch.
-  timeout --signal=TERM --kill-after=1 "$UPDATE_TOTAL_TIMEOUT" bash -c '
+  timeout --signal=TERM --kill-after=1 "$seconds" bash -c '
     source /proc/self/fd/3
     parse_config /etc/a2dpilot.conf || exit 1
     DAEMON_HAVE_CONFIG=1
@@ -2296,6 +2298,11 @@ verify_updated_daemon() {
     load_daemon_active
     daemon_cycle
   ' a2dpilot-update-verifier 3< "$INSTALLED_CLI"
+}
+
+update_daemon_verification_timeout() {
+  parse_config "$CONFIG_FILE" || return 1
+  printf '%s\n' "$((UPDATE_TOTAL_TIMEOUT + ${#CFG_SPEAKERS[@]} * CONNECT_TIMEOUT))"
 }
 
 rollback_failed_update() {
@@ -2323,6 +2330,7 @@ rollback_failed_update() {
 update_action() {
   require_root
   local selector=branch ref=main selector_set=0 url phase previous_umask
+  local verification_timeout=$UPDATE_TOTAL_TIMEOUT
   while [[ $# -gt 0 ]]; do
     case $1 in
       --tag|--branch|--sha)
@@ -2409,6 +2417,10 @@ update_action() {
     rollback_failed_update 1 "Could not preserve the current A2DPilot executable."
   UPDATE_WAS_ACTIVE=$(checked_system_unit_active_bit a2dpilot.service) || \
     rollback_failed_update 1 "Could not determine the A2DPilot service state."
+  if (( UPDATE_WAS_ACTIVE )); then
+    verification_timeout=$(update_daemon_verification_timeout) || \
+      rollback_failed_update 1 "Could not validate the configuration for daemon verification."
+  fi
   # Bash may defer a trapped signal until the replacement command returns, so
   # mark the transaction for rollback before entering the atomic operation.
   UPDATE_REPLACED=1
@@ -2421,7 +2433,7 @@ update_action() {
     # Type=simple reports startup before the daemon can pass this updater's
     # lock. Exercise the new executable's lock-protected iteration explicitly
     # before accepting it, while the parent updater preserves serialization.
-    verify_updated_daemon || \
+    verify_updated_daemon "$verification_timeout" || \
       rollback_failed_update 1 "The updated A2DPilot daemon failed its first runtime cycle."
     [[ $(system_unit_active_bit a2dpilot.service) == 1 ]] || \
       rollback_failed_update 1 "The updated A2DPilot service did not remain active."
