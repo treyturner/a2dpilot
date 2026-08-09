@@ -15,7 +15,7 @@ The project is delivered as one Bash program. The same `a2dpilot` file installs 
 - Configurable media-key routing with broad Linux transport-key coverage, relative volume control, and relative or absolute HTTP(S) player URLs.
 - Safe configuration editing and validation through the CLI.
 - Headless PipeWire/WirePlumber operation using systemd linger.
-- Transactional installation with restoration of files, packages, services, user services, linger, rfkill, and controller state.
+- Transactional installation with restoration of files, services, user services, linger, rfkill, and controller state.
 - Optional removal of only the Bluetooth bonds that A2DPilot itself created.
 
 LE Audio/BAP, aptX Adaptive, and codec forcing are not currently supported.
@@ -266,7 +266,7 @@ sudo a2dpilot uninstall --remove-bonds
 
 `--remove-bonds` affects only bonds A2DPilot created. A device that was already paired before A2DPilot touched it is never automatically removed.
 
-Uninstall restores replaced files, original system and user unit states, linger settings for every audio user A2DPilot managed, controller power and rfkill state when the hardware is still present, and packages that were explicitly absent before installation. It does not run `apt autoremove`.
+Uninstall restores replaced files, original system and user unit states, linger settings for every audio user A2DPilot managed, and controller power and rfkill state when the hardware is still present. A2DPilot never removes APT-managed packages or runs `apt autoremove`; distribution packages may be shared with other software and remain under the administrator's control. Failed-install rollback likewise restores only A2DPilot-managed system state and retains any packages APT installed.
 
 Do not manually delete `/var/lib/a2dpilot` before uninstalling; it contains the rollback snapshot.
 
@@ -286,7 +286,7 @@ aptX Adaptive is not currently exposed by this PipeWire stack. Although the LC3 
 - Root-managed configuration is parsed as data and never sourced as shell code.
 - Triggerhappy receives only validated key names; URL resolution and placeholder expansion happen inside `player-control` immediately before `curl` runs. Stateful volume, mute, shuffle, and repeat mappings first poll the player's music timeline. Systemd recreates `/run/a2dpilot` for Debian's unprivileged Triggerhappy handler; per-player pre-mute volumes stored there expire on reboot.
 - A2DPilot runs Triggerhappy through its direct service and disables the competing socket-activation unit while installed. Uninstall restores the original state of both units.
-- Install records its rollback snapshot before APT and service mutations. A failed or interrupted installation invokes uninstall automatically; failed rollback retains the snapshot for recovery.
+- Install records its managed-state rollback snapshot before APT and service mutations. A failed or interrupted installation invokes uninstall automatically; APT-managed packages are retained, and a failed rollback keeps the snapshot for recovery.
 - Pairing happens after installation commits, so a speaker being unavailable does not erase a valid system setup.
 - The system-wide WirePlumber fragment only disables seat monitoring. It deliberately does not override `bluez5.codecs`.
 

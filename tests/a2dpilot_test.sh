@@ -143,6 +143,7 @@ test_syntax_help_and_stream_bootstrap() {
   assert_contains "$local_help" 'a2dpilot install [--user USER] [--non-interactive]'
   assert_contains "$local_help" 'a2dpilot config [--check]'
   assert_contains "$local_help" 'uninstall [--keep-bonds | --remove-bonds]'
+  assert_not_contains "$local_help" '--with-dependencies'
   assert_not_contains "$local_help" 'update --mac'
   assert_not_contains "$local_help" '--control-helper'
   set +e
@@ -481,11 +482,15 @@ test_noninteractive_install_and_uninstall_fixture() {
   record_user_state() { :; }
   record_rfkill_state() { : > "$STATE_DIR/rfkill-state"; }
   record_controller_state() { : > "$STATE_DIR/controller-state"; }
-  dpkg-query() { return 1; }
-  apt-get() { printf '%s\n' "$*" >> "$apt_log"; }
+  apt-get() {
+    printf '%s\n' "$*" >> "$apt_log"
+  }
   systemctl() {
     printf '%s\n' "$*" >> "$TEST_SCRATCH/systemctl.log"
-    if [[ $* == 'disable --now triggerhappy.socket' ]]; then
+    if [[ $1 == unmask && $* == *triggerhappy.service* ]]; then
+      : > "$TEST_SCRATCH/system-unmasked"
+    elif [[ $* == 'disable --now triggerhappy.socket' ]]; then
+      [[ -e $TEST_SCRATCH/system-unmasked ]] || return 1
       : > "$TEST_SCRATCH/triggerhappy-socket-disabled"
     elif [[ $1 == enable && ${2:-} == --now ]]; then
       [[ $* != *triggerhappy.socket* ]] || return 1
@@ -509,7 +514,12 @@ test_noninteractive_install_and_uninstall_fixture() {
   assert_file_not_contains "$TRIGGER_CONF" 'commandID='
   assert_file_contains "$STATE_FILE" 'INSTALL_PHASE=installed'
   assert_file_contains "$apt_log" 'install -y --no-install-recommends'
-  assert_file_contains "$STATE_DIR/new-packages" rfkill
+  assert_file_not_contains "$apt_log" 'DPkg::Pre-Invoke'
+  assert_file_not_contains "$apt_log" 'DPkg::Post-Invoke'
+  assert_file_contains "$TEST_SCRATCH/systemctl.log" \
+    'unmask bluetooth.service triggerhappy.socket triggerhappy.service a2dpilot.service'
+  assert_file_contains "$TEST_SCRATCH/systemctl.log" \
+    'unmask --runtime bluetooth.service triggerhappy.socket triggerhappy.service a2dpilot.service'
   assert_file_contains "$TEST_SCRATCH/systemctl.log" \
     'disable --now triggerhappy.socket'
   assert_file_contains "$TEST_SCRATCH/systemctl.log" \
@@ -522,11 +532,92 @@ test_noninteractive_install_and_uninstall_fixture() {
   restore_rfkill_state() { :; }
   restore_system_service_states() { :; }
   output=$(uninstall_action --keep-bonds)
-  assert_contains "$output" 'prior system state was restored'
+  assert_contains "$output" 'APT-managed packages were retained.'
+  assert_contains "$output" 'managed system state was restored'
   [[ ! -e $INSTALLED_CLI ]] || fail 'created executable survived uninstall'
   [[ ! -e $CONFIG_FILE ]] || fail 'created configuration survived uninstall'
   [[ ! -e $STATE_DIR ]] || fail 'rollback state survived successful uninstall'
-  assert_file_contains "$apt_log" 'remove -y'
+  assert_file_not_contains "$apt_log" 'remove -y'
+}
+
+test_uninstall_keeps_packages_and_reports_empty_bond_policy() {
+  local output
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  : > "$STATE_FILE"
+  : > "$STATE_DIR/created-bonds"
+  require_root() { :; }
+  acquire_lock() { :; }
+  release_lock() { :; }
+  systemctl() {
+    if [[ $1 == show ]]; then
+      printf 'not-found\n'
+    else
+      printf '%s\n' "$*" >> "$TEST_SCRATCH/systemctl.log"
+    fi
+  }
+  apt-get() {
+    printf '%s\n' "$*" >> "$TEST_SCRATCH/apt.log"
+  }
+  output=$(uninstall_action --remove-bonds)
+  assert_contains "$output" 'No A2DPilot-created bonds were recorded.'
+  assert_contains "$output" 'APT-managed packages were retained.'
+  [[ ! -e $TEST_SCRATCH/apt.log ]] || fail 'uninstall invoked APT'
+  [[ ! -e $STATE_DIR ]] || fail 'package-retaining uninstall retained state'
+}
+
+test_failed_install_rollback_retains_packages() {
+  local output rc mock
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  mock=$TEST_SCRATCH/uninstall-mock
+  cat > "$mock" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" > "$ROLLBACK_LOG"
+EOF
+  chmod +x "$mock"
+  ROLLBACK_LOG=$TEST_SCRATCH/rollback.log
+  export ROLLBACK_LOG
+  SCRIPT_PATH=$mock
+  release_lock() { :; }
+  set +e
+  output=$(rollback_failed_install 23 2>&1)
+  rc=$?
+  set -e
+  assert_eq 23 "$rc"
+  assert_contains "$output" 'Automatic rollback succeeded.'
+  assert_eq 'uninstall --keep-bonds' "$(< "$ROLLBACK_LOG")"
+}
+
+test_install_recovery_needs_no_package_snapshot() {
+  local lock_calls mock phase
+  for phase in installing failed; do
+    lock_calls=0
+    setup_scratch_dir
+    load_app
+    configure_scratch_paths
+    printf 'INSTALL_PHASE=%s\n' "$phase" > "$STATE_FILE"
+    mock=$TEST_SCRATCH/uninstall-mock
+    cat > "$mock" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" > "$RECOVERY_LOG"
+EOF
+    chmod +x "$mock"
+    RECOVERY_LOG=$TEST_SCRATCH/recovery.log
+    export RECOVERY_LOG
+    SCRIPT_PATH=$mock
+    require_root() { :; }
+    acquire_lock() {
+      lock_calls=$((lock_calls + 1))
+      (( lock_calls == 1 )) || die "recovery checkpoint"
+    }
+    release_lock() { :; }
+    expect_failure_contains 'recovery checkpoint' install_action --non-interactive
+    assert_eq 'uninstall --keep-bonds' "$(< "$RECOVERY_LOG")"
+    cleanup_scratch_dir
+  done
 }
 
 test_config_editor_success_and_validation_failure() {
@@ -1163,6 +1254,113 @@ test_audio_user_reconciliation() {
   assert_eq "$new_user" "$(< "$STATE_DIR/runtime-user")"
 }
 
+test_audio_user_units_are_unmasked_before_enablement() {
+  local user unmask_line enable_line expected
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  record_user_state() { :; }
+  loginctl() { printf '%s\n' "$*" >> "$TEST_SCRATCH/loginctl.log"; }
+  systemctl() { printf '%s\n' "$*" >> "$TEST_SCRATCH/systemctl.log"; }
+  as_user_systemctl() { printf '%s\n' "$*" >> "$TEST_SCRATCH/user-systemctl.log"; }
+  ensure_audio_user "$user"
+  assert_file_contains "$TEST_SCRATCH/user-systemctl.log" \
+    "$user unmask pipewire.socket pipewire.service pipewire-pulse.socket pipewire-pulse.service wireplumber.service"
+  assert_file_contains "$TEST_SCRATCH/user-systemctl.log" \
+    "$user unmask --runtime pipewire.socket pipewire.service pipewire-pulse.socket pipewire-pulse.service wireplumber.service"
+  unmask_line=$(grep -n ' unmask ' "$TEST_SCRATCH/user-systemctl.log" | cut -d: -f1 | head -n 1)
+  enable_line=$(grep -n ' enable --now ' "$TEST_SCRATCH/user-systemctl.log" | cut -d: -f1)
+  (( unmask_line < enable_line )) || fail 'user units were enabled before being unmasked'
+
+  restore_unit_state_and_activity user "$user" masked-user.service masked 1 start
+  expected=$TEST_SCRATCH/expected-user-restore
+  cat > "$expected" <<EOF
+$user unmask masked-user.service
+$user unmask --runtime masked-user.service
+$user start masked-user.service
+$user mask masked-user.service
+EOF
+  tail -n 4 "$TEST_SCRATCH/user-systemctl.log" | diff -u "$expected" -
+}
+
+test_user_unit_enablement_restores_sockets_last() {
+  local user directory expected pipewire_socket_enabled=1 pulse_socket_enabled=1
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  directory=$(user_state_dir "$user")
+  install -d "$directory"
+  printf '%s\n' "$user" > "$directory/user"
+  printf 'yes\n' > "$directory/linger"
+  cat > "$directory/service-states" <<'EOF'
+pipewire.socket disabled 0
+pipewire.service enabled 0
+pipewire-pulse.socket disabled 0
+pipewire-pulse.service enabled 0
+wireplumber.service disabled 0
+EOF
+  : > "$directory/recorded"
+  loginctl() { :; }
+  systemctl() { :; }
+  as_user_systemctl() {
+    local run_user=$1 action unit
+    shift
+    action=$1
+    unit=${2:-}
+    if [[ $action == show ]]; then
+      printf 'loaded\n'
+      return 0
+    fi
+    printf '%s %s\n' "$run_user" "$*" >> "$TEST_SCRATCH/user-systemctl.log"
+    case "$action $unit" in
+      'enable pipewire.service') pipewire_socket_enabled=1 ;;
+      'disable pipewire.socket') pipewire_socket_enabled=0 ;;
+      'enable pipewire-pulse.service') pulse_socket_enabled=1 ;;
+      'disable pipewire-pulse.socket') pulse_socket_enabled=0 ;;
+    esac
+  }
+
+  restore_user_state "$user"
+  assert_eq 0 "$pipewire_socket_enabled"
+  assert_eq 0 "$pulse_socket_enabled"
+  expected=$TEST_SCRATCH/expected-user-restore
+  cat > "$expected" <<EOF
+$user unmask pipewire.socket
+$user unmask --runtime pipewire.socket
+$user stop pipewire.socket
+$user unmask pipewire.service
+$user unmask --runtime pipewire.service
+$user stop pipewire.service
+$user unmask pipewire-pulse.socket
+$user unmask --runtime pipewire-pulse.socket
+$user stop pipewire-pulse.socket
+$user unmask pipewire-pulse.service
+$user unmask --runtime pipewire-pulse.service
+$user stop pipewire-pulse.service
+$user unmask wireplumber.service
+$user unmask --runtime wireplumber.service
+$user stop wireplumber.service
+$user unmask pipewire.service
+$user unmask --runtime pipewire.service
+$user enable pipewire.service
+$user unmask pipewire.socket
+$user unmask --runtime pipewire.socket
+$user disable pipewire.socket
+$user unmask pipewire-pulse.service
+$user unmask --runtime pipewire-pulse.service
+$user enable pipewire-pulse.service
+$user unmask pipewire-pulse.socket
+$user unmask --runtime pipewire-pulse.socket
+$user disable pipewire-pulse.socket
+$user unmask wireplumber.service
+$user unmask --runtime wireplumber.service
+$user disable wireplumber.service
+EOF
+  diff -u "$expected" "$TEST_SCRATCH/user-systemctl.log"
+}
+
 test_rfkill_snapshot_restore_and_hard_block() {
   local sysfs
   setup_scratch_dir
@@ -1274,11 +1472,12 @@ test_bond_policy_and_removal_aggregation() {
   configure_scratch_paths
   printf '%s %s\n' "$controller" AA:BB:CC:DD:EE:01 > "$STATE_DIR/created-bonds"
   printf '%s %s\n' "$controller" AA:BB:CC:DD:EE:02 >> "$STATE_DIR/created-bonds"
+  printf '%s %s\n' "$controller" AA:BB:CC:DD:EE:03 >> "$STATE_DIR/created-bonds"
   has_tty() { return 1; }
   assert_eq keep "$(choose_bond_policy ask)"
   assert_eq remove "$(choose_bond_policy remove)"
 
-  device_info_on_controller() { return 0; }
+  device_info_on_controller() { [[ $2 != AA:BB:CC:DD:EE:03 ]]; }
   remove_bluetooth_device_on_controller() {
     printf '%s %s\n' "$1" "$2" >> "$TEST_SCRATCH/bond-removals"
     [[ $2 != AA:BB:CC:DD:EE:01 ]]
@@ -1289,12 +1488,19 @@ test_bond_policy_and_removal_aggregation() {
   set -e
   (( rc != 0 )) || fail 'partial bond removal reported success'
   assert_contains "$output" 'Could not remove'
+  assert_contains "$output" 'AA:BB:CC:DD:EE:03 is already absent'
   assert_file_contains "$TEST_SCRATCH/bond-removals" 'AA:BB:CC:DD:EE:01'
   assert_file_contains "$TEST_SCRATCH/bond-removals" 'AA:BB:CC:DD:EE:02'
+  assert_file_not_contains "$TEST_SCRATCH/bond-removals" 'AA:BB:CC:DD:EE:03'
+
+  : > "$STATE_DIR/created-bonds"
+  assert_eq none "$(choose_bond_policy remove)"
 
   require_root() { :; }
   : > "$STATE_FILE"
   expect_failure_contains 'mutually exclusive' uninstall_action --keep-bonds --remove-bonds
+  expect_failure_contains 'Unknown uninstall option: --with-dependencies' \
+    uninstall_action --with-dependencies
 }
 
 test_managed_paths_and_state_serialization() {
@@ -1338,6 +1544,9 @@ test_system_service_state_restoration() {
 enabled.service enabled 1
 disabled.service disabled 0
 static.service static 1
+masked.service masked 0
+active-masked.service masked 1
+runtime-masked.service masked-runtime 1
 missing.service not-found 0
 EOF
   systemctl() {
@@ -1351,11 +1560,29 @@ EOF
   restore_system_service_states
   expected=$TEST_SCRATCH/expected
   cat > "$expected" <<'EOF'
+unmask enabled.service
+unmask --runtime enabled.service
 enable enabled.service
 start enabled.service
+unmask disabled.service
+unmask --runtime disabled.service
 disable disabled.service
 stop disabled.service
+unmask static.service
+unmask --runtime static.service
 start static.service
+unmask masked.service
+unmask --runtime masked.service
+mask masked.service
+stop masked.service
+unmask active-masked.service
+unmask --runtime active-masked.service
+start active-masked.service
+mask active-masked.service
+unmask runtime-masked.service
+unmask --runtime runtime-masked.service
+start runtime-masked.service
+mask --runtime runtime-masked.service
 EOF
   diff -u "$expected" "$TEST_SCRATCH/systemctl.log"
 
@@ -1398,8 +1625,12 @@ EOF
   restore_system_service_states
   cat > "$expected" <<'EOF'
 stop triggerhappy.service
+unmask triggerhappy.socket
+unmask --runtime triggerhappy.socket
 enable triggerhappy.socket
 start triggerhappy.socket
+unmask triggerhappy.service
+unmask --runtime triggerhappy.service
 enable triggerhappy.service
 restart triggerhappy.service
 EOF
@@ -1416,6 +1647,9 @@ run_test 'media URL configuration validation' test_media_url_configuration_valid
 run_test 'generated system integration files' test_generated_integration_files
 run_test 'Triggerhappy config rejects symlinked parent' test_trigger_config_rejects_symlinked_parent
 run_test 'non-interactive install and uninstall fixture' test_noninteractive_install_and_uninstall_fixture
+run_test 'uninstall keeps packages and reports empty bond policy' test_uninstall_keeps_packages_and_reports_empty_bond_policy
+run_test 'failed install rollback retains packages' test_failed_install_rollback_retains_packages
+run_test 'install recovery needs no package snapshot' test_install_recovery_needs_no_package_snapshot
 run_test 'safe config editor success and validation failure' test_config_editor_success_and_validation_failure
 run_test 'config editor installs a protected snapshot' test_config_editor_installs_protected_snapshot
 run_test 'failed config application restores previous config' test_config_application_rolls_back
@@ -1436,6 +1670,8 @@ run_test 'connection health reuses the original deadline' test_daemon_reuses_con
 run_test 'daemon cooldown and bounded backoff' test_daemon_cooldown_and_backoff
 run_test 'removed active speaker is disconnected after restart' test_daemon_disconnects_removed_active_speaker
 run_test 'audio-user reconciliation' test_audio_user_reconciliation
+run_test 'audio-user units are unmasked before enablement' test_audio_user_units_are_unmasked_before_enablement
+run_test 'user socket enablement is restored after services' test_user_unit_enablement_restores_sockets_last
 run_test 'rfkill snapshot, restore, and hard blocks' test_rfkill_snapshot_restore_and_hard_block
 run_test 'controller selection and power control' test_controller_selection_and_power
 run_test 'explicit controller scopes device operations' test_explicit_controller_scopes_device_operations

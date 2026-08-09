@@ -51,6 +51,17 @@ PACKAGES=(
 )
 
 USER_UNITS=(
+  # Stop activation paths before their services while restoring inactive units.
+  pipewire.socket
+  pipewire.service
+  pipewire-pulse.socket
+  pipewire-pulse.service
+  wireplumber.service
+)
+
+USER_ENABLEMENT_UNITS=(
+  # PipeWire services use Also= to enable their sockets, so restore each
+  # service before its socket can re-establish the socket's exact state.
   pipewire.service
   pipewire.socket
   pipewire-pulse.service
@@ -711,9 +722,31 @@ record_user_state() {
   : > "$directory/recorded"
 }
 
+scoped_systemctl() {
+  local scope=$1 user=$2
+  shift 2
+  if [[ $scope == system ]]; then
+    systemctl "$@"
+  else
+    as_user_systemctl "$user" "$@"
+  fi
+}
+
+unmask_units_all_scopes() {
+  local scope=$1 user=$2
+  shift 2
+  scoped_systemctl "$scope" "$user" unmask "$@" || return 1
+  scoped_systemctl "$scope" "$user" unmask --runtime "$@"
+}
+
 set_unit_enabled_state() {
   local scope=$1 user=$2 unit=$3 state=$4
   local -a command=()
+
+  # Disabled and masked are distinct systemd states. Always clear the state
+  # A2DPilot needed while installed before recreating the recorded state.
+  unmask_units_all_scopes "$scope" "$user" "$unit" || return 1
+
   case $state in
     enabled) command=(enable "$unit") ;;
     enabled-runtime) command=(enable --runtime "$unit") ;;
@@ -723,15 +756,28 @@ set_unit_enabled_state() {
     static|indirect|generated|transient|alias) return 0 ;;
     *) return 1 ;;
   esac
-  if [[ $scope == system ]]; then
-    systemctl "${command[@]}"
+  scoped_systemctl "$scope" "$user" "${command[@]}"
+}
+
+restore_unit_state_and_activity() {
+  local scope=$1 user=$2 unit=$3 state=$4 active=$5 action=$6
+  local -a mask_command=(mask "$unit")
+  # Masking does not stop a running unit, but it does prevent a later start.
+  # Recreate the recorded active-and-masked state in that required order.
+  if [[ $active == 1 && ( $state == masked || $state == masked-runtime ) ]]; then
+    [[ $state != masked-runtime ]] || mask_command=(mask --runtime "$unit")
+    unmask_units_all_scopes "$scope" "$user" "$unit" || return 1
+    scoped_systemctl "$scope" "$user" "$action" "$unit" || return 1
+    scoped_systemctl "$scope" "$user" "${mask_command[@]}"
   else
-    as_user_systemctl "$user" "${command[@]}"
+    set_unit_enabled_state "$scope" "$user" "$unit" "$state" || return 1
+    scoped_systemctl "$scope" "$user" "$action" "$unit"
   fi
 }
 
 restore_user_state() {
   local user=$1 directory unit enabled active uid linger load_state action
+  local -A enabled_states=() restorable=()
   directory=$(user_state_dir "$user")
   [[ -f $directory/recorded ]] || return 0
   uid=$(id -u "$user")
@@ -744,12 +790,20 @@ restore_user_state() {
       continue
     fi
     [[ $load_state != not-found ]] || return 1
-    set_unit_enabled_state user "$user" "$unit" "$enabled" || return 1
+    enabled_states[$unit]=$enabled
+    restorable[$unit]=1
     action=stop
     [[ $active == 1 ]] && action=start
     [[ $unit == wireplumber.service && $active == 1 ]] && action=restart
-    as_user_systemctl "$user" "$action" "$unit" || return 1
+    # Restore activity in snapshot order so sockets are stopped before the
+    # services they can activate. Enablement is restored separately below.
+    unmask_units_all_scopes user "$user" "$unit" || return 1
+    scoped_systemctl user "$user" "$action" "$unit" || return 1
   done < "$directory/service-states"
+  for unit in "${USER_ENABLEMENT_UNITS[@]}"; do
+    [[ ${restorable[$unit]+present} ]] || continue
+    set_unit_enabled_state user "$user" "$unit" "${enabled_states[$unit]}" || return 1
+  done
   linger=$(< "$directory/linger")
   if [[ $linger != yes ]]; then
     loginctl disable-linger "$user" || return 1
@@ -765,6 +819,7 @@ ensure_audio_user() {
   uid=$(id -u "$user")
   loginctl enable-linger "$user" || return 1
   systemctl start "user@$uid.service" || return 1
+  unmask_units_all_scopes user "$user" "${USER_UNITS[@]}" || return 1
   as_user_systemctl "$user" enable --now pipewire.service pipewire-pulse.service wireplumber.service || return 1
   as_user_systemctl "$user" restart wireplumber.service || return 1
 }
@@ -812,13 +867,12 @@ restore_system_service_states() {
       # restoring the original socket-activated service state.
       systemctl stop triggerhappy.service || return 1
     fi
-    set_unit_enabled_state system '' "$unit" "$enabled" || return 1
     action=stop
     [[ $active == 1 ]] && action=start
     case $unit:$active in
       triggerhappy.service:1) action=restart ;;
     esac
-    systemctl "$action" "$unit" || return 1
+    restore_unit_state_and_activity system '' "$unit" "$enabled" "$active" "$action" || return 1
   done < "$STATE_DIR/system-service-states"
 }
 
@@ -2123,8 +2177,8 @@ status_action() {
 rollback_failed_install() {
   local rc=$1
   trap - ERR INT TERM
-  release_lock
   note "Installation failed; attempting automatic rollback..."
+  release_lock
   if "$SCRIPT_PATH" uninstall --keep-bonds; then
     note "Automatic rollback succeeded."
   else
@@ -2190,10 +2244,9 @@ install_action() {
   chmod 0700 "$STATE_DIR" "$BACKUP_DIR"
   : > "$STATE_DIR/created-files"
   : > "$STATE_DIR/replaced-files"
-  : > "$STATE_DIR/new-packages"
   : > "$STATE_DIR/created-bonds"
 
-  local audio_user config_seed package
+  local audio_user config_seed
   if [[ -e $CONFIG_FILE || -L $CONFIG_FILE ]]; then
     [[ -z $requested_user ]] || die "--user only applies when creating a new configuration."
     parse_config "$CONFIG_FILE" || die "$CONFIG_ERROR"
@@ -2208,10 +2261,6 @@ install_action() {
   record_user_state "$audio_user"
   record_rfkill_state
   record_controller_state
-  for package in "${PACKAGES[@]}"; do
-    dpkg-query -W -f='${db:Status-Abbrev}' "$package" 2>/dev/null | grep -q '^ii' || \
-      printf '%s\n' "$package" >> "$STATE_DIR/new-packages"
-  done
   backup_file "$INSTALLED_CLI"
   backup_file "$CONFIG_FILE"
   backup_file "$SYSTEMD_UNIT"
@@ -2253,6 +2302,7 @@ install_action() {
   write_trigger_config "$TRIGGER_CONF" "$CFG_MEDIA_CONTROLS"
 
   systemctl daemon-reload
+  unmask_units_all_scopes system '' "${SYSTEM_UNITS[@]}"
   ensure_audio_user "$CFG_AUDIO_USER"
   printf '%s\n' "$CFG_AUDIO_USER" > "$STATE_DIR/runtime-user"
   # Debian ships triggerhappy.socket as an alternative activation path for
@@ -2287,8 +2337,9 @@ remove_created_bonds() {
       failed=1
       continue
     fi
-    if device_info_on_controller "$controller" "$mac" >/dev/null 2>&1 &&
-       ! remove_bluetooth_device_on_controller "$controller" "$mac"; then
+    if ! device_info_on_controller "$controller" "$mac" >/dev/null 2>&1; then
+      note "A2DPilot-created bond $mac is already absent from controller $controller."
+    elif ! remove_bluetooth_device_on_controller "$controller" "$mac"; then
       warn "Could not remove A2DPilot-created bond $mac from controller $controller."
       failed=1
     else
@@ -2300,7 +2351,11 @@ remove_created_bonds() {
 
 choose_bond_policy() {
   local requested=$1 answer controller mac extra
-  if [[ $requested == keep || ! -s $STATE_DIR/created-bonds ]]; then
+  if [[ ! -s $STATE_DIR/created-bonds ]]; then
+    printf 'none\n'
+    return 0
+  fi
+  if [[ $requested == keep ]]; then
     printf 'keep\n'
     return 0
   fi
@@ -2375,6 +2430,8 @@ uninstall_action() {
   fi
   if [[ $bond_policy == remove ]]; then
     remove_created_bonds || bond_failure=1
+  elif [[ $bond_policy == none ]]; then
+    note "No A2DPilot-created bonds were recorded."
   else
     note "Bluetooth bonds were preserved."
   fi
@@ -2386,11 +2443,7 @@ uninstall_action() {
   restore_rfkill_state
   restore_system_service_states || rollback_failure=1
 
-  if [[ -s $STATE_DIR/new-packages ]]; then
-    local -a new_packages=()
-    mapfile -t new_packages < "$STATE_DIR/new-packages"
-    DEBIAN_FRONTEND=noninteractive apt-get remove -y "${new_packages[@]}" || rollback_failure=1
-  fi
+  note "APT-managed packages were retained."
 
   release_lock
   if (( rollback_failure )); then
@@ -2398,7 +2451,7 @@ uninstall_action() {
     die "Rollback was incomplete; recovery state remains at $STATE_DIR."
   fi
   rm -rf -- "$STATE_DIR"
-  note "A2DPilot was uninstalled and prior system state was restored."
+  note "A2DPilot was uninstalled and managed system state was restored."
   (( bond_failure == 0 )) || die "System rollback succeeded, but one or more Bluetooth bonds could not be removed."
 }
 
