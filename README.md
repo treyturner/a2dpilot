@@ -285,6 +285,7 @@ aptX Adaptive is not currently exposed by this PipeWire stack. Although the LC3 
 - Mutating commands and daemon connection cycles serialize through the root-owned `/run/lock/a2dpilot/lock`. Stateful media controls use a separate short-lived lock so a configuration editor cannot block button handling.
 - Root-managed configuration is parsed as data and never sourced as shell code.
 - Triggerhappy receives only validated key names; URL resolution and placeholder expansion happen inside `player-control` immediately before `curl` runs. Stateful volume, mute, shuffle, and repeat mappings first poll the player's music timeline. Systemd recreates `/run/a2dpilot` for Debian's unprivileged Triggerhappy handler; per-player pre-mute volumes stored there expire on reboot.
+- A2DPilot runs Triggerhappy through its direct service and disables the competing socket-activation unit while installed. Uninstall restores the original state of both units.
 - Install records its rollback snapshot before APT and service mutations. A failed or interrupted installation invokes uninstall automatically; failed rollback retains the snapshot for recovery.
 - Pairing happens after installation commits, so a speaker being unavailable does not erase a valid system setup.
 - The system-wide WirePlumber fragment only disables seat monitoring. It deliberately does not override `bluez5.codecs`.

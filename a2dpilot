@@ -60,8 +60,9 @@ USER_UNITS=(
 
 SYSTEM_UNITS=(
   bluetooth.service
-  triggerhappy.service
+  # Restoration must activate the socket before its associated service.
   triggerhappy.socket
+  triggerhappy.service
   a2dpilot.service
 )
 
@@ -806,6 +807,11 @@ restore_system_service_states() {
       continue
     fi
     [[ $load_state != not-found ]] || return 1
+    if [[ $unit == triggerhappy.socket && $active == 1 ]]; then
+      # A2DPilot runs Triggerhappy directly; release its socket path before
+      # restoring the original socket-activated service state.
+      systemctl stop triggerhappy.service || return 1
+    fi
     set_unit_enabled_state system '' "$unit" "$enabled" || return 1
     action=stop
     [[ $active == 1 ]] && action=start
@@ -2249,7 +2255,11 @@ install_action() {
   systemctl daemon-reload
   ensure_audio_user "$CFG_AUDIO_USER"
   printf '%s\n' "$CFG_AUDIO_USER" > "$STATE_DIR/runtime-user"
-  systemctl enable --now bluetooth.service triggerhappy.service triggerhappy.socket a2dpilot.service
+  # Debian ships triggerhappy.socket as an alternative activation path for
+  # triggerhappy.service. Starting both makes the socket fail when the service
+  # already owns /run/thd.socket, so A2DPilot uses the direct service only.
+  systemctl disable --now triggerhappy.socket
+  systemctl enable --now bluetooth.service triggerhappy.service a2dpilot.service
   systemctl restart triggerhappy.service
   power_controller || warn "No usable Bluetooth controller is currently available."
 

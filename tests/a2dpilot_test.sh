@@ -483,7 +483,15 @@ test_noninteractive_install_and_uninstall_fixture() {
   record_controller_state() { : > "$STATE_DIR/controller-state"; }
   dpkg-query() { return 1; }
   apt-get() { printf '%s\n' "$*" >> "$apt_log"; }
-  systemctl() { printf '%s\n' "$*" >> "$TEST_SCRATCH/systemctl.log"; }
+  systemctl() {
+    printf '%s\n' "$*" >> "$TEST_SCRATCH/systemctl.log"
+    if [[ $* == 'disable --now triggerhappy.socket' ]]; then
+      : > "$TEST_SCRATCH/triggerhappy-socket-disabled"
+    elif [[ $1 == enable && ${2:-} == --now ]]; then
+      [[ $* != *triggerhappy.socket* ]] || return 1
+      [[ -e $TEST_SCRATCH/triggerhappy-socket-disabled ]] || return 1
+    fi
+  }
   ensure_audio_user() { :; }
   power_controller() { :; }
 
@@ -503,6 +511,10 @@ test_noninteractive_install_and_uninstall_fixture() {
   assert_file_contains "$apt_log" 'install -y --no-install-recommends'
   assert_file_contains "$STATE_DIR/new-packages" rfkill
   assert_file_contains "$TEST_SCRATCH/systemctl.log" \
+    'disable --now triggerhappy.socket'
+  assert_file_contains "$TEST_SCRATCH/systemctl.log" \
+    'enable --now bluetooth.service triggerhappy.service a2dpilot.service'
+  assert_file_not_contains "$TEST_SCRATCH/systemctl.log" \
     'enable --now bluetooth.service triggerhappy.service triggerhappy.socket a2dpilot.service'
 
   restore_all_user_states() { :; }
@@ -1318,7 +1330,7 @@ test_managed_paths_and_state_serialization() {
 }
 
 test_system_service_state_restoration() {
-  local expected
+  local expected service_active socket_active trigger_order
   setup_scratch_dir
   load_app
   configure_scratch_paths
@@ -1344,6 +1356,52 @@ start enabled.service
 disable disabled.service
 stop disabled.service
 start static.service
+EOF
+  diff -u "$expected" "$TEST_SCRATCH/systemctl.log"
+
+  systemctl() {
+    case $1 in
+      is-enabled) printf 'enabled\n' ;;
+      is-active) printf 'active\n' ;;
+    esac
+  }
+  record_system_service_states
+  trigger_order=$(awk '/^triggerhappy\./ { print $1 }' \
+    "$STATE_DIR/system-service-states" | paste -sd ' ')
+  assert_eq 'triggerhappy.socket triggerhappy.service' "$trigger_order"
+  : > "$TEST_SCRATCH/systemctl.log"
+  cat > "$STATE_DIR/system-service-states" <<'EOF'
+triggerhappy.socket enabled 1
+triggerhappy.service enabled 1
+EOF
+  service_active=1
+  socket_active=0
+  systemctl() {
+    local action=$1 unit=${2:-}
+    if [[ $action == show ]]; then
+      printf 'loaded\n'
+      return 0
+    fi
+    case "$action $unit" in
+      'stop triggerhappy.service') service_active=0 ;;
+      'start triggerhappy.socket')
+        (( service_active == 0 )) || return 1
+        socket_active=1
+        ;;
+      'restart triggerhappy.service')
+        (( socket_active == 1 )) || return 1
+        service_active=1
+        ;;
+    esac
+    printf '%s\n' "$*" >> "$TEST_SCRATCH/systemctl.log"
+  }
+  restore_system_service_states
+  cat > "$expected" <<'EOF'
+stop triggerhappy.service
+enable triggerhappy.socket
+start triggerhappy.socket
+enable triggerhappy.service
+restart triggerhappy.service
 EOF
   diff -u "$expected" "$TEST_SCRATCH/systemctl.log"
 }
