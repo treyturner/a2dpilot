@@ -2128,7 +2128,9 @@ interactive_pair_loop() {
     devices=()
     while IFS= read -r line; do
       [[ $line =~ ^Device[[:space:]]+(([[:xdigit:]]{2}:){5}[[:xdigit:]]{2})[[:space:]]+(.+)$ ]] || continue
-      devices+=("${BASH_REMATCH[1]^^}|${BASH_REMATCH[3]}")
+      mac=${BASH_REMATCH[1]^^}
+      speaker_configured "$mac" && continue
+      devices+=("$mac|${BASH_REMATCH[3]}")
     done < <(configured_bluetooth_devices 2>/dev/null || true)
     if (( ${#devices[@]} == 0 )); then
       note "No devices were discovered."
