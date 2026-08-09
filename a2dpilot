@@ -2093,15 +2093,16 @@ interactive_pair_loop() {
     done < <(configured_bluetooth_devices 2>/dev/null || true)
     if (( ${#devices[@]} == 0 )); then
       note "No devices were discovered."
-      return 0
+    else
+      tty_print 'Discovered devices:\n'
+      for index in "${!devices[@]}"; do
+        tty_print '  %d) %s %s\n' "$((index + 1))" "${devices[$index]%%|*}" "${devices[$index]#*|}"
+      done
     fi
-    tty_print 'Discovered devices:\n'
-    for index in "${!devices[@]}"; do
-      tty_print '  %d) %s %s\n' "$((index + 1))" "${devices[$index]%%|*}" "${devices[$index]#*|}"
-    done
-    tty_print 'Select a device number, or press Enter to finish: '
+    tty_print 'Select a device number, [r]escan, or press Enter to finish: '
     tty_read choice || return 0
     [[ -n $choice ]] || return 0
+    [[ $choice == r || $choice == R ]] && continue
     [[ $choice =~ ^[0-9]+$ ]] || {
       warn "Invalid selection."
       continue

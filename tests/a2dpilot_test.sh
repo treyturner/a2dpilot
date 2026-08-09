@@ -1932,20 +1932,21 @@ test_pair_all_attempts_every_configured_speaker() {
 }
 
 test_interactive_scan_selection() {
-  local -a answers=(1 '')
-  local answer_index=0
+  local -a answers=(r 1 '')
+  local answer_index=0 scan_count=0 warnings=''
   setup_scratch_dir
   load_app
   configure_scratch_paths
   CFG_CONTROLLER=auto
-  scan_bredr() { :; }
-  tty_print() { :; }
+  scan_bredr() { scan_count=$((scan_count + 1)); }
+  tty_print() { printf '%s\n' "$1" >> "$TEST_SCRATCH/prompts"; }
   tty_read() {
     printf -v "$1" '%s' "${answers[$answer_index]}"
     answer_index=$((answer_index + 1))
   }
+  warn() { warnings+="$*"; }
   bluetoothctl() {
-    if [[ ${1:-} == devices ]]; then
+    if [[ ${1:-} == devices && $scan_count -gt 1 ]]; then
       printf 'Device AA:BB:CC:DD:EE:FF Kitchen Speaker\n'
       printf 'Device 10:20:30:40:50:60 Other Device\n'
     fi
@@ -1954,6 +1955,9 @@ test_interactive_scan_selection() {
   interactive_pair_loop KeyboardDisplay
   assert_file_contains "$TEST_SCRATCH/selected" 'AA:BB:CC:DD:EE:FF KeyboardDisplay'
   assert_eq 1 "$(wc -l < "$TEST_SCRATCH/selected")"
+  assert_eq 3 "$scan_count"
+  assert_not_contains "$warnings" 'Invalid selection.'
+  assert_file_contains "$TEST_SCRATCH/prompts" '[r]escan'
 }
 
 test_forget_removes_config_and_provenance() {
