@@ -482,19 +482,8 @@ test_noninteractive_install_and_uninstall_fixture() {
   record_user_state() { :; }
   record_rfkill_state() { : > "$STATE_DIR/rfkill-state"; }
   record_controller_state() { : > "$STATE_DIR/controller-state"; }
-  list_present_packages() {
-    printf 'base-package\n'
-    if [[ -e $TEST_SCRATCH/apt-installed ]]; then
-      printf 'pipewire\npipewire-bin\nrfkill\n'
-    fi
-  }
   apt-get() {
     printf '%s\n' "$*" >> "$apt_log"
-    if [[ ${1:-} == install ]]; then
-      printf 'base-package\n' > "$STATE_DIR/packages-before"
-      : > "$TEST_SCRATCH/apt-installed"
-      printf 'base-package\npipewire\npipewire-bin\nrfkill\n' > "$STATE_DIR/packages-after"
-    fi
   }
   systemctl() {
     printf '%s\n' "$*" >> "$TEST_SCRATCH/systemctl.log"
@@ -525,12 +514,8 @@ test_noninteractive_install_and_uninstall_fixture() {
   assert_file_not_contains "$TRIGGER_CONF" 'commandID='
   assert_file_contains "$STATE_FILE" 'INSTALL_PHASE=installed'
   assert_file_contains "$apt_log" 'install -y --no-install-recommends'
-  assert_file_contains "$apt_log" \
-    "DPkg::Pre-Invoke::=$STATE_DIR/package-snapshot-hook before"
-  assert_file_contains "$apt_log" \
-    "DPkg::Post-Invoke::=$STATE_DIR/package-snapshot-hook after"
-  assert_file_contains "$STATE_DIR/new-packages" rfkill
-  assert_file_contains "$STATE_DIR/new-packages" pipewire-bin
+  assert_file_not_contains "$apt_log" 'DPkg::Pre-Invoke'
+  assert_file_not_contains "$apt_log" 'DPkg::Post-Invoke'
   assert_file_contains "$TEST_SCRATCH/systemctl.log" \
     'unmask bluetooth.service triggerhappy.socket triggerhappy.service a2dpilot.service'
   assert_file_contains "$TEST_SCRATCH/systemctl.log" \
@@ -553,71 +538,6 @@ test_noninteractive_install_and_uninstall_fixture() {
   [[ ! -e $CONFIG_FILE ]] || fail 'created configuration survived uninstall'
   [[ ! -e $STATE_DIR ]] || fail 'rollback state survived successful uninstall'
   assert_file_not_contains "$apt_log" 'remove -y'
-}
-
-test_package_transaction_tracking() {
-  local output mock_bin rc
-  setup_scratch_dir
-  load_app
-  configure_scratch_paths
-  mock_bin=$TEST_SCRATCH/mock-bin
-  install -d "$mock_bin"
-  cat > "$mock_bin/dpkg-query" <<'EOF'
-#!/bin/sh
-printf 'base-package\tii \n'
-printf 'partial-before\tiU \n'
-printf 'unrelated-during-update\tii \n'
-if [ "$(cat "$PACKAGE_PHASE_FILE")" = after ]; then
-  printf 'new-direct\tii \n'
-  printf 'new-dependency:armhf\tiU \n'
-fi
-EOF
-  chmod +x "$mock_bin/dpkg-query"
-  PACKAGE_PHASE_FILE=$TEST_SCRATCH/package-phase
-  export PACKAGE_PHASE_FILE
-  printf 'before\n' > "$PACKAGE_PHASE_FILE"
-  write_package_snapshot_hook
-  PATH=$mock_bin:$PATH "$STATE_DIR/package-snapshot-hook" before
-  printf 'after\n' > "$PACKAGE_PHASE_FILE"
-  # Repeated DPkg::Pre-Invoke hooks must retain the start of the transaction.
-  PATH=$mock_bin:$PATH "$STATE_DIR/package-snapshot-hook" before
-  PATH=$mock_bin:$PATH "$STATE_DIR/package-snapshot-hook" after
-  dpkg-query() {
-    printf 'base-package\tii \n'
-    printf 'partial-before\tiU \n'
-    printf 'new-direct\tii \n'
-    printf 'new-dependency:armhf\tiU \n'
-    printf 'removed-package\trc \n'
-    printf 'absent-package\tun \n'
-  }
-  output=$(list_present_packages)
-  assert_contains "$output" 'base-package'
-  assert_contains "$output" 'new-dependency:armhf'
-  assert_not_contains "$output" 'removed-package'
-  assert_not_contains "$output" 'absent-package'
-  comm() {
-    [[ ${LC_ALL:-} == C ]] || fail 'comm did not use the package snapshot collation'
-    command comm "$@"
-  }
-  record_new_packages
-  assert_file_contains "$STATE_DIR/new-packages" 'new-direct'
-  assert_file_contains "$STATE_DIR/new-packages" 'new-dependency:armhf'
-  assert_file_not_contains "$STATE_DIR/new-packages" 'base-package'
-  assert_file_not_contains "$STATE_DIR/new-packages" 'partial-before'
-  assert_file_not_contains "$STATE_DIR/new-packages" 'unrelated-during-update'
-
-  cat > "$mock_bin/dpkg-query" <<'EOF'
-#!/bin/sh
-exit 1
-EOF
-  chmod +x "$mock_bin/dpkg-query"
-  rm -f -- "$STATE_DIR/packages-before" "$STATE_DIR/packages-after"
-  set +e
-  PATH=$mock_bin:$PATH "$STATE_DIR/package-snapshot-hook" before
-  rc=$?
-  set -e
-  (( rc != 0 )) || fail 'failed dpkg-query produced a package snapshot'
-  [[ ! -e $STATE_DIR/packages-before ]] || fail 'failed package snapshot was installed'
 }
 
 test_uninstall_keeps_packages_and_reports_empty_bond_policy() {
@@ -647,7 +567,7 @@ test_uninstall_keeps_packages_and_reports_empty_bond_policy() {
   [[ ! -e $STATE_DIR ]] || fail 'package-retaining uninstall retained state'
 }
 
-test_failed_install_rollback_removes_dependencies() {
+test_failed_install_rollback_retains_packages() {
   local output rc mock
   setup_scratch_dir
   load_app
@@ -662,45 +582,42 @@ EOF
   export ROLLBACK_LOG
   SCRIPT_PATH=$mock
   release_lock() { :; }
-  record_new_packages() { :; }
   set +e
   output=$(rollback_failed_install 23 2>&1)
   rc=$?
   set -e
   assert_eq 23 "$rc"
   assert_contains "$output" 'Automatic rollback succeeded.'
-  assert_file_contains "$ROLLBACK_LOG" 'uninstall --keep-bonds --with-dependencies'
+  assert_eq 'uninstall --keep-bonds' "$(< "$ROLLBACK_LOG")"
 }
 
-test_failed_state_recovery_preserves_recorded_packages() {
-  local lock_calls=0 mock
-  setup_scratch_dir
-  load_app
-  configure_scratch_paths
-  printf 'INSTALL_PHASE=failed\n' > "$STATE_FILE"
-  printf 'recorded-dependency\n' > "$STATE_DIR/new-packages"
-  mock=$TEST_SCRATCH/uninstall-mock
-  cat > "$mock" <<'EOF'
+test_install_recovery_needs_no_package_snapshot() {
+  local lock_calls mock phase
+  for phase in installing failed; do
+    lock_calls=0
+    setup_scratch_dir
+    load_app
+    configure_scratch_paths
+    printf 'INSTALL_PHASE=%s\n' "$phase" > "$STATE_FILE"
+    mock=$TEST_SCRATCH/uninstall-mock
+    cat > "$mock" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" > "$RECOVERY_LOG"
 EOF
-  chmod +x "$mock"
-  RECOVERY_LOG=$TEST_SCRATCH/recovery.log
-  export RECOVERY_LOG
-  SCRIPT_PATH=$mock
-  require_root() { :; }
-  acquire_lock() {
-    lock_calls=$((lock_calls + 1))
-    (( lock_calls == 1 )) || die "recovery checkpoint"
-  }
-  release_lock() { :; }
-  record_new_packages() { : > "$TEST_SCRATCH/recomputed-packages"; }
-
-  expect_failure_contains 'recovery checkpoint' install_action --non-interactive
-  [[ ! -e $TEST_SCRATCH/recomputed-packages ]] || \
-    fail 'failed-state recovery recomputed package provenance'
-  assert_file_contains "$RECOVERY_LOG" 'uninstall --keep-bonds --with-dependencies'
-  assert_file_contains "$STATE_DIR/new-packages" 'recorded-dependency'
+    chmod +x "$mock"
+    RECOVERY_LOG=$TEST_SCRATCH/recovery.log
+    export RECOVERY_LOG
+    SCRIPT_PATH=$mock
+    require_root() { :; }
+    acquire_lock() {
+      lock_calls=$((lock_calls + 1))
+      (( lock_calls == 1 )) || die "recovery checkpoint"
+    }
+    release_lock() { :; }
+    expect_failure_contains 'recovery checkpoint' install_action --non-interactive
+    assert_eq 'uninstall --keep-bonds' "$(< "$RECOVERY_LOG")"
+    cleanup_scratch_dir
+  done
 }
 
 test_config_editor_success_and_validation_failure() {
@@ -1730,10 +1647,9 @@ run_test 'media URL configuration validation' test_media_url_configuration_valid
 run_test 'generated system integration files' test_generated_integration_files
 run_test 'Triggerhappy config rejects symlinked parent' test_trigger_config_rejects_symlinked_parent
 run_test 'non-interactive install and uninstall fixture' test_noninteractive_install_and_uninstall_fixture
-run_test 'APT transaction package tracking' test_package_transaction_tracking
 run_test 'uninstall keeps packages and reports empty bond policy' test_uninstall_keeps_packages_and_reports_empty_bond_policy
-run_test 'failed install rollback removes dependencies' test_failed_install_rollback_removes_dependencies
-run_test 'failed-state recovery preserves package provenance' test_failed_state_recovery_preserves_recorded_packages
+run_test 'failed install rollback retains packages' test_failed_install_rollback_retains_packages
+run_test 'install recovery needs no package snapshot' test_install_recovery_needs_no_package_snapshot
 run_test 'safe config editor success and validation failure' test_config_editor_success_and_validation_failure
 run_test 'config editor installs a protected snapshot' test_config_editor_installs_protected_snapshot
 run_test 'failed config application restores previous config' test_config_application_rolls_back

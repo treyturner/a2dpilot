@@ -2174,86 +2174,12 @@ status_action() {
   fi
 }
 
-list_present_packages() {
-  dpkg-query -W -f='${binary:Package}\t${db:Status-Abbrev}\n' 2>/dev/null |
-    awk -F '\t' 'length($2) >= 2 && substr($2, 2, 1) !~ /^[nc]$/ { print $1 }' |
-    LC_ALL=C sort -u
-}
-
-write_package_snapshot_hook() {
-  local hook=$STATE_DIR/package-snapshot-hook candidate
-  [[ $hook =~ ^[A-Za-z0-9_./-]+$ ]] || return 1
-  candidate=$(mktemp "$STATE_DIR/.package-snapshot-hook.XXXXXX") || return 1
-  if ! cat > "$candidate" <<'EOF'
-#!/bin/sh
-set -eu
-
-state_dir=${0%/*}
-
-snapshot_packages() {
-  name=$1
-  raw=
-  filtered=
-  candidate=
-  trap 'rm -f -- "$raw" "$filtered" "$candidate"' EXIT HUP INT TERM
-  raw=$(mktemp "$state_dir/.$name.raw.XXXXXX")
-  filtered=$(mktemp "$state_dir/.$name.filtered.XXXXXX")
-  candidate=$(mktemp "$state_dir/.$name.XXXXXX")
-  dpkg-query -W -f='${binary:Package}\t${db:Status-Abbrev}\n' > "$raw" 2>/dev/null
-  awk -F '\t' 'length($2) >= 2 && substr($2, 2, 1) !~ /^[nc]$/ { print $1 }' \
-    "$raw" > "$filtered"
-  LC_ALL=C sort -u "$filtered" > "$candidate"
-  mv -f -- "$candidate" "$state_dir/$name"
-  candidate=
-  rm -f -- "$raw" "$filtered"
-  trap - EXIT HUP INT TERM
-}
-
-case ${1:-} in
-  before)
-    [ -e "$state_dir/packages-before" ] || snapshot_packages packages-before
-    ;;
-  after)
-    snapshot_packages packages-after
-    ;;
-  *)
-    exit 2
-    ;;
-esac
-EOF
-  then
-    rm -f -- "$candidate"
-    return 1
-  fi
-  chmod 0700 "$candidate" || {
-    rm -f -- "$candidate"
-    return 1
-  }
-  mv -f -- "$candidate" "$hook"
-}
-
-record_new_packages() {
-  local before=$STATE_DIR/packages-before after=$STATE_DIR/packages-after
-  local replacement=$STATE_DIR/new-packages.tmp
-  [[ -f $before && -f $after ]] || return 1
-  if ! LC_ALL=C comm -13 "$before" "$after" > "$replacement"; then
-    rm -f -- "$replacement"
-    return 1
-  fi
-  mv -f -- "$replacement" "$STATE_DIR/new-packages"
-}
-
 rollback_failed_install() {
   local rc=$1
   trap - ERR INT TERM
   note "Installation failed; attempting automatic rollback..."
-  if ! record_new_packages; then
-    write_state_file failed || true
-    warn "Could not determine which packages were added; recovery state remains at $STATE_DIR."
-    exit "$rc"
-  fi
   release_lock
-  if "$SCRIPT_PATH" uninstall --keep-bonds --with-dependencies; then
+  if "$SCRIPT_PATH" uninstall --keep-bonds; then
     note "Automatic rollback succeeded."
   else
     if [[ -f $STATE_FILE ]] && ! write_state_file failed; then
@@ -2301,11 +2227,8 @@ install_action() {
     case $existing_phase in
       installing|failed)
         note "Recovering interrupted installation before retrying..."
-        if [[ $existing_phase == installing ]]; then
-          record_new_packages || die "Could not determine which packages were added during the interrupted installation."
-        fi
         release_lock
-        "$SCRIPT_PATH" uninstall --keep-bonds --with-dependencies || die "Could not recover the interrupted installation."
+        "$SCRIPT_PATH" uninstall --keep-bonds || die "Could not recover the interrupted installation."
         acquire_lock
         ;;
       *) release_lock; die "A2DPilot is already installed." ;;
@@ -2321,10 +2244,7 @@ install_action() {
   chmod 0700 "$STATE_DIR" "$BACKUP_DIR"
   : > "$STATE_DIR/created-files"
   : > "$STATE_DIR/replaced-files"
-  : > "$STATE_DIR/new-packages"
   : > "$STATE_DIR/created-bonds"
-  rm -f -- "$STATE_DIR/packages-before" "$STATE_DIR/packages-after" \
-    "$STATE_DIR/package-snapshot-hook"
 
   local audio_user config_seed
   if [[ -e $CONFIG_FILE || -L $CONFIG_FILE ]]; then
@@ -2354,19 +2274,7 @@ install_action() {
 
   note "Installing BlueZ, PipeWire, WirePlumber, Triggerhappy, and A2DP codec support..."
   apt-get update
-  write_package_snapshot_hook || die "Could not prepare package transaction tracking."
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    -o "DPkg::Pre-Invoke::=$STATE_DIR/package-snapshot-hook before" \
-    -o "DPkg::Post-Invoke::=$STATE_DIR/package-snapshot-hook after" \
-    "${PACKAGES[@]}"
-  if [[ ! -e $STATE_DIR/packages-before && ! -e $STATE_DIR/packages-after ]]; then
-    # APT does not invoke DPkg hooks when every requested package is already
-    # present, which is a successful transaction with an empty package delta.
-    : > "$STATE_DIR/packages-before"
-    : > "$STATE_DIR/packages-after"
-  fi
-  record_new_packages
-  rm -f -- "$STATE_DIR/package-snapshot-hook"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${PACKAGES[@]}"
 
   install -d -m 0755 "$(dirname "$INSTALLED_CLI")" "$(dirname "$SYSTEMD_UNIT")" \
     "$(dirname "$WIREPLUMBER_CONF")" "$(dirname "$TRIGGER_CONF")" "$(dirname "$CONFIG_FILE")"
