@@ -142,14 +142,15 @@ test_syntax_help_and_stream_bootstrap() {
   assert_eq "$local_help" "$streamed_help"
   assert_contains "$local_help" 'a2dpilot install [--user USER] [--non-interactive]'
   assert_contains "$local_help" 'a2dpilot config [--check]'
+  assert_contains "$local_help" 'a2dpilot update [--tag TAG | --branch BRANCH | --sha SHA]'
   assert_contains "$local_help" 'uninstall [--keep-bonds | --remove-bonds]'
   assert_not_contains "$local_help" '--with-dependencies'
   assert_not_contains "$local_help" 'update --mac'
   assert_not_contains "$local_help" '--control-helper'
   set +e
-  output=$(bash "$APP" update 2>&1)
+  output=$(bash "$APP" obsolete 2>&1)
   set -e
-  assert_contains "$output" 'Unknown command: update'
+  assert_contains "$output" 'Unknown command: obsolete'
 }
 
 test_managed_package_list() {
@@ -618,6 +619,335 @@ EOF
     assert_eq 'uninstall --keep-bonds' "$(< "$RECOVERY_LOG")"
     cleanup_scratch_dir
   done
+}
+
+test_update_source_selection_and_validation() {
+  local sha=0123456789abcdef0123456789abcdef01234567 ref
+  local -a valid_refs=(main feat/update_command release/v1.2.3 v1.2.3+build one@two -tag)
+  local -a invalid_refs=('' '@' '/main' 'main/' 'main.' 'feat//one' 'feat/../one' \
+    'feat/@{one' '.hidden' 'feat/.hidden' 'release.lock' 'feat/release.lock' 'has space' \
+    'question?' 'star*' 'back\slash')
+  load_app
+  assert_eq 'https://raw.githubusercontent.com/treyturner/a2dpilot/refs/heads/main/a2dpilot' \
+    "$(update_source_url branch main)"
+  assert_eq 'https://raw.githubusercontent.com/treyturner/a2dpilot/refs/heads/feat/update_command/a2dpilot' \
+    "$(update_source_url branch feat/update_command)"
+  assert_eq 'https://raw.githubusercontent.com/treyturner/a2dpilot/refs/tags/v1.2.3/a2dpilot' \
+    "$(update_source_url tag v1.2.3)"
+  assert_eq "https://raw.githubusercontent.com/treyturner/a2dpilot/$sha/a2dpilot" \
+    "$(update_source_url sha "$sha")"
+  for ref in "${valid_refs[@]}"; do
+    valid_update_ref "$ref" || fail "valid update ref was rejected: $ref"
+  done
+  for ref in "${invalid_refs[@]}"; do
+    if valid_update_ref "$ref"; then fail "invalid update ref was accepted: $ref"; fi
+  done
+
+  require_root() { :; }
+  expect_failure_contains 'mutually exclusive' update_action --tag v1.0.0 --branch main
+  expect_failure_contains 'mutually exclusive' update_action --branch main --branch next
+  expect_failure_contains 'full 40-character' update_action --sha 0123456
+  expect_failure_contains 'Invalid tag name' update_action --tag 'bad tag'
+  expect_failure_contains 'Unknown update option' update_action --repository elsewhere
+  expect_failure_contains 'Unexpected update argument' update_action main
+}
+
+test_update_executable_only_transaction() {
+  local payload output before after service_active=1 target_owner=0
+  local upper_sha=ABCDEF0123456789ABCDEF0123456789ABCDEF01
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  install -d "$(dirname "$INSTALLED_CLI")" "$(dirname "$SYSTEMD_UNIT")" \
+    "$(dirname "$WIREPLUMBER_CONF")" "$(dirname "$TRIGGER_CONF")"
+  render_state_file "$STATE_FILE" installed
+  printf 'created files sentinel\n' > "$STATE_DIR/created-files"
+  printf 'replaced files sentinel\n' > "$STATE_DIR/replaced-files"
+  printf 'created bonds sentinel\n' > "$STATE_DIR/created-bonds"
+  printf 'runtime user sentinel\n' > "$STATE_DIR/runtime-user"
+  printf '#!/usr/bin/env bash\n# old executable\n' > "$INSTALLED_CLI"
+  chmod 0755 "$INSTALLED_CLI"
+  printf 'config sentinel\n' > "$CONFIG_FILE"
+  printf 'unit sentinel\n' > "$SYSTEMD_UNIT"
+  printf 'wireplumber sentinel\n' > "$WIREPLUMBER_CONF"
+  printf 'trigger sentinel\n' > "$TRIGGER_CONF"
+  before=$(sha256sum "$STATE_FILE" "$STATE_DIR/created-files" \
+    "$STATE_DIR/replaced-files" "$STATE_DIR/created-bonds" "$STATE_DIR/runtime-user" \
+    "$CONFIG_FILE" "$SYSTEMD_UNIT" \
+    "$WIREPLUMBER_CONF" "$TRIGGER_CONF")
+  payload=$TEST_SCRATCH/update-payload
+  printf '#!/usr/bin/env bash\n# updated main\n' > "$payload"
+
+  require_root() { :; }
+  acquire_lock() { printf 'acquire\n' >> "$TEST_SCRATCH/lock.log"; }
+  release_lock() { printf 'release\n' >> "$TEST_SCRATCH/lock.log"; }
+  stat() {
+    if [[ ${1:-} == -c && ${2:-} == %u && ${4:-} == "$INSTALLED_CLI" ]]; then
+      printf '%s\n' "$target_owner"
+    else
+      /usr/bin/stat "$@"
+    fi
+  }
+  install() {
+    local -a forwarded=()
+    printf '%s\n' "$*" >> "$TEST_SCRATCH/install.log"
+    while [[ $# -gt 0 ]]; do
+      case $1 in
+        -o|-g) shift 2 ;;
+        *) forwarded+=("$1"); shift ;;
+      esac
+    done
+    /usr/bin/install "${forwarded[@]}"
+  }
+  curl() {
+    local output_path=''
+    printf '%s\n' "$*" >> "$TEST_SCRATCH/curl.log"
+    while [[ $# -gt 0 ]]; do
+      if [[ $1 == --output ]]; then output_path=$2; shift 2; else shift; fi
+    done
+    cp "$payload" "$output_path"
+  }
+  systemctl() {
+    case $1 in
+      is-active)
+        if (( service_active )); then printf 'active\n'; else printf 'inactive\n'; fi
+        ;;
+      restart) printf '%s\n' "$*" >> "$TEST_SCRATCH/systemctl.log" ;;
+      *) fail "unexpected systemctl call during update: $*" ;;
+    esac
+  }
+  apt-get() { fail 'update invoked APT'; }
+  reconcile_runtime_configuration() { fail 'update reconciled runtime configuration'; }
+  write_systemd_unit() { fail 'update regenerated its systemd unit'; }
+  write_wireplumber_config() { fail 'update regenerated WirePlumber configuration'; }
+  write_trigger_config() { fail 'update regenerated Triggerhappy configuration'; }
+
+  output=$(update_action)
+  assert_contains "$output" "updated successfully from branch 'main'"
+  assert_file_contains "$INSTALLED_CLI" '# updated main'
+  assert_eq 755 "$(/usr/bin/stat -c %a "$INSTALLED_CLI")"
+  assert_file_contains "$TEST_SCRATCH/curl.log" "--proto =https --proto-redir =https"
+  assert_file_contains "$TEST_SCRATCH/curl.log" "--connect-timeout 10 --max-time 60"
+  assert_file_contains "$TEST_SCRATCH/curl.log" \
+    'https://raw.githubusercontent.com/treyturner/a2dpilot/refs/heads/main/a2dpilot'
+  assert_file_contains "$TEST_SCRATCH/install.log" '-o root -g root -m 0755'
+  assert_eq 1 "$(grep -Fc 'restart a2dpilot.service' "$TEST_SCRATCH/systemctl.log")"
+
+  : > "$TEST_SCRATCH/systemctl.log"
+  output=$(update_action)
+  assert_contains "$output" "already current for branch 'main'"
+  [[ ! -s $TEST_SCRATCH/systemctl.log ]] || fail 'no-op update restarted the service'
+
+  service_active=0
+  printf '#!/usr/bin/env bash\n# updated branch\n' > "$payload"
+  update_action --branch feat/update_command >/dev/null
+  assert_file_contains "$TEST_SCRATCH/curl.log" \
+    'https://raw.githubusercontent.com/treyturner/a2dpilot/refs/heads/feat/update_command/a2dpilot'
+  printf '#!/usr/bin/env bash\n# updated tag\n' > "$payload"
+  update_action --tag v1.2.3 >/dev/null
+  assert_file_contains "$TEST_SCRATCH/curl.log" \
+    'https://raw.githubusercontent.com/treyturner/a2dpilot/refs/tags/v1.2.3/a2dpilot'
+  printf '#!/usr/bin/env bash\n# updated sha\n' > "$payload"
+  update_action --sha "$upper_sha" >/dev/null
+  assert_file_contains "$TEST_SCRATCH/curl.log" \
+    'https://raw.githubusercontent.com/treyturner/a2dpilot/abcdef0123456789abcdef0123456789abcdef01/a2dpilot'
+  [[ ! -s $TEST_SCRATCH/systemctl.log ]] || fail 'inactive service was started during update'
+
+  after=$(sha256sum "$STATE_FILE" "$STATE_DIR/created-files" \
+    "$STATE_DIR/replaced-files" "$STATE_DIR/created-bonds" "$STATE_DIR/runtime-user" \
+    "$CONFIG_FILE" "$SYSTEMD_UNIT" \
+    "$WIREPLUMBER_CONF" "$TRIGGER_CONF")
+  assert_eq "$before" "$after"
+  assert_eq 5 "$(grep -Fc acquire "$TEST_SCRATCH/lock.log")"
+  assert_eq 5 "$(grep -Fc release "$TEST_SCRATCH/lock.log")"
+}
+
+test_update_rejects_bad_candidates_and_targets() {
+  local mode output rc candidate target_owner=0 parent redirected
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  install -d "$(dirname "$INSTALLED_CLI")"
+  render_state_file "$STATE_FILE" installed
+  printf '#!/usr/bin/env bash\n# old executable\n' > "$INSTALLED_CLI"
+  chmod 0755 "$INSTALLED_CLI"
+
+  require_root() { :; }
+  acquire_lock() { printf 'acquire\n' >> "$TEST_SCRATCH/lock.log"; }
+  release_lock() { printf 'release\n' >> "$TEST_SCRATCH/lock.log"; }
+  stat() {
+    if [[ ${1:-} == -c && ${2:-} == %u && ${4:-} == "$INSTALLED_CLI" ]]; then
+      printf '%s\n' "$target_owner"
+    else
+      /usr/bin/stat "$@"
+    fi
+  }
+  curl() {
+    local output_path=''
+    while [[ $# -gt 0 ]]; do
+      if [[ $1 == --output ]]; then output_path=$2; shift 2; else shift; fi
+    done
+    printf '%s\n' "$output_path" > "$TEST_SCRATCH/candidate-path"
+    case $mode in
+      fail) return 22 ;;
+      empty) : > "$output_path" ;;
+      invalid) printf 'if broken syntax\n' > "$output_path" ;;
+    esac
+  }
+
+  for mode in fail empty invalid; do
+    : > "$TEST_SCRATCH/lock.log"
+    set +e
+    output=$(update_action 2>&1)
+    rc=$?
+    set -e
+    (( rc != 0 )) || fail "$mode update candidate was accepted"
+    case $mode in
+      fail) assert_contains "$output" 'Could not download A2DPilot' ;;
+      empty) assert_contains "$output" 'empty or unsafe' ;;
+      invalid) assert_contains "$output" 'failed Bash syntax validation' ;;
+    esac
+    candidate=$(< "$TEST_SCRATCH/candidate-path")
+    [[ ! -e $candidate ]] || fail "$mode update left its candidate behind"
+    assert_file_not_contains "$TEST_SCRATCH/lock.log" acquire
+    assert_file_contains "$INSTALLED_CLI" '# old executable'
+  done
+
+  rm -f -- "$TEST_SCRATCH/candidate-path"
+  render_state_file "$STATE_FILE" failed
+  expect_failure_contains "requires an installed state; found 'failed'" update_action
+  [[ ! -e $TEST_SCRATCH/candidate-path ]] || fail 'failed installation state downloaded a candidate'
+  render_state_file "$STATE_FILE" installed
+  target_owner=1000
+  expect_failure_contains 'must be owned by root' update_action
+  [[ ! -e $TEST_SCRATCH/candidate-path ]] || fail 'owner validation downloaded a candidate'
+  target_owner=0
+  rm -f -- "$INSTALLED_CLI"
+  ln -s /etc/passwd "$INSTALLED_CLI"
+  expect_failure_contains 'missing or unsafe' update_action
+  [[ ! -e $TEST_SCRATCH/candidate-path ]] || fail 'symlink validation downloaded a candidate'
+
+  rm -f -- "$INSTALLED_CLI"
+  parent=$(dirname "$INSTALLED_CLI")
+  rmdir -- "$parent"
+  redirected=$TEST_SCRATCH/redirected-update-target
+  install -d "$redirected"
+  printf '#!/usr/bin/env bash\n' > "$redirected/a2dpilot"
+  ln -s "$redirected" "$parent"
+  expect_failure_contains 'Refusing to traverse symlinked directory' update_action
+  [[ ! -e $TEST_SCRATCH/candidate-path ]] || fail 'symlinked parent downloaded a candidate'
+}
+
+test_update_activation_rollback_and_interruption() {
+  local payload output rc restart_count atomic_count
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  install -d "$(dirname "$INSTALLED_CLI")"
+  render_state_file "$STATE_FILE" installed
+  printf '#!/usr/bin/env bash\n# old executable\n' > "$INSTALLED_CLI"
+  chmod 0755 "$INSTALLED_CLI"
+  payload=$TEST_SCRATCH/update-payload
+  printf '#!/usr/bin/env bash\n# new executable\n' > "$payload"
+  restart_count=$TEST_SCRATCH/restart-count
+  atomic_count=$TEST_SCRATCH/atomic-count
+  printf '0\n' > "$restart_count"
+
+  require_root() { :; }
+  acquire_lock() { :; }
+  release_lock() { printf 'release\n' >> "$TEST_SCRATCH/release.log"; }
+  stat() {
+    if [[ ${1:-} == -c && ${2:-} == %u && ${4:-} == "$INSTALLED_CLI" ]]; then
+      printf '0\n'
+    else
+      /usr/bin/stat "$@"
+    fi
+  }
+  install() {
+    local -a forwarded=()
+    while [[ $# -gt 0 ]]; do
+      case $1 in
+        -o|-g) shift 2 ;;
+        *) forwarded+=("$1"); shift ;;
+      esac
+    done
+    /usr/bin/install "${forwarded[@]}"
+  }
+  mktemp() {
+    case $1 in
+      /tmp/a2dpilot-*) /usr/bin/mktemp "$TEST_SCRATCH/${1##*/}" ;;
+      *) /usr/bin/mktemp "$@" ;;
+    esac
+  }
+  curl() {
+    local output_path=''
+    while [[ $# -gt 0 ]]; do
+      if [[ $1 == --output ]]; then output_path=$2; shift 2; else shift; fi
+    done
+    cp "$payload" "$output_path"
+  }
+  systemctl() {
+    local count
+    case $1 in
+      is-active) printf 'active\n' ;;
+      restart)
+        count=$(< "$restart_count")
+        count=$((count + 1))
+        printf '%s\n' "$count" > "$restart_count"
+        (( count > 1 ))
+        ;;
+    esac
+  }
+
+  set +e
+  output=$(update_action 2>&1)
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'failed service activation reported update success'
+  assert_contains "$output" 'updated A2DPilot service did not become active'
+  assert_contains "$output" 'previous A2DPilot executable was restored'
+  assert_file_contains "$INSTALLED_CLI" '# old executable'
+  assert_eq 2 "$(< "$restart_count")"
+  [[ -z $(find "$TEST_SCRATCH" -maxdepth 1 -name 'a2dpilot-update.*' -o \
+    -name 'a2dpilot-previous.*') ]] || fail 'successful rollback retained temporary files'
+
+  printf '#!/usr/bin/env bash\n# old executable\n' > "$INSTALLED_CLI"
+  printf '0\n' > "$restart_count"
+  printf '0\n' > "$atomic_count"
+  atomic_install_file() {
+    local count
+    count=$(< "$atomic_count")
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$atomic_count"
+    (( count < 2 )) || return 1
+    cp "$1" "$2"
+    chmod "$3" "$2"
+  }
+  set +e
+  output=$(update_action 2>&1)
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'failed executable restoration reported success'
+  assert_contains "$output" 'Could not fully restore the previous A2DPilot executable and service'
+  assert_file_contains "$INSTALLED_CLI" '# new executable'
+
+  UPDATE_PREVIOUS=$TEST_SCRATCH/interrupted-previous
+  UPDATE_CANDIDATE=$TEST_SCRATCH/interrupted-candidate
+  printf '#!/usr/bin/env bash\n# interrupted old\n' > "$UPDATE_PREVIOUS"
+  printf '#!/usr/bin/env bash\n# interrupted candidate\n' > "$UPDATE_CANDIDATE"
+  printf '#!/usr/bin/env bash\n# interrupted new\n' > "$INSTALLED_CLI"
+  UPDATE_REPLACED=1
+  UPDATE_WAS_ACTIVE=0
+  atomic_install_file() { cp "$1" "$2"; chmod "$3" "$2"; }
+  set +e
+  output=$(rollback_failed_update 130 'A2DPilot update was interrupted.' 2>&1)
+  rc=$?
+  set -e
+  assert_eq 130 "$rc"
+  assert_contains "$output" 'previous A2DPilot executable was restored'
+  assert_file_contains "$INSTALLED_CLI" '# interrupted old'
+  [[ ! -e $UPDATE_PREVIOUS && ! -e $UPDATE_CANDIDATE ]] || \
+    fail 'interrupted update retained temporary files'
 }
 
 test_config_editor_success_and_validation_failure() {
@@ -1650,6 +1980,10 @@ run_test 'non-interactive install and uninstall fixture' test_noninteractive_ins
 run_test 'uninstall keeps packages and reports empty bond policy' test_uninstall_keeps_packages_and_reports_empty_bond_policy
 run_test 'failed install rollback retains packages' test_failed_install_rollback_retains_packages
 run_test 'install recovery needs no package snapshot' test_install_recovery_needs_no_package_snapshot
+run_test 'update source selection and validation' test_update_source_selection_and_validation
+run_test 'executable-only update transaction' test_update_executable_only_transaction
+run_test 'update rejects bad candidates and targets' test_update_rejects_bad_candidates_and_targets
+run_test 'update activation rollback and interruption' test_update_activation_rollback_and_interruption
 run_test 'safe config editor success and validation failure' test_config_editor_success_and_validation_failure
 run_test 'config editor installs a protected snapshot' test_config_editor_installs_protected_snapshot
 run_test 'failed config application restores previous config' test_config_application_rolls_back

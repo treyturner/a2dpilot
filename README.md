@@ -14,6 +14,7 @@ The project is delivered as one Bash program. The same `a2dpilot` file installs 
 - Automatic codec negotiation through PipeWire, including SBC, SBC-XQ, aptX, aptX HD, and LDAC when supported by the speaker.
 - Configurable media-key routing with broad Linux transport-key coverage, relative volume control, and relative or absolute HTTP(S) player URLs.
 - Safe configuration editing and validation through the CLI.
+- Atomic executable-only updates from `main`, a branch, a tag, or an exact commit.
 - Headless PipeWire/WirePlumber operation using systemd linger.
 - Transactional installation with restoration of files, services, user services, linger, rfkill, and controller state.
 - Optional removal of only the Bluetooth bonds that A2DPilot itself created.
@@ -53,7 +54,7 @@ Managed files are:
 - Bash, APT, dpkg, systemd, logind, and root access through `sudo`.
 - A working Bluetooth Classic adapter supported by the kernel and BlueZ.
 - A Bluetooth speaker that supports A2DP.
-- Network access to configured APT repositories during installation.
+- Network access to configured APT repositories during installation and GitHub during updates.
 - An existing local audio/player user with a real home directory.
 - Plexamp, Caldera Music, or another compatible player already installed for that user.
 - An HTTP GET endpoint for each media key you want A2DPilot to handle; the defaults target a player API at `http://127.0.0.1:32500`.
@@ -101,6 +102,28 @@ curl -fsSL https://raw.githubusercontent.com/treyturner/a2dpilot/main/a2dpilot \
 ```
 
 An unattended installation with no speakers is valid and remains idle until `a2dpilot pair` or `a2dpilot config` is used.
+
+## Updating A2DPilot
+
+Update the installed executable from the latest commit on `main`:
+
+```sh
+sudo a2dpilot update
+```
+
+An update can instead select one branch, tag, or exact commit:
+
+```sh
+sudo a2dpilot update --branch feat/example
+sudo a2dpilot update --tag v1.2.3
+sudo a2dpilot update --sha 0123456789abcdef0123456789abcdef01234567
+```
+
+`--tag`, `--branch`, and `--sha` are mutually exclusive. A SHA must contain all 40 hexadecimal characters. A branch or tag may move; a commit SHA is the immutable choice when an exact revision is required. Selecting an older revision is allowed and may install a version that does not itself provide the `update` command; the streamed installation command can restore a current executable in that case.
+
+Update downloads and syntax-checks the selected Bash program, then atomically replaces only `/usr/local/sbin/a2dpilot`. It does not invoke APT, rewrite `/etc/a2dpilot.conf`, regenerate systemd, WirePlumber, or Triggerhappy files, run `systemctl daemon-reload`, or alter the installation rollback snapshot. If `a2dpilot.service` was active, it is restarted and checked; an inactive service remains inactive. Failed activation restores the previous executable and attempts to restart the previous daemon.
+
+Like streamed installation, updating trusts this repository, GitHub, and the TLS connection. A2DPilot does not currently verify signed releases or a separate checksum manifest.
 
 ## Configuration
 
@@ -287,6 +310,7 @@ aptX Adaptive is not currently exposed by this PipeWire stack. Although the LC3 
 - Triggerhappy receives only validated key names; URL resolution and placeholder expansion happen inside `player-control` immediately before `curl` runs. Stateful volume, mute, shuffle, and repeat mappings first poll the player's music timeline. Systemd recreates `/run/a2dpilot` for Debian's unprivileged Triggerhappy handler; per-player pre-mute volumes stored there expire on reboot.
 - A2DPilot runs Triggerhappy through its direct service and disables the competing socket-activation unit while installed. Uninstall restores the original state of both units.
 - Install records its managed-state rollback snapshot before APT and service mutations. A failed or interrupted installation invokes uninstall automatically; APT-managed packages are retained, and a failed rollback keeps the snapshot for recovery.
+- Update preserves that snapshot and replaces only the installed executable; an active daemon is restarted, while an inactive daemon remains stopped.
 - Pairing happens after installation commits, so a speaker being unavailable does not erase a valid system setup.
 - The system-wide WirePlumber fragment only disables seat monitoring. It deliberately does not override `bluez5.codecs`.
 
