@@ -676,7 +676,13 @@ test_update_executable_only_transaction() {
     "$CONFIG_FILE" "$SYSTEMD_UNIT" \
     "$WIREPLUMBER_CONF" "$TRIGGER_CONF")
   payload=$TEST_SCRATCH/update-payload
-  printf '#!/usr/bin/env bash\n# updated main\n' > "$payload"
+  UPDATE_EXECUTION_LOG=$TEST_SCRATCH/candidate-execution.log
+  export UPDATE_EXECUTION_LOG
+  cat > "$payload" <<'EOF'
+#!/usr/bin/env bash
+printf 'executed\n' >> "$UPDATE_EXECUTION_LOG"
+# updated main
+EOF
 
   require_root() { :; }
   acquire_lock() { printf 'acquire\n' >> "$TEST_SCRATCH/lock.log"; }
@@ -726,8 +732,6 @@ test_update_executable_only_transaction() {
   write_systemd_unit() { fail 'update regenerated its systemd unit'; }
   write_wireplumber_config() { fail 'update regenerated WirePlumber configuration'; }
   write_trigger_config() { fail 'update regenerated Triggerhappy configuration'; }
-  update_daemon_verification_timeout() { printf '60\n'; }
-  verify_updated_daemon() { printf 'verify\n' >> "$TEST_SCRATCH/daemon-verification.log"; }
 
   output=$(update_action)
   assert_contains "$output" "updated successfully from branch 'main'"
@@ -739,6 +743,7 @@ test_update_executable_only_transaction() {
     'https://raw.githubusercontent.com/treyturner/a2dpilot/refs/heads/main/a2dpilot'
   assert_file_contains "$TEST_SCRATCH/install.log" '-o root -g root -m 0755'
   assert_eq 1 "$(grep -Fc 'restart a2dpilot.service' "$TEST_SCRATCH/systemctl.log")"
+  [[ ! -e $UPDATE_EXECUTION_LOG ]] || fail 'update directly executed its downloaded candidate'
 
   : > "$TEST_SCRATCH/systemctl.log"
   output=$(update_action)
@@ -777,7 +782,7 @@ test_update_executable_only_transaction() {
   assert_eq "$before" "$after"
   assert_eq 6 "$(grep -Fc acquire "$TEST_SCRATCH/lock.log")"
   assert_eq 6 "$(grep -Fc release "$TEST_SCRATCH/lock.log")"
-  assert_eq 2 "$(grep -Fc verify "$TEST_SCRATCH/daemon-verification.log")"
+  [[ ! -e $UPDATE_EXECUTION_LOG ]] || fail 'update directly executed an installed candidate'
 }
 
 test_update_rejects_bad_candidates_and_targets() {
@@ -918,8 +923,6 @@ test_update_activation_rollback_and_interruption() {
         ;;
     esac
   }
-  update_daemon_verification_timeout() { printf '60\n'; }
-
   set +e
   output=$(update_action 2>&1)
   rc=$?
@@ -1050,152 +1053,6 @@ test_update_activation_rollback_and_interruption() {
   assert_file_contains "$INSTALLED_CLI" '# old executable before query failure'
   [[ ! -e $TEST_SCRATCH/unexpected-replacement ]] || \
     fail 'indeterminate service state replaced the executable'
-}
-
-test_update_runtime_verification_rollback() {
-  local payload output rc restart_count
-  setup_scratch_dir
-  load_app
-  configure_scratch_paths
-  install -d "$(dirname "$INSTALLED_CLI")"
-  render_state_file "$STATE_FILE" installed
-  printf '#!/usr/bin/env bash\n# old executable\n' > "$INSTALLED_CLI"
-  chmod 0755 "$INSTALLED_CLI"
-  payload=$TEST_SCRATCH/update-payload
-  printf '#!/usr/bin/env bash\n# new executable\n' > "$payload"
-  restart_count=$TEST_SCRATCH/restart-count
-  printf '0\n' > "$restart_count"
-
-  require_root() { :; }
-  acquire_lock() { :; }
-  release_lock() { :; }
-  stat() {
-    if [[ ${1:-} == -c && ${2:-} == %u && ${4:-} == "$INSTALLED_CLI" ]]; then
-      printf '0\n'
-    else
-      /usr/bin/stat "$@"
-    fi
-  }
-  install() {
-    local -a forwarded=()
-    while [[ $# -gt 0 ]]; do
-      case $1 in
-        -o|-g) shift 2 ;;
-        *) forwarded+=("$1"); shift ;;
-      esac
-    done
-    /usr/bin/install "${forwarded[@]}"
-  }
-  mktemp() {
-    case $1 in
-      /tmp/a2dpilot-*) /usr/bin/mktemp "$TEST_SCRATCH/${1##*/}" ;;
-      *) /usr/bin/mktemp "$@" ;;
-    esac
-  }
-  curl() {
-    local output_path=''
-    while [[ $# -gt 0 ]]; do
-      if [[ $1 == --output ]]; then output_path=$2; shift 2; else shift; fi
-    done
-    cp "$payload" "$output_path"
-  }
-  systemctl() {
-    local count
-    case $1 in
-      is-active) printf 'active\n' ;;
-      restart)
-        count=$(< "$restart_count")
-        printf '%s\n' "$((count + 1))" > "$restart_count"
-        ;;
-    esac
-  }
-  update_daemon_verification_timeout() { printf '60\n'; }
-  verify_updated_daemon() {
-    printf 'attempted\n' > "$TEST_SCRATCH/daemon-verification.log"
-    return 1
-  }
-
-  set +e
-  output=$(update_action 2>&1)
-  rc=$?
-  set -e
-  (( rc != 0 )) || fail 'failed daemon runtime verification reported update success'
-  assert_contains "$output" 'daemon failed its first runtime cycle'
-  assert_contains "$output" 'previous A2DPilot executable was restored'
-  assert_file_contains "$TEST_SCRATCH/daemon-verification.log" attempted
-  assert_file_contains "$INSTALLED_CLI" '# old executable'
-  assert_eq 2 "$(< "$restart_count")"
-}
-
-test_update_daemon_verifier_runs_one_iteration() {
-  setup_scratch_dir
-  load_app
-  INSTALLED_CLI=$TEST_SCRATCH/installed-a2dpilot
-  VERIFY_LOG=$TEST_SCRATCH/verification.log
-  VERIFY_SIDE_EFFECT_LOG=$TEST_SCRATCH/side-effects.log
-  VERIFY_PARSE_FAIL=0
-  export VERIFY_LOG
-  export VERIFY_SIDE_EFFECT_LOG
-  export VERIFY_PARSE_FAIL
-  cat > "$INSTALLED_CLI" <<'EOF'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-parse_config() {
-  printf 'parse\n' >> "$VERIFY_LOG"
-  [[ $VERIFY_PARSE_FAIL == 0 ]]
-}
-load_daemon_active() { :; }
-reconcile_runtime_configuration() {
-  printf 'reconcile\n' >> "$VERIFY_SIDE_EFFECT_LOG"
-  exit 90
-}
-power_controller() {
-  printf 'power\n' >> "$VERIFY_SIDE_EFFECT_LOG"
-  exit 91
-}
-daemon_cycle() {
-  printf 'cycle-start\n' >> "$VERIFY_LOG"
-  /usr/bin/sleep 1
-  printf 'cycle-finished\n' >> "$VERIFY_LOG"
-}
-EOF
-  chmod 0755 "$INSTALLED_CLI"
-  UPDATE_TOTAL_TIMEOUT=3
-
-  verify_updated_daemon 3
-  assert_eq $'parse\ncycle-start\ncycle-finished' "$(< "$VERIFY_LOG")"
-  [[ ! -e $VERIFY_SIDE_EFFECT_LOG ]] || \
-    fail 'daemon verification invoked a managed-state or controller reconciliation path'
-
-  : > "$VERIFY_LOG"
-  VERIFY_PARSE_FAIL=1
-  export VERIFY_PARSE_FAIL
-  if verify_updated_daemon 3; then
-    fail 'daemon verification accepted an unparseable configuration'
-  fi
-  assert_eq parse "$(< "$VERIFY_LOG")"
-}
-
-test_update_daemon_verification_timeout_scales() {
-  local user
-  setup_scratch_dir
-  load_app
-  configure_scratch_paths
-  user=$(id -un)
-
-  write_test_config "$CONFIG_FILE" "$user"
-  assert_eq 60 "$(update_daemon_verification_timeout)"
-
-  write_test_config "$CONFIG_FILE" "$user" \
-    AA:BB:CC:DD:EE:01 AA:BB:CC:DD:EE:02 AA:BB:CC:DD:EE:03 \
-    AA:BB:CC:DD:EE:04 AA:BB:CC:DD:EE:05 AA:BB:CC:DD:EE:06 \
-    AA:BB:CC:DD:EE:07
-  assert_eq 130 "$(update_daemon_verification_timeout)"
-
-  printf 'invalid configuration\n' > "$CONFIG_FILE"
-  if update_daemon_verification_timeout >/dev/null; then
-    fail 'verification timeout accepted an invalid configuration'
-  fi
 }
 
 test_config_editor_success_and_validation_failure() {
@@ -2232,9 +2089,6 @@ run_test 'update source selection and validation' test_update_source_selection_a
 run_test 'executable-only update transaction' test_update_executable_only_transaction
 run_test 'update rejects bad candidates and targets' test_update_rejects_bad_candidates_and_targets
 run_test 'update activation rollback and interruption' test_update_activation_rollback_and_interruption
-run_test 'update runtime verification rollback' test_update_runtime_verification_rollback
-run_test 'update daemon verifier runs one iteration' test_update_daemon_verifier_runs_one_iteration
-run_test 'update daemon verification timeout scales' test_update_daemon_verification_timeout_scales
 run_test 'safe config editor success and validation failure' test_config_editor_success_and_validation_failure
 run_test 'config editor installs a protected snapshot' test_config_editor_installs_protected_snapshot
 run_test 'failed config application restores previous config' test_config_application_rolls_back
