@@ -533,6 +533,8 @@ test_noninteractive_install_and_uninstall_fixture() {
   assert_file_contains "$TEST_SCRATCH/systemctl.log" \
     'unmask bluetooth.service triggerhappy.socket triggerhappy.service a2dpilot.service'
   assert_file_contains "$TEST_SCRATCH/systemctl.log" \
+    'unmask --runtime bluetooth.service triggerhappy.socket triggerhappy.service a2dpilot.service'
+  assert_file_contains "$TEST_SCRATCH/systemctl.log" \
     'disable --now triggerhappy.socket'
   assert_file_contains "$TEST_SCRATCH/systemctl.log" \
     'enable --now bluetooth.service triggerhappy.service a2dpilot.service'
@@ -1372,7 +1374,9 @@ test_audio_user_units_are_unmasked_before_enablement() {
   ensure_audio_user "$user"
   assert_file_contains "$TEST_SCRATCH/user-systemctl.log" \
     "$user unmask pipewire.socket pipewire.service pipewire-pulse.socket pipewire-pulse.service wireplumber.service"
-  unmask_line=$(grep -n ' unmask ' "$TEST_SCRATCH/user-systemctl.log" | cut -d: -f1)
+  assert_file_contains "$TEST_SCRATCH/user-systemctl.log" \
+    "$user unmask --runtime pipewire.socket pipewire.service pipewire-pulse.socket pipewire-pulse.service wireplumber.service"
+  unmask_line=$(grep -n ' unmask ' "$TEST_SCRATCH/user-systemctl.log" | cut -d: -f1 | head -n 1)
   enable_line=$(grep -n ' enable --now ' "$TEST_SCRATCH/user-systemctl.log" | cut -d: -f1)
   (( unmask_line < enable_line )) || fail 'user units were enabled before being unmasked'
 
@@ -1380,10 +1384,11 @@ test_audio_user_units_are_unmasked_before_enablement() {
   expected=$TEST_SCRATCH/expected-user-restore
   cat > "$expected" <<EOF
 $user unmask masked-user.service
+$user unmask --runtime masked-user.service
 $user start masked-user.service
 $user mask masked-user.service
 EOF
-  tail -n 3 "$TEST_SCRATCH/user-systemctl.log" | diff -u "$expected" -
+  tail -n 4 "$TEST_SCRATCH/user-systemctl.log" | diff -u "$expected" -
 }
 
 test_user_unit_enablement_restores_sockets_last() {
@@ -1430,24 +1435,34 @@ EOF
   expected=$TEST_SCRATCH/expected-user-restore
   cat > "$expected" <<EOF
 $user unmask pipewire.socket
+$user unmask --runtime pipewire.socket
 $user stop pipewire.socket
 $user unmask pipewire.service
+$user unmask --runtime pipewire.service
 $user stop pipewire.service
 $user unmask pipewire-pulse.socket
+$user unmask --runtime pipewire-pulse.socket
 $user stop pipewire-pulse.socket
 $user unmask pipewire-pulse.service
+$user unmask --runtime pipewire-pulse.service
 $user stop pipewire-pulse.service
 $user unmask wireplumber.service
+$user unmask --runtime wireplumber.service
 $user stop wireplumber.service
 $user unmask pipewire.service
+$user unmask --runtime pipewire.service
 $user enable pipewire.service
 $user unmask pipewire.socket
+$user unmask --runtime pipewire.socket
 $user disable pipewire.socket
 $user unmask pipewire-pulse.service
+$user unmask --runtime pipewire-pulse.service
 $user enable pipewire-pulse.service
 $user unmask pipewire-pulse.socket
+$user unmask --runtime pipewire-pulse.socket
 $user disable pipewire-pulse.socket
 $user unmask wireplumber.service
+$user unmask --runtime wireplumber.service
 $user disable wireplumber.service
 EOF
   diff -u "$expected" "$TEST_SCRATCH/user-systemctl.log"
@@ -1653,20 +1668,26 @@ EOF
   expected=$TEST_SCRATCH/expected
   cat > "$expected" <<'EOF'
 unmask enabled.service
+unmask --runtime enabled.service
 enable enabled.service
 start enabled.service
 unmask disabled.service
+unmask --runtime disabled.service
 disable disabled.service
 stop disabled.service
 unmask static.service
+unmask --runtime static.service
 start static.service
 unmask masked.service
+unmask --runtime masked.service
 mask masked.service
 stop masked.service
 unmask active-masked.service
+unmask --runtime active-masked.service
 start active-masked.service
 mask active-masked.service
 unmask runtime-masked.service
+unmask --runtime runtime-masked.service
 start runtime-masked.service
 mask --runtime runtime-masked.service
 EOF
@@ -1712,9 +1733,11 @@ EOF
   cat > "$expected" <<'EOF'
 stop triggerhappy.service
 unmask triggerhappy.socket
+unmask --runtime triggerhappy.socket
 enable triggerhappy.socket
 start triggerhappy.socket
 unmask triggerhappy.service
+unmask --runtime triggerhappy.service
 enable triggerhappy.service
 restart triggerhappy.service
 EOF
