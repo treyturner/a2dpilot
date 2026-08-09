@@ -2225,7 +2225,9 @@ install_action() {
     case $existing_phase in
       installing|failed)
         note "Recovering interrupted installation before retrying..."
-        record_new_packages || die "Could not determine which packages were added during the interrupted installation."
+        if [[ $existing_phase == installing ]]; then
+          record_new_packages || die "Could not determine which packages were added during the interrupted installation."
+        fi
         release_lock
         "$SCRIPT_PATH" uninstall --keep-bonds --with-dependencies || die "Could not recover the interrupted installation."
         acquire_lock

@@ -623,6 +623,37 @@ EOF
   assert_file_contains "$ROLLBACK_LOG" 'uninstall --keep-bonds --with-dependencies'
 }
 
+test_failed_state_recovery_preserves_recorded_packages() {
+  local lock_calls=0 mock
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  printf 'INSTALL_PHASE=failed\n' > "$STATE_FILE"
+  printf 'recorded-dependency\n' > "$STATE_DIR/new-packages"
+  mock=$TEST_SCRATCH/uninstall-mock
+  cat > "$mock" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" > "$RECOVERY_LOG"
+EOF
+  chmod +x "$mock"
+  RECOVERY_LOG=$TEST_SCRATCH/recovery.log
+  export RECOVERY_LOG
+  SCRIPT_PATH=$mock
+  require_root() { :; }
+  acquire_lock() {
+    lock_calls=$((lock_calls + 1))
+    (( lock_calls == 1 )) || die "recovery checkpoint"
+  }
+  release_lock() { :; }
+  record_new_packages() { : > "$TEST_SCRATCH/recomputed-packages"; }
+
+  expect_failure_contains 'recovery checkpoint' install_action --non-interactive
+  [[ ! -e $TEST_SCRATCH/recomputed-packages ]] || \
+    fail 'failed-state recovery recomputed package provenance'
+  assert_file_contains "$RECOVERY_LOG" 'uninstall --keep-bonds --with-dependencies'
+  assert_file_contains "$STATE_DIR/new-packages" 'recorded-dependency'
+}
+
 test_config_editor_success_and_validation_failure() {
   local user candidate before output rc
   setup_scratch_dir
@@ -1548,6 +1579,7 @@ run_test 'non-interactive install and uninstall fixture' test_noninteractive_ins
 run_test 'APT transaction package tracking' test_package_transaction_tracking
 run_test 'opt-in dependency removal and empty bond policy' test_uninstall_dependency_and_empty_bond_policy
 run_test 'failed install rollback removes dependencies' test_failed_install_rollback_removes_dependencies
+run_test 'failed-state recovery preserves package provenance' test_failed_state_recovery_preserves_recorded_packages
 run_test 'safe config editor success and validation failure' test_config_editor_success_and_validation_failure
 run_test 'config editor installs a protected snapshot' test_config_editor_installs_protected_snapshot
 run_test 'failed config application restores previous config' test_config_application_rolls_back
