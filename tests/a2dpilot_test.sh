@@ -1129,8 +1129,10 @@ test_update_daemon_verifier_runs_one_iteration() {
   load_app
   INSTALLED_CLI=$TEST_SCRATCH/installed-a2dpilot
   VERIFY_LOG=$TEST_SCRATCH/verification.log
+  VERIFY_SIDE_EFFECT_LOG=$TEST_SCRATCH/side-effects.log
   VERIFY_PARSE_FAIL=0
   export VERIFY_LOG
+  export VERIFY_SIDE_EFFECT_LOG
   export VERIFY_PARSE_FAIL
   cat > "$INSTALLED_CLI" <<'EOF'
 #!/usr/bin/env bash
@@ -1140,6 +1142,14 @@ parse_config() {
   [[ $VERIFY_PARSE_FAIL == 0 ]]
 }
 load_daemon_active() { :; }
+reconcile_runtime_configuration() {
+  printf 'reconcile\n' >> "$VERIFY_SIDE_EFFECT_LOG"
+  exit 90
+}
+power_controller() {
+  printf 'power\n' >> "$VERIFY_SIDE_EFFECT_LOG"
+  exit 91
+}
 daemon_cycle() {
   printf 'cycle-start\n' >> "$VERIFY_LOG"
   /usr/bin/sleep 1
@@ -1151,6 +1161,8 @@ EOF
 
   verify_updated_daemon
   assert_eq $'parse\ncycle-start\ncycle-finished' "$(< "$VERIFY_LOG")"
+  [[ ! -e $VERIFY_SIDE_EFFECT_LOG ]] || \
+    fail 'daemon verification invoked a managed-state or controller reconciliation path'
 
   : > "$VERIFY_LOG"
   VERIFY_PARSE_FAIL=1

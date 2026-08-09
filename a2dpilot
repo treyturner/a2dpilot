@@ -2286,6 +2286,8 @@ restore_previous_update() {
 }
 
 verify_updated_daemon() {
+  # Do not call daemon_action here: its reconciliation path can rewrite
+  # managed integration files that an executable-only update must not touch.
   timeout --signal=TERM --kill-after=1 "$UPDATE_TOTAL_TIMEOUT" bash -c '
     source /proc/self/fd/3
     parse_config /etc/a2dpilot.conf || exit 1
