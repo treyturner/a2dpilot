@@ -653,7 +653,7 @@ test_update_source_selection_and_validation() {
 }
 
 test_update_executable_only_transaction() {
-  local payload output before after service_active=1 target_owner=0
+  local payload output before after service_active=1 target_owner=0 target_group=0 target_mode=755
   local upper_sha=ABCDEF0123456789ABCDEF0123456789ABCDEF01
   setup_scratch_dir
   load_app
@@ -682,8 +682,13 @@ test_update_executable_only_transaction() {
   acquire_lock() { printf 'acquire\n' >> "$TEST_SCRATCH/lock.log"; }
   release_lock() { printf 'release\n' >> "$TEST_SCRATCH/lock.log"; }
   stat() {
-    if [[ ${1:-} == -c && ${2:-} == %u && ${4:-} == "$INSTALLED_CLI" ]]; then
-      printf '%s\n' "$target_owner"
+    if [[ ${1:-} == -c && ${4:-} == "$INSTALLED_CLI" ]]; then
+      case $2 in
+        %u) printf '%s\n' "$target_owner" ;;
+        %g) printf '%s\n' "$target_group" ;;
+        %a) printf '%s\n' "$target_mode" ;;
+        *) /usr/bin/stat "$@" ;;
+      esac
     else
       /usr/bin/stat "$@"
     fi
@@ -738,6 +743,16 @@ test_update_executable_only_transaction() {
   assert_contains "$output" "already current for branch 'main'"
   [[ ! -s $TEST_SCRATCH/systemctl.log ]] || fail 'no-op update restarted the service'
 
+  target_group=1234
+  target_mode=644
+  output=$(update_action)
+  assert_contains "$output" "updated successfully from branch 'main'"
+  assert_eq 755 "$(/usr/bin/stat -c %a "$INSTALLED_CLI")"
+  assert_eq 1 "$(grep -Fc 'restart a2dpilot.service' "$TEST_SCRATCH/systemctl.log")"
+  target_group=0
+  target_mode=755
+  : > "$TEST_SCRATCH/systemctl.log"
+
   service_active=0
   printf '#!/usr/bin/env bash\n# updated branch\n' > "$payload"
   update_action --branch feat/update_command >/dev/null
@@ -758,8 +773,8 @@ test_update_executable_only_transaction() {
     "$CONFIG_FILE" "$SYSTEMD_UNIT" \
     "$WIREPLUMBER_CONF" "$TRIGGER_CONF")
   assert_eq "$before" "$after"
-  assert_eq 5 "$(grep -Fc acquire "$TEST_SCRATCH/lock.log")"
-  assert_eq 5 "$(grep -Fc release "$TEST_SCRATCH/lock.log")"
+  assert_eq 6 "$(grep -Fc acquire "$TEST_SCRATCH/lock.log")"
+  assert_eq 6 "$(grep -Fc release "$TEST_SCRATCH/lock.log")"
 }
 
 test_update_rejects_bad_candidates_and_targets() {

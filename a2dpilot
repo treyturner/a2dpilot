@@ -684,6 +684,12 @@ validate_update_target() {
   }
 }
 
+update_target_metadata_current() {
+  [[ $(stat -c %u -- "$INSTALLED_CLI") == 0 &&
+     $(stat -c %g -- "$INSTALLED_CLI") == 0 &&
+     $(stat -c %a -- "$INSTALLED_CLI") == 755 ]]
+}
+
 user_home() {
   getent passwd "$1" | cut -d: -f6
 }
@@ -2347,7 +2353,7 @@ update_action() {
   validate_update_target || \
     rollback_failed_update 1 "The installed executable became unsafe during the update."
 
-  if cmp -s -- "$UPDATE_CANDIDATE" "$INSTALLED_CLI"; then
+  if cmp -s -- "$UPDATE_CANDIDATE" "$INSTALLED_CLI" && update_target_metadata_current; then
     trap '' INT TERM
     cleanup_update_temps
     release_lock
