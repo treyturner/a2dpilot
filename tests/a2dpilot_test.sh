@@ -858,7 +858,7 @@ test_update_rejects_bad_candidates_and_targets() {
 }
 
 test_update_activation_rollback_and_interruption() {
-  local payload output rc restart_count atomic_count test_signal=TERM retained_previous
+  local payload output rc restart_count atomic_count test_signal=TERM second_signal=INT retained_previous
   setup_scratch_dir
   load_app
   configure_scratch_paths
@@ -976,6 +976,8 @@ test_update_activation_rollback_and_interruption() {
     chmod "$3" "$2"
     if (( count == 1 )); then
       kill "-$test_signal" "$BASHPID"
+    elif (( count == 2 )); then
+      kill "-$second_signal" "$BASHPID"
     fi
   }
   set +e

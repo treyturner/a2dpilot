@@ -2301,7 +2301,7 @@ verify_updated_daemon() {
 
 rollback_failed_update() {
   local rc=$1 message=$2 restored=1 retained_previous=
-  trap - HUP INT TERM
+  trap '' HUP INT TERM
   printf 'ERROR: %s\n' "$message" >&2
   if (( UPDATE_REPLACED )); then
     note "Restoring the previous A2DPilot executable..."
