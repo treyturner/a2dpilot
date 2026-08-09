@@ -555,7 +555,7 @@ test_noninteractive_install_and_uninstall_fixture() {
 }
 
 test_package_transaction_tracking() {
-  local output mock_bin
+  local output mock_bin rc
   setup_scratch_dir
   load_app
   configure_scratch_paths
@@ -604,6 +604,19 @@ EOF
   assert_file_not_contains "$STATE_DIR/new-packages" 'base-package'
   assert_file_not_contains "$STATE_DIR/new-packages" 'partial-before'
   assert_file_not_contains "$STATE_DIR/new-packages" 'unrelated-during-update'
+
+  cat > "$mock_bin/dpkg-query" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+  chmod +x "$mock_bin/dpkg-query"
+  rm -f -- "$STATE_DIR/packages-before" "$STATE_DIR/packages-after"
+  set +e
+  PATH=$mock_bin:$PATH "$STATE_DIR/package-snapshot-hook" before
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'failed dpkg-query produced a package snapshot'
+  [[ ! -e $STATE_DIR/packages-before ]] || fail 'failed package snapshot was installed'
 }
 
 test_uninstall_dependency_and_empty_bond_policy() {

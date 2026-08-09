@@ -2192,12 +2192,20 @@ state_dir=${0%/*}
 
 snapshot_packages() {
   name=$1
+  raw=
+  filtered=
+  candidate=
+  trap 'rm -f -- "$raw" "$filtered" "$candidate"' EXIT HUP INT TERM
+  raw=$(mktemp "$state_dir/.$name.raw.XXXXXX")
+  filtered=$(mktemp "$state_dir/.$name.filtered.XXXXXX")
   candidate=$(mktemp "$state_dir/.$name.XXXXXX")
-  trap 'rm -f -- "$candidate"' EXIT HUP INT TERM
-  dpkg-query -W -f='${binary:Package}\t${db:Status-Abbrev}\n' 2>/dev/null |
-    awk -F '\t' 'length($2) >= 2 && substr($2, 2, 1) !~ /^[nc]$/ { print $1 }' |
-    LC_ALL=C sort -u > "$candidate"
+  dpkg-query -W -f='${binary:Package}\t${db:Status-Abbrev}\n' > "$raw" 2>/dev/null
+  awk -F '\t' 'length($2) >= 2 && substr($2, 2, 1) !~ /^[nc]$/ { print $1 }' \
+    "$raw" > "$filtered"
+  LC_ALL=C sort -u "$filtered" > "$candidate"
   mv -f -- "$candidate" "$state_dir/$name"
+  candidate=
+  rm -f -- "$raw" "$filtered"
   trap - EXIT HUP INT TERM
 }
 
