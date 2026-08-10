@@ -144,6 +144,7 @@ test_syntax_help_and_stream_bootstrap() {
   assert_eq "$local_help" "$streamed_help"
   assert_contains "$local_help" 'a2dpilot install [--user USER] [--non-interactive]'
   assert_contains "$local_help" 'a2dpilot config [--check]'
+  assert_contains "$local_help" 'a2dpilot audio onboard disable [analog | hdmi | all]'
   assert_contains "$local_help" 'a2dpilot update [--tag TAG | --branch BRANCH | --sha SHA]'
   assert_contains "$local_help" 'uninstall [--keep-bonds | --remove-bonds]'
   assert_not_contains "$local_help" '--with-dependencies'
@@ -197,6 +198,8 @@ test_config_parser_and_normalization() {
   assert_eq AA:BB:CC:DD:EE:01 "$CFG_CONTROLLER"
   assert_eq 9 "$CFG_RECONNECT_INTERVAL"
   assert_eq required "$CFG_MEDIA_CONTROLS"
+  assert_eq enabled "$CFG_ONBOARD_ANALOG"
+  assert_eq enabled "$CFG_ONBOARD_HDMI"
   assert_eq https://player.example:32500/api "$CFG_BASE_URL"
   assert_eq KEY_NEXTSONG "${CFG_MEDIA_KEYS[0]}"
   assert_eq '/next?request={command-id}' "${CFG_MEDIA_URLS[0]}"
@@ -204,6 +207,38 @@ test_config_parser_and_normalization() {
   assert_eq 'https://other.example/play?literal=yes' "${CFG_MEDIA_URLS[1]}"
   assert_eq AA:BB:CC:DD:EE:FF "${CFG_SPEAKERS[0]}"
   assert_eq 10:20:30:40:50:60 "${CFG_SPEAKERS[1]}"
+}
+
+test_onboard_audio_configuration() {
+  local user
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+
+  write_test_config "$CONFIG_FILE" "$user" AA:BB:CC:DD:EE:FF
+  parse_config "$CONFIG_FILE"
+  assert_eq enabled "$CFG_ONBOARD_ANALOG"
+  assert_eq enabled "$CFG_ONBOARD_HDMI"
+
+  printf 'onboard-analog = disabled\nonboard-hdmi = disabled\n' >> "$CONFIG_FILE"
+  parse_config "$CONFIG_FILE"
+  assert_eq disabled "$CFG_ONBOARD_ANALOG"
+  assert_eq disabled "$CFG_ONBOARD_HDMI"
+  assert_eq AA:BB:CC:DD:EE:FF "${CFG_SPEAKERS[0]}"
+
+  printf 'onboard-analog = enabled\n' >> "$CONFIG_FILE"
+  if parse_config "$CONFIG_FILE"; then fail 'duplicate onboard-analog was accepted'; fi
+  assert_contains "$CONFIG_ERROR" 'duplicate setting: onboard-analog'
+
+  write_test_config "$CONFIG_FILE" "$user"
+  printf 'onboard-hdmi = hidden\n' >> "$CONFIG_FILE"
+  if parse_config "$CONFIG_FILE"; then fail 'invalid onboard-hdmi policy was accepted'; fi
+  assert_contains "$CONFIG_ERROR" 'onboard-hdmi must be enabled or disabled'
+
+  write_default_config "$CONFIG_FILE" "$user"
+  assert_file_contains "$CONFIG_FILE" 'onboard-analog = enabled'
+  assert_file_contains "$CONFIG_FILE" 'onboard-hdmi = enabled'
 }
 
 test_default_media_key_mappings() {
@@ -436,6 +471,7 @@ test_generated_integration_files() {
   write_trigger_config "$TRIGGER_CONF" auto
   write_systemd_unit "$SYSTEMD_UNIT"
   assert_file_contains "$WIREPLUMBER_CONF" 'monitor.bluez.seat-monitoring = disabled'
+  assert_file_not_contains "$WIREPLUMBER_CONF" 'monitor.alsa.rules'
   assert_file_not_contains "$WIREPLUMBER_CONF" 'bluez5.codecs'
   assert_file_contains "$TRIGGER_CONF" 'a2dpilot player-control KEY_NEXTSONG'
   assert_file_contains "$TRIGGER_CONF" 'a2dpilot player-control KEY_PREVIOUSSONG'
@@ -449,6 +485,21 @@ test_generated_integration_files() {
   assert_file_contains "$SYSTEMD_UNIT" "-m 0700 $MEDIA_STATE_DIR"
   assert_file_contains "$SYSTEMD_UNIT" 'Before=triggerhappy.service'
 
+  CFG_ONBOARD_ANALOG=disabled
+  CFG_ONBOARD_HDMI=enabled
+  write_wireplumber_config "$WIREPLUMBER_CONF"
+  assert_file_contains "$WIREPLUMBER_CONF" 'monitor.alsa.rules'
+  assert_file_contains "$WIREPLUMBER_CONF" 'device.form-factor = "internal"'
+  assert_file_contains "$WIREPLUMBER_CONF" 'api.alsa.card.name = "~bcm2835.*"'
+  assert_file_contains "$WIREPLUMBER_CONF" 'device.disabled = true'
+  assert_file_not_contains "$WIREPLUMBER_CONF" 'vc4-hdmi'
+  assert_file_not_contains "$WIREPLUMBER_CONF" 'bluez5.codecs'
+
+  CFG_ONBOARD_HDMI=disabled
+  write_wireplumber_config "$WIREPLUMBER_CONF"
+  assert_file_contains "$WIREPLUMBER_CONF" 'api.alsa.card.name = "~bcm2835.*"'
+  assert_file_contains "$WIREPLUMBER_CONF" 'api.alsa.card.name = "~vc4-hdmi.*"'
+
   write_trigger_config "$TRIGGER_CONF" off
   assert_file_contains "$TRIGGER_CONF" 'media controls are disabled'
   assert_file_not_contains "$TRIGGER_CONF" 'KEY_NEXTSONG'
@@ -457,6 +508,29 @@ test_generated_integration_files() {
   CFG_MEDIA_URLS=()
   write_trigger_config "$TRIGGER_CONF" required
   assert_file_contains "$TRIGGER_CONF" 'no media-key mappings are configured'
+}
+
+test_wireplumber_config_path_safety() {
+  local parent redirected
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  parent=$(dirname "$WIREPLUMBER_CONF")
+  redirected=$TEST_SCRATCH/redirected-wireplumber-config
+  install -d "$(dirname "$parent")" "$redirected"
+  ln -s "$redirected" "$parent"
+  as_user_systemctl() { fail 'unsafe WirePlumber config restarted WirePlumber'; }
+
+  expect_failure_contains 'Refusing to traverse symlinked directory' apply_wireplumber_config
+  [[ -z $(find "$redirected" -mindepth 1 -print -quit) ]] || \
+    fail 'apply_wireplumber_config wrote through its symlinked parent'
+
+  unlink "$parent"
+  install -d "$parent"
+  ln -s "$redirected/target" "$WIREPLUMBER_CONF"
+  expect_failure_contains '' apply_wireplumber_config
+  [[ ! -e $redirected/target ]] || \
+    fail 'apply_wireplumber_config wrote through its symlinked target'
 }
 
 test_trigger_config_rejects_symlinked_parent() {
@@ -1203,6 +1277,185 @@ test_config_application_rolls_back() {
   cmp -s "$before" "$CONFIG_FILE" || fail 'application rollback did not restore exact config'
 }
 
+test_onboard_audio_cli_and_application() {
+  local user output
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  write_test_config "$CONFIG_FILE" "$user" AA:BB:CC:DD:EE:FF
+  : > "$STATE_FILE"
+  install -d "$(dirname "$WIREPLUMBER_CONF")"
+  parse_config "$CONFIG_FILE"
+  write_wireplumber_config "$WIREPLUMBER_CONF"
+
+  require_root() { :; }
+  acquire_lock() { :; }
+  release_lock() { :; }
+  atomic_install_file() { cp "$1" "$2"; chmod "$3" "$2"; }
+  reconcile_runtime_configuration() { apply_wireplumber_config; }
+  as_user_systemctl() { printf '%s\n' "$*" >> "$TEST_SCRATCH/user-systemctl.log"; }
+  systemctl() { printf '%s\n' "$*" >> "$TEST_SCRATCH/systemctl.log"; }
+
+  audio_onboard_action disable analog
+  parse_config "$CONFIG_FILE"
+  assert_eq disabled "$CFG_ONBOARD_ANALOG"
+  assert_eq enabled "$CFG_ONBOARD_HDMI"
+  assert_eq AA:BB:CC:DD:EE:FF "${CFG_SPEAKERS[0]}"
+  assert_file_contains "$WIREPLUMBER_CONF" 'api.alsa.card.name = "~bcm2835.*"'
+  assert_file_not_contains "$WIREPLUMBER_CONF" 'vc4-hdmi'
+
+  audio_onboard_action disable
+  parse_config "$CONFIG_FILE"
+  assert_eq disabled "$CFG_ONBOARD_ANALOG"
+  assert_eq disabled "$CFG_ONBOARD_HDMI"
+  assert_file_contains "$WIREPLUMBER_CONF" 'api.alsa.card.name = "~vc4-hdmi.*"'
+
+  audio_onboard_action enable hdmi
+  parse_config "$CONFIG_FILE"
+  assert_eq disabled "$CFG_ONBOARD_ANALOG"
+  assert_eq enabled "$CFG_ONBOARD_HDMI"
+  assert_file_not_contains "$WIREPLUMBER_CONF" 'vc4-hdmi'
+
+  output=$(audio_onboard_action enable hdmi)
+  assert_contains "$output" 'already current'
+  expect_failure_contains 'Unknown onboard-audio target' audio_onboard_action disable usb
+  expect_failure_contains 'Unknown onboard-audio operation' audio_onboard_action toggle analog
+  assert_file_contains "$TEST_SCRATCH/user-systemctl.log" "$user restart wireplumber.service"
+  assert_file_contains "$TEST_SCRATCH/systemctl.log" 'restart a2dpilot.service'
+}
+
+test_onboard_audio_application_rolls_back() {
+  local user before output rc restart_count=0
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  write_test_config "$CONFIG_FILE" "$user" AA:BB:CC:DD:EE:FF
+  before=$TEST_SCRATCH/config-before
+  cp "$CONFIG_FILE" "$before"
+  : > "$STATE_FILE"
+  install -d "$(dirname "$WIREPLUMBER_CONF")"
+  parse_config "$CONFIG_FILE"
+  write_wireplumber_config "$WIREPLUMBER_CONF"
+
+  require_root() { :; }
+  acquire_lock() { :; }
+  release_lock() { :; }
+  atomic_install_file() { cp "$1" "$2"; chmod "$3" "$2"; }
+  reconcile_runtime_configuration() { apply_wireplumber_config; }
+  as_user_systemctl() { printf '%s\n' "$*" >> "$TEST_SCRATCH/user-systemctl.log"; }
+  systemctl() {
+    if [[ $* == 'restart a2dpilot.service' ]]; then
+      restart_count=$((restart_count + 1))
+      (( restart_count > 1 ))
+    fi
+  }
+
+  set +e
+  output=$(audio_onboard_action disable analog 2>&1)
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'fault-injected onboard policy application unexpectedly succeeded'
+  assert_contains "$output" 'previous configuration was restored'
+  cmp -s "$before" "$CONFIG_FILE" || fail 'onboard policy rollback did not restore exact config'
+  assert_file_not_contains "$WIREPLUMBER_CONF" 'monitor.alsa.rules'
+  assert_eq 2 "$(wc -l < "$TEST_SCRATCH/user-systemctl.log")"
+}
+
+test_onboard_audio_status_and_matching() {
+  local user output
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  write_test_config "$CONFIG_FILE" "$user"
+  parse_config "$CONFIG_FILE"
+  bounded_user_pw_cli() {
+    if [[ $3 == ls ]]; then
+      cat <<'EOF'
+	id 48, type PipeWire:Interface:Device/3
+		device.api = "alsa"
+		media.class = "Audio/Device"
+	id 49, type PipeWire:Interface:Device/3
+		device.api = "alsa"
+		media.class = "Audio/Device"
+	id 50, type PipeWire:Interface:Device/3
+		device.api = "alsa"
+		media.class = "Audio/Device"
+	id 51, type PipeWire:Interface:Device/3
+		device.api = "alsa"
+		media.class = "Audio/Device"
+	id 52, type PipeWire:Interface:Device/3
+		device.api = "v4l2"
+		media.class = "Video/Device"
+EOF
+      return 0
+    fi
+    case $4 in
+      48) cat <<'EOF'
+	id: 48
+	type: PipeWire:Interface:Device/3
+*		api.alsa.card.name = "bcm2835 Headphones"
+*		device.api = "alsa"
+*		device.form-factor = "internal"
+*		media.class = "Audio/Device"
+EOF
+        ;;
+      49) cat <<'EOF'
+	id: 49
+	type: PipeWire:Interface:Device/3
+*		api.alsa.card.name = "vc4-hdmi"
+*		device.api = "alsa"
+*		device.form-factor = "internal"
+*		media.class = "Audio/Device"
+EOF
+        ;;
+      50) cat <<'EOF'
+	id: 50
+	type: PipeWire:Interface:Device/3
+*		api.alsa.card.name = "bcm2835 USB impostor"
+*		device.api = "alsa"
+*		device.form-factor = "external"
+*		media.class = "Audio/Device"
+EOF
+        ;;
+      51) cat <<'EOF'
+	id: 51
+	type: PipeWire:Interface:Device/3
+*		api.alsa.card.name = "snd_rpi_hifiberry_dacplus"
+*		device.api = "alsa"
+*		device.form-factor = "internal"
+*		media.class = "Audio/Device"
+EOF
+        ;;
+    esac
+  }
+
+  visible_onboard_devices
+  assert_eq 1 "$ONBOARD_ANALOG_VISIBLE"
+  assert_eq 1 "$ONBOARD_HDMI_VISIBLE"
+  output=$(print_onboard_audio_status all)
+  assert_contains "$output" 'Onboard analog: enabled (1 visible matching devices)'
+  assert_contains "$output" 'Onboard HDMI: enabled (1 visible matching devices)'
+
+  bounded_user_pw_cli() {
+    if [[ $3 == ls ]]; then
+      printf '\tid 48, type PipeWire:Interface:Device/3\n\t\tdevice.api = "alsa"\n\t\tmedia.class = "Audio/Device"\n'
+    else
+      printf '\tid: 999\n\ttype: PipeWire:Interface:Device/3\n'
+    fi
+  }
+  if visible_onboard_devices; then fail 'malformed PipeWire device details were accepted'; fi
+  output=$(print_onboard_audio_status analog)
+  assert_contains "$output" 'unknown visible matching devices'
+
+  bounded_user_pw_cli() { :; }
+  output=$(print_onboard_audio_status all)
+  assert_contains "$output" 'Onboard analog: enabled (0 visible matching devices)'
+  assert_contains "$output" 'Onboard HDMI: enabled (0 visible matching devices)'
+}
+
 test_player_control_resolves_configured_urls() {
   local user mock_bin output rc mapped_url first_id second_id
   setup_scratch_dir
@@ -1514,9 +1767,12 @@ test_status_reports_media_url_configuration() {
   rfkill() { :; }
   systemctl() { :; }
   as_user_systemctl() { :; }
+  bounded_user_pw_cli() { :; }
   output=$(status_action)
   assert_contains "$output" 'Base URL: http://127.0.0.1:32500'
   assert_contains "$output" 'Media key mappings: 4'
+  assert_contains "$output" 'Onboard analog: enabled (0 visible matching devices)'
+  assert_contains "$output" 'Onboard HDMI: enabled (0 visible matching devices)'
 }
 
 test_pairing_provenance_and_existing_bond() {
@@ -2235,12 +2491,14 @@ EOF
 run_test 'syntax, help, and streamed bootstrap' test_syntax_help_and_stream_bootstrap
 run_test 'managed dependency list' test_managed_package_list
 run_test 'configuration parsing and normalization' test_config_parser_and_normalization
+run_test 'onboard-audio configuration and defaults' test_onboard_audio_configuration
 run_test 'default media-key mappings' test_default_media_key_mappings
 run_test 'configuration rejection and non-evaluation' test_config_parser_rejections_and_no_eval
 run_test 'invalid reload retains last valid configuration' test_invalid_reload_retains_last_valid_configuration
 run_test 'config parser avoids legacy subshell helpers' test_config_parser_avoids_legacy_subshell_helpers
 run_test 'media URL configuration validation' test_media_url_configuration_validation
 run_test 'generated system integration files' test_generated_integration_files
+run_test 'WirePlumber config path safety' test_wireplumber_config_path_safety
 run_test 'Triggerhappy config rejects symlinked parent' test_trigger_config_rejects_symlinked_parent
 run_test 'non-interactive install and uninstall fixture' test_noninteractive_install_and_uninstall_fixture
 run_test 'uninstall keeps packages and reports empty bond policy' test_uninstall_keeps_packages_and_reports_empty_bond_policy
@@ -2253,6 +2511,9 @@ run_test 'update activation rollback and interruption' test_update_activation_ro
 run_test 'safe config editor success and validation failure' test_config_editor_success_and_validation_failure
 run_test 'config editor installs a protected snapshot' test_config_editor_installs_protected_snapshot
 run_test 'failed config application restores previous config' test_config_application_rolls_back
+run_test 'onboard-audio CLI and live application' test_onboard_audio_cli_and_application
+run_test 'failed onboard-audio application rolls back' test_onboard_audio_application_rolls_back
+run_test 'onboard-audio status and device matching' test_onboard_audio_status_and_matching
 run_test 'player control resolves configured URLs' test_player_control_resolves_configured_urls
 run_test 'media controls share one deadline' test_media_control_shared_deadline
 run_test 'media controls use a monotonic outer bound' test_media_control_monotonic_outer_bound
