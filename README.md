@@ -11,6 +11,7 @@ The project is delivered as one Bash program. The same `a2dpilot` file installs 
 - Non-preemptive failover: a working fallback is not interrupted merely because a preferred speaker reappears.
 - Automatic controller soft-unblock and power-on at boot and after adapter loss.
 - BlueZ, PipeWire A2DP, and optional AVRCP health checks.
+- Deterministic default-sink selection and live playback-stream routing to the active speaker.
 - Automatic PipeWire codec negotiation by default, with optional ordered codec preferences for each speaker.
 - Responsive media-key routing with broad Linux transport-key coverage, relative volume control, configurable HTTP(S) URLs, and one bounded action deadline.
 - Reversible live suppression of Raspberry Pi onboard analogue and HDMI audio devices without disabling HDMI video.
@@ -46,7 +47,7 @@ Managed files are:
 | `/etc/systemd/system/a2dpilot.service`                 | Connection-maintenance daemon                                                     |
 | `/etc/wireplumber/wireplumber.conf.d/51-a2dpilot.conf` | Headless Bluetooth policy and optional Raspberry Pi onboard-audio suppression     |
 | `/etc/triggerhappy/triggers.d/a2dpilot.conf`           | Media-key mappings, or an inert file when controls are disabled                   |
-| `/var/lib/a2dpilot/`                                   | Root-only backups, rollback metadata, user snapshots, and created-bond provenance |
+| `/var/lib/a2dpilot/`                                   | Root-only backups, rollback metadata, user snapshots, routing ownership, and created-bond provenance |
 
 ## Environment expectations
 
@@ -271,7 +272,7 @@ sudo a2dpilot status
 sudo a2dpilot audio onboard status
 ```
 
-`devices` prints priority, pairing, trust, BlueZ connection, A2DP, AVRCP, negotiated codec, configured codec policy, and device name for every speaker. A policy appears as `auto` or an ordered value such as `aptx_hd>aptx>sbc`. `status` adds installation, controller, rfkill, base URL, media-key count, onboard-audio policy and visibility, system-service, and audio-user service diagnostics.
+`devices` prints priority, pairing, trust, BlueZ connection, A2DP, AVRCP, negotiated codec, configured codec policy, and device name for every speaker. A policy appears as `auto` or an ordered value such as `aptx_hd>aptx>sbc`. `status` adds the active managed sink, configured PipeWire default, streams still routed elsewhere, installation, controller, rfkill, base URL, media-key count, onboard-audio policy and visibility, system-service, and audio-user service diagnostics.
 
 ### Add or repair speakers
 
@@ -344,6 +345,8 @@ aptX Adaptive is not currently exposed by this PipeWire stack. Although the LC3 
 
 - The daemon reloads the central configuration while running. If a direct manual edit becomes invalid, it retains the last valid configuration and logs the error once per distinct failure.
 - Connection health requires BlueZ `Connected: yes` and a matching PipeWire `bluez_output` node. `media-controls = required` additionally checks BlueZ's `MediaControl1` AVRCP state.
+- A healthy managed speaker becomes the configured audio user's default sink. The daemon also moves existing playback streams through WirePlumber's `target.object` metadata and revisits the graph every cycle so players started before or after Bluetooth are routed consistently.
+- Routing ownership is intentionally not a historical snapshot. On loss, audio-user change, or uninstall, A2DPilot clears a default or stream target only if it still equals the value A2DPilot wrote; later user or application changes are left intact.
 - PipeWire lookups run with finite deadlines. Codec-profile discovery parses Trixie's `pw-cli EnumProfile` diagnostic format because that query has no structured CLI output; unrecognized output fails closed as a discovery error rather than selecting a guessed profile.
 - Mutating commands and daemon connection cycles serialize through the root-owned `/run/lock/a2dpilot/lock`. Stateful media controls use a separate short-lived lock beneath `/run/a2dpilot/media`, within the same two-second action deadline, so a configuration editor cannot block button handling.
 - Root-managed configuration is parsed as data and never sourced as shell code.
@@ -428,6 +431,13 @@ Look for `bluez_output.` followed by the speaker MAC with underscores. Check the
 ```sh
 sudo loginctl show-user pi -p Linger
 sudo systemctl status "user@$(id -u pi).service"
+```
+
+`a2dpilot status` also reports the active managed sink, configured audio default, and the number of playback streams still off the active sink. A nonzero or `unknown` result indicates that WirePlumber did not accept or verify every stream move. A2DPilot retries routing without repeatedly disconnecting an otherwise healthy Bluetooth transport; inspect both services for the underlying policy or PipeWire error:
+
+```sh
+sudo journalctl -b -u a2dpilot.service
+sudo -u pi env XDG_RUNTIME_DIR="/run/user/$(id -u pi)" pw-metadata -n default
 ```
 
 ### A preferred codec was not selected

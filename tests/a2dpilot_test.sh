@@ -93,6 +93,7 @@ configure_scratch_paths() {
   MEDIA_STATE_ROOT=$TEST_SCRATCH/run/a2dpilot
   MEDIA_STATE_DIR=$MEDIA_STATE_ROOT/media
   MEDIA_LOCK_FILE=$MEDIA_STATE_DIR/media.lock
+  ROUTING_STATE_FILE=$STATE_DIR/routing-overrides
   MEDIA_RUNTIME_USER=$(id -un)
   install -d "$(dirname "$CONFIG_FILE")" "$(dirname "$LOCK_FILE")" \
     "$STATE_DIR" "$BACKUP_DIR" "$MEDIA_STATE_ROOT"
@@ -2183,6 +2184,155 @@ test_codec_property_parsing() {
   assert_contains "$calls" '3 inspect 42'
 }
 
+mock_pipewire_nodes_for_routing() {
+  cat <<'EOF'
+	id 83, type PipeWire:Interface:Node/3
+		object.serial = "89"
+		node.name = "bluez_output.AA_BB_CC_DD_EE_FF.1"
+		media.class = "Audio/Sink"
+	id 95, type PipeWire:Interface:Node/3
+		object.serial = "138"
+		node.name = "alsa_playback.test-player"
+		media.class = "Stream/Output/Audio"
+EOF
+}
+
+test_pipewire_routing_parsers() {
+  local output
+  load_app
+  bounded_user_pw_cli() { mock_pipewire_nodes_for_routing; }
+  output=$(enumerate_playback_streams audio 3)
+  assert_eq '95 138' "$output"
+
+  bounded_user_wpctl() {
+    cat <<'EOF'
+id 95, type PipeWire:Interface:Node
+  * object.serial = "138"
+  * node.name = "alsa_playback.test-player"
+    node.driver-id = "83"
+  * media.class = "Stream/Output/Audio"
+EOF
+  }
+  inspect_pipewire_node audio 95 3
+  assert_eq 138 "$PIPEWIRE_NODE_SERIAL"
+  assert_eq alsa_playback.test-player "$PIPEWIRE_NODE_NAME"
+  assert_eq Stream/Output/Audio "$PIPEWIRE_NODE_CLASS"
+  assert_eq 83 "$PIPEWIRE_NODE_DRIVER"
+
+  bounded_user_pw_metadata() {
+    printf '%s\n' "update: id:0 key:'default.configured.audio.sink' value:'{\"name\":\"bluez_output.AA_BB_CC_DD_EE_FF.1\"}' type:'Spa:String:JSON'"
+  }
+  assert_eq bluez_output.AA_BB_CC_DD_EE_FF.1 \
+    "$(configured_default_sink audio 3)"
+  bounded_user_pw_metadata() {
+    printf '%s\n' "update: id:95 key:'target.object' value:'89' type:'Spa:Id'"
+  }
+  assert_eq 89 "$(stream_target_serial audio 95 3)"
+
+  bounded_user_pw_cli() {
+    printf '%s\n' $'\tid 95, type PipeWire:Interface:Node/3' \
+      $'\t\tmedia.class = "Stream/Output/Audio"'
+  }
+  if enumerate_playback_streams audio 3 >/dev/null; then
+    fail 'playback stream without an object serial was accepted'
+  fi
+  bounded_user_wpctl() {
+    printf '%s\n' '  * object.serial = "138"' '  * object.serial = "139"' \
+      '  * node.name = "alsa_playback.test"' '  * media.class = "Stream/Output/Audio"'
+  }
+  if inspect_pipewire_node audio 95 3; then
+    fail 'duplicate PipeWire object serial was accepted'
+  fi
+}
+
+test_default_routing_and_owned_cleanup() {
+  local user mac=AA:BB:CC:DD:EE:FF default_sink=alsa_output.builtin
+  local stream_driver=35 stream_target='' cleanup_log
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  CFG_AUDIO_USER=$user
+  now_seconds() { printf '100\n'; }
+  find_a2dp_node_id() { printf '83\n'; }
+  bounded_user_pw_cli() { mock_pipewire_nodes_for_routing; }
+  bounded_user_wpctl() {
+    case $3 in
+      inspect)
+        if [[ $4 == 83 ]]; then
+          cat <<'EOF'
+  * object.serial = "89"
+  * node.name = "bluez_output.AA_BB_CC_DD_EE_FF.1"
+  * media.class = "Audio/Sink"
+EOF
+        else
+          printf '%s\n' '  * object.serial = "138"' \
+            '  * node.name = "alsa_playback.test-player"' \
+            "    node.driver-id = \"$stream_driver\"" \
+            '  * media.class = "Stream/Output/Audio"'
+        fi
+        ;;
+      set-default)
+        default_sink=bluez_output.AA_BB_CC_DD_EE_FF.1
+        printf 'set-default %s\n' "$4" >> "$TEST_SCRATCH/routing.log"
+        ;;
+      clear-default)
+        default_sink=
+        printf 'clear-default %s\n' "$4" >> "$TEST_SCRATCH/routing.log"
+        ;;
+    esac
+  }
+  bounded_user_pw_metadata() {
+    if [[ $* == *'default.configured.audio.sink'* ]]; then
+      [[ -z $default_sink ]] || printf '%s\n' \
+        "update: id:0 key:'default.configured.audio.sink' value:'{\"name\":\"$default_sink\"}' type:'Spa:String:JSON'"
+    elif [[ $* == *'-d -n default 95 target.object'* ]]; then
+      stream_target=
+      printf 'clear-target 95\n' >> "$TEST_SCRATCH/routing.log"
+    elif [[ $* == *'95 target.object 89 Spa:Id'* ]]; then
+      stream_target=89
+      stream_driver=83
+      printf 'set-target 95 89\n' >> "$TEST_SCRATCH/routing.log"
+    elif [[ $* == *'95 target.object'* ]]; then
+      [[ -z $stream_target ]] || printf '%s\n' \
+        "update: id:95 key:'target.object' value:'$stream_target' type:'Spa:Id'"
+    fi
+  }
+
+  reconcile_speaker_routing "$mac"
+  assert_eq bluez_output.AA_BB_CC_DD_EE_FF.1 "$default_sink"
+  assert_eq 83 "$stream_driver"
+  assert_eq 89 "$stream_target"
+  assert_file_contains "$ROUTING_STATE_FILE" $'default\tbluez_output.AA_BB_CC_DD_EE_FF.1'
+  assert_file_contains "$ROUTING_STATE_FILE" $'stream\t138\t89'
+
+  clear_owned_routing "$user"
+  [[ ! -e $ROUTING_STATE_FILE ]] || fail 'cleared routing provenance remained'
+  [[ -z $default_sink && -z $stream_target ]] || fail 'owned routing overrides survived cleanup'
+  assert_file_contains "$TEST_SCRATCH/routing.log" 'clear-default 0'
+  assert_file_contains "$TEST_SCRATCH/routing.log" 'clear-target 95'
+
+  default_sink=alsa_output.user-choice
+  stream_target=77
+  cleanup_log=$(< "$TEST_SCRATCH/routing.log")
+  ROUTING_STATE_USER=$user
+  ROUTING_DEFAULT_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
+  ROUTING_STREAM_TARGETS=([138]=89)
+  write_routing_state
+  clear_owned_routing "$user"
+  assert_eq alsa_output.user-choice "$default_sink"
+  assert_eq 77 "$stream_target"
+  assert_eq "$cleanup_log" "$(< "$TEST_SCRATCH/routing.log")"
+  [[ ! -e $ROUTING_STATE_FILE ]] || fail 'stale routing provenance was not discarded'
+
+  printf 'sentinel\n' > "$TEST_SCRATCH/redirected-routing-state"
+  ln -s "$TEST_SCRATCH/redirected-routing-state" "$ROUTING_STATE_FILE"
+  ROUTING_STATE_USER=$user
+  ROUTING_DEFAULT_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
+  if write_routing_state; then fail 'routing state followed a symlink'; fi
+  assert_eq sentinel "$(< "$TEST_SCRATCH/redirected-routing-state")"
+}
+
 mock_a2dp_enum_profiles() {
   cat <<'EOF'
   Object: size 256, type Spa:Pod:Object:Param:Profile, id EnumProfile
@@ -2232,6 +2382,8 @@ test_pipewire_codec_profile_discovery() {
   assert_contains "$output" 'timeout --signal=TERM --kill-after=1 3 pw-cli enum-params 55 EnumProfile'
   output=$(bounded_user_wpctl audio 2 status --name)
   assert_contains "$output" 'timeout --signal=TERM --kill-after=1 2 wpctl status --name'
+  output=$(bounded_user_pw_metadata audio 2 -n default 0 default.configured.audio.sink)
+  assert_contains "$output" 'timeout --signal=TERM --kill-after=1 2 pw-metadata -n default 0 default.configured.audio.sink'
 
   CFG_AUDIO_USER=audio
   bounded_user_wpctl() {
@@ -2370,6 +2522,7 @@ test_daemon_nonpreemption_and_failover_order() {
   device_healthy() { [[ $1 == "$second" ]]; }
   device_connected() { [[ $1 == "$second" ]]; }
   a2dp_connected() { [[ $1 == "$second" ]]; }
+  maintain_speaker_routing() { :; }
   disconnect_other_speakers() { printf '%s\n' "$1" > "$TEST_SCRATCH/stale-cleanup"; }
   bluetoothctl() { printf '%s\n' "$*" >> "$TEST_SCRATCH/bluetooth.log"; }
   daemon_cycle
@@ -2414,11 +2567,35 @@ test_daemon_disconnects_new_stale_connection() {
   DAEMON_ACTIVE=$active
   device_healthy() { [[ $1 == "$active" ]]; }
   device_connected() { [[ $1 == "$stale" ]]; }
+  maintain_speaker_routing() { :; }
   disconnect_bluetooth_device() { printf '%s\n' "$1" >> "$TEST_SCRATCH/disconnected"; }
 
   daemon_cycle
   assert_eq "$stale" "$(< "$TEST_SCRATCH/disconnected")"
   assert_eq "$active" "$DAEMON_ACTIVE"
+}
+
+test_daemon_routing_failure_keeps_transport() {
+  local mac=AA:BB:CC:DD:EE:FF
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  CFG_SPEAKERS=("$mac")
+  CFG_RECONNECT_INTERVAL=5
+  CFG_MEDIA_CONTROLS=auto
+  DAEMON_ACTIVE=$mac
+  device_connected() { return 0; }
+  a2dp_connected() { return 0; }
+  apply_speaker_codec_policy() { return 0; }
+  disconnect_other_speakers() { :; }
+  reconcile_speaker_routing() { return 1; }
+  disconnect_bluetooth_device() { fail 'routing failure disconnected a healthy speaker'; }
+  now_seconds() { printf '100\n'; }
+
+  daemon_cycle > "$TEST_SCRATCH/daemon-output"
+  assert_eq "$mac" "$DAEMON_ACTIVE"
+  assert_contains "$(< "$TEST_SCRATCH/daemon-output")" \
+    'Bluetooth connection remains active'
 }
 
 test_daemon_reuses_connection_deadline() {
@@ -2567,6 +2744,7 @@ test_daemon_disconnects_removed_active_speaker() {
   DAEMON_ACTIVE=
   load_daemon_active
   device_healthy() { [[ $1 == "$replacement" ]]; }
+  maintain_speaker_routing() { :; }
   disconnect_bluetooth_device() {
     printf 'disconnect %s\n' "$1" >> "$TEST_SCRATCH/bluetooth.log"
   }
@@ -3046,10 +3224,13 @@ run_test 'forget removes config and provenance' test_forget_removes_config_and_p
 run_test 'media-control health modes' test_media_control_health_modes
 run_test 'optimistic codec reporting' test_codec_reporting_is_optimistic
 run_test 'PipeWire codec property parsing' test_codec_property_parsing
+run_test 'PipeWire routing parsers' test_pipewire_routing_parsers
+run_test 'default routing and owned cleanup' test_default_routing_and_owned_cleanup
 run_test 'PipeWire codec profile discovery' test_pipewire_codec_profile_discovery
 run_test 'per-speaker codec selection' test_per_speaker_codec_selection
 run_test 'non-preemptive failover order' test_daemon_nonpreemption_and_failover_order
 run_test 'healthy active speaker disconnects new stale connections' test_daemon_disconnects_new_stale_connection
+run_test 'routing failure keeps healthy Bluetooth transport' test_daemon_routing_failure_keeps_transport
 run_test 'connection health reuses the original deadline' test_daemon_reuses_connection_deadline
 run_test 'strict codec policy fails over to next speaker' test_daemon_codec_policy_failover
 run_test 'daemon cooldown and bounded backoff' test_daemon_cooldown_and_backoff
