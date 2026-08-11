@@ -213,7 +213,7 @@ media-key = KEY_NEXTSONG player/playback/skipNext?type=music&commandID={command-
 
 `base-url` is optional. It must be an HTTP(S) origin or path prefix without a query or fragment. A relative mapping is resolved against it, so the usual single-player configuration does not repeat the host. An absolute HTTP(S) mapping overrides the base and may target another host:
 
-Requests are HTTP GETs. Each media action receives one two-second budget shared by configuration parsing, state locking, timeline polling, connection establishment, and the final request, so individually bounded steps cannot accumulate into a long apparent freeze. The generated Triggerhappy command contains only the validated key name; configured URLs are looked up by A2DPilot and passed to `curl` as data, never evaluated as shell code.
+Requests are HTTP GETs. Each media action receives one monotonic two-second budget enforced around the complete worker process and shared by configuration parsing, state locking, timeline polling, connection establishment, and the final request, so individually bounded steps cannot accumulate into a long apparent freeze. The generated Triggerhappy command contains only the validated key name; configured URLs are looked up by A2DPilot and passed to `curl` as data, never evaluated as shell code.
 
 ```ini
 media-key = KEY_CUSTOM https://automation.example/hooks/skip
@@ -307,7 +307,7 @@ aptX Adaptive is not currently exposed by this PipeWire stack. Although the LC3 
 - Connection health requires BlueZ `Connected: yes` and a matching PipeWire `bluez_output` node. `media-controls = required` additionally checks BlueZ's `MediaControl1` AVRCP state.
 - Mutating commands and daemon connection cycles serialize through the root-owned `/run/lock/a2dpilot/lock`. Stateful media controls use a separate short-lived lock beneath `/run/a2dpilot/media`, within the same two-second action deadline, so a configuration editor cannot block button handling.
 - Root-managed configuration is parsed as data and never sourced as shell code.
-- Triggerhappy receives only validated key names; URL resolution and placeholder expansion happen inside `player-control` immediately before `curl` runs. Stateful volume, mute, shuffle, and repeat mappings first poll the player's music timeline. Systemd owns `/run/a2dpilot` and creates its mode-`0700` `media` child for Debian's unprivileged Triggerhappy handler; per-player pre-mute volumes stored there expire on reboot.
+- Triggerhappy receives only validated key names; URL resolution and placeholder expansion happen inside `player-control` immediately before `curl` runs. Stateful volume, mute, shuffle, and repeat mappings first poll the player's music timeline. Systemd owns `/run/a2dpilot` and creates its mode-`0700` `media` child for Debian's unprivileged Triggerhappy handler; root CLI requests drop to that handler identity before opening its lock or state files, and per-player pre-mute volumes stored there expire on reboot.
 - A2DPilot runs Triggerhappy through its direct service and disables the competing socket-activation unit while installed. Uninstall restores the original state of both units.
 - Install records its managed-state rollback snapshot before APT and service mutations. A failed or interrupted installation invokes uninstall automatically; APT-managed packages are retained, and a failed rollback keeps the snapshot for recovery.
 - Update preserves that snapshot and replaces only the installed executable; an active daemon is restarted, while an inactive daemon remains stopped.

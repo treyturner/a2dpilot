@@ -38,6 +38,7 @@ SCAN_TIMEOUT=15
 VOLUME_STEP=5
 MEDIA_ACTION_TIMEOUT=2
 MEDIA_CONNECT_TIMEOUT=1
+MEDIA_MONOTONIC_CLOCK=/proc/uptime
 UPDATE_BASE_URL=https://raw.githubusercontent.com/treyturner/a2dpilot
 UPDATE_CONNECT_TIMEOUT=10
 UPDATE_TOTAL_TIMEOUT=60
@@ -98,6 +99,7 @@ RESOLVED_MEDIA_URL=
 EXPANDED_MEDIA_TEMPLATE=
 MEDIA_STATE_ACTION=
 MEDIA_DEADLINE_US=0
+MEDIA_DEADLINE_INHERITED=0
 UPDATE_CANDIDATE=
 UPDATE_PREVIOUS=
 UPDATE_REPLACED=0
@@ -198,7 +200,8 @@ release_lock() {
 }
 
 acquire_media_lock() {
-  local wait_seconds=${1:-$MEDIA_ACTION_TIMEOUT} previous_umask media_group
+  local wait_seconds=${1:-$MEDIA_ACTION_TIMEOUT} previous_umask
+  media_state_access_allowed || return 1
   prepare_media_state_directory || return 1
   [[ ! -e $MEDIA_LOCK_FILE || -f $MEDIA_LOCK_FILE && ! -L $MEDIA_LOCK_FILE ]] || return 1
   previous_umask=$(umask)
@@ -208,10 +211,6 @@ acquire_media_lock() {
     return 1
   fi
   umask "$previous_umask"
-  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
-    media_group=$(id -gn "$MEDIA_RUNTIME_USER") || return 1
-    chown "$MEDIA_RUNTIME_USER:$media_group" "$MEDIA_LOCK_FILE" || return 1
-  fi
   chmod 0600 "$MEDIA_LOCK_FILE"
   if (( MEDIA_DEADLINE_US > 0 )); then
     if ! media_remaining_seconds wait_seconds; then
@@ -1964,8 +1963,13 @@ daemon_action() {
 }
 
 media_now_us() {
-  local target=$1 value=${EPOCHREALTIME/./}
-  [[ $value =~ ^[0-9]{16}$ ]] || return 1
+  local target=$1 seconds fraction _ value
+  [[ -f $MEDIA_MONOTONIC_CLOCK && ! -L $MEDIA_MONOTONIC_CLOCK ]] || return 1
+  IFS=' .' read -r seconds fraction _ < "$MEDIA_MONOTONIC_CLOCK" || return 1
+  [[ $seconds =~ ^[0-9]+$ && $fraction =~ ^[0-9]+$ ]] || return 1
+  fraction=${fraction}000000
+  fraction=${fraction:0:6}
+  value=$((10#$seconds * 1000000 + 10#$fraction))
   printf -v "$target" '%s' "$value"
 }
 
@@ -1976,11 +1980,59 @@ start_media_deadline() {
 }
 
 media_remaining_seconds() {
-  local target=$1 now_us remaining
+  local target=$1 now_us remaining_us_value
   media_now_us now_us || return 1
-  remaining=$((MEDIA_DEADLINE_US - 10#$now_us))
-  (( remaining > 0 )) || return 1
-  printf -v "$target" '%d.%06d' "$((remaining / 1000000))" "$((remaining % 1000000))"
+  remaining_us_value=$((MEDIA_DEADLINE_US - 10#$now_us))
+  (( remaining_us_value > 0 )) || return 1
+  printf -v "$target" '%d.%06d' \
+    "$((remaining_us_value / 1000000))" "$((remaining_us_value % 1000000))"
+}
+
+import_media_deadline() {
+  local inherited=${A2DPILOT_MEDIA_DEADLINE_US:-} now_us remaining_us
+  [[ $inherited =~ ^[1-9][0-9]{0,17}$ ]] || return 1
+  media_now_us now_us || return 1
+  remaining_us=$((10#$inherited - 10#$now_us))
+  (( remaining_us > 0 && remaining_us <= MEDIA_ACTION_TIMEOUT * 1000000 )) || return 1
+  MEDIA_DEADLINE_US=$((10#$inherited))
+  MEDIA_DEADLINE_INHERITED=1
+}
+
+media_invoking_as_root() {
+  [[ ${EUID:-$(id -u)} -eq 0 ]]
+}
+
+bounded_player_control_action() {
+  local remaining rc
+  start_media_deadline || die "Could not start the media-control deadline."
+  media_remaining_seconds remaining || die "The media-control request timed out."
+  if media_invoking_as_root; then
+    if timeout --signal=TERM --kill-after=0.1 "$remaining" \
+        runuser -u "$MEDIA_RUNTIME_USER" -- env \
+        A2DPILOT_MEDIA_DEADLINE_US="$MEDIA_DEADLINE_US" \
+        "$SCRIPT_PATH" __player-control "$@"; then
+      return 0
+    else
+      rc=$?
+    fi
+  else
+    if A2DPILOT_MEDIA_DEADLINE_US=$MEDIA_DEADLINE_US \
+        timeout --signal=TERM --kill-after=0.1 "$remaining" \
+        "$SCRIPT_PATH" __player-control "$@"; then
+      return 0
+    else
+      rc=$?
+    fi
+  fi
+  case $rc in
+    124|137) warn "The media-control request timed out." ;;
+  esac
+  return "$rc"
+}
+
+player_control_worker_action() {
+  import_media_deadline || die "Invalid or expired media-control deadline."
+  player_control_action "$@"
 }
 
 media_curl() {
@@ -1998,9 +2050,13 @@ media_curl() {
 }
 
 media_command_id() {
-  local target=$1 now_us
-  media_now_us now_us || return 1
-  printf -v "$target" '%s' "${now_us::-3}"
+  local target=$1 wall_value=$EPOCHREALTIME seconds fraction milliseconds
+  seconds=${wall_value%%.*}
+  fraction=${wall_value#*.}000
+  fraction=${fraction:0:3}
+  [[ $seconds =~ ^[0-9]+$ && $fraction =~ ^[0-9]{3}$ ]] || return 1
+  milliseconds=$((10#$seconds * 1000 + 10#$fraction))
+  printf -v "$target" '%s' "$milliseconds"
 }
 
 media_url_for_key() {
@@ -2051,6 +2107,12 @@ media_mute_state_path() {
   printf '%s/mute-%s\n' "$MEDIA_STATE_DIR" "$digest"
 }
 
+media_state_access_allowed() {
+  local runtime_uid
+  runtime_uid=$(id -u "$MEDIA_RUNTIME_USER") || return 1
+  [[ ${EUID:-$(id -u)} -eq "$runtime_uid" ]]
+}
+
 prepare_media_state_directory() {
   local owner parent parent_owner runtime_uid media_group
   runtime_uid=$(id -u "$MEDIA_RUNTIME_USER") || return 1
@@ -2079,6 +2141,7 @@ prepare_media_state_directory() {
 
 read_media_mute_volume() {
   local path directory owner file_owner runtime_uid saved_base saved_volume _extra
+  media_state_access_allowed || return 1
   runtime_uid=$(id -u "$MEDIA_RUNTIME_USER") || return 1
   path=$(media_mute_state_path) || return 1
   directory=$(dirname "$path")
@@ -2101,8 +2164,9 @@ read_media_mute_volume() {
 }
 
 write_media_mute_volume() {
-  local volume=$1 path temp media_group
+  local volume=$1 path temp
   [[ $volume =~ ^[1-9][0-9]*$ ]] && (( 10#$volume <= 100 )) || return 1
+  media_state_access_allowed || return 1
   prepare_media_state_directory || return 1
   path=$(media_mute_state_path) || return 1
   [[ ! -e $path || -f $path && ! -L $path ]] || return 1
@@ -2110,13 +2174,6 @@ write_media_mute_volume() {
   if ! printf '%s\n%s\n' "$CFG_BASE_URL" "$volume" > "$temp"; then
     rm -f -- "$temp"
     return 1
-  fi
-  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
-    if ! media_group=$(id -gn "$MEDIA_RUNTIME_USER") ||
-       ! chown "$MEDIA_RUNTIME_USER:$media_group" "$temp"; then
-      rm -f -- "$temp"
-      return 1
-    fi
   fi
   if ! chmod 0600 "$temp" || ! mv -f -- "$temp" "$path"; then
     rm -f -- "$temp"
@@ -2126,6 +2183,7 @@ write_media_mute_volume() {
 
 clear_media_mute_volume() {
   local path
+  media_state_access_allowed || return 1
   path=$(media_mute_state_path) || return 1
   validate_directory_chain "$(dirname "$path")"
   [[ ! -e $path || -f $path && ! -L $path ]] || return 1
@@ -2216,7 +2274,12 @@ expand_player_state_tokens() {
 
 player_control_action() {
   local media_key=${1:-} stateful=0 lock_wait
-  start_media_deadline || die "Could not start the media-control deadline."
+  if (( MEDIA_DEADLINE_INHERITED )); then
+    MEDIA_DEADLINE_INHERITED=0
+    media_remaining_seconds lock_wait || die "The media-control request timed out."
+  else
+    start_media_deadline || die "Could not start the media-control deadline."
+  fi
   [[ $# -eq 1 ]] || die "Usage: a2dpilot player-control KEY_NAME"
   [[ $media_key =~ ^KEY_[A-Z0-9_]+$ ]] || die "Invalid media key name: $media_key"
   parse_config "$CONFIG_FILE" || die "$CONFIG_ERROR"
@@ -2751,7 +2814,8 @@ main() {
     update) update_action "$@" ;;
     uninstall) uninstall_action "$@" ;;
     daemon) daemon_action "$@" ;;
-    player-control) player_control_action "$@" ;;
+    player-control) bounded_player_control_action "$@" ;;
+    __player-control) player_control_worker_action "$@" ;;
     -h|--help|help|'') usage ;;
     *) usage >&2; die "Unknown command: $action" ;;
   esac
