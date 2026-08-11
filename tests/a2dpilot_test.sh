@@ -2999,6 +2999,67 @@ test_daemon_signal_defers_during_routing_mutation() {
     fail 'interrupted stream cleanup retained stale provenance'
 }
 
+test_cli_signal_defers_during_routing_cleanup() {
+  local user result default_sink=alsa_output.builtin
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  ROUTING_STATE_USER=$user
+  ROUTING_DEFAULT_NAME=$default_sink
+  write_routing_state
+  configured_default_sink() { printf '%s\n' "$default_sink"; }
+  bounded_user_wpctl() {
+    [[ $ROUTING_MUTATION_CRITICAL == 1 ]] || \
+      fail 'CLI default cleanup ran outside its critical section'
+    default_sink=
+    kill -TERM "$BASHPID"
+  }
+
+  if clear_owned_routing "$user"; then
+    fail 'signaled CLI default cleanup reported success'
+  else
+    result=$?
+  fi
+  assert_eq 143 "$result"
+  assert_eq 0 "$ROUTING_MUTATION_CRITICAL"
+  [[ -z $(trap -p INT) && -z $(trap -p TERM) ]] || \
+    fail 'CLI cleanup retained its temporary signal traps'
+  [[ ! -e $ROUTING_STATE_FILE ]] || \
+    fail 'signaled CLI default cleanup retained stale provenance'
+
+  ROUTING_STATE_USER=$user
+  ROUTING_PIPEWIRE_INSTANCE=01234567-89ab-cdef-0123-456789abcdef:4321:987654
+  ROUTING_STREAM_TARGETS=([138]=89)
+  write_routing_state
+  pipewire_instance_id() { printf '01234567-89ab-cdef-0123-456789abcdef:4321:987654\n'; }
+  enumerate_playback_streams() { printf '95 138\n'; }
+  inspect_pipewire_node() {
+    PIPEWIRE_NODE_SERIAL=138
+    PIPEWIRE_NODE_NAME='Long-lived Player'
+    PIPEWIRE_NODE_CLASS=Stream/Output/Audio
+    PIPEWIRE_NODE_DRIVER=83
+  }
+  stream_target_serial() { printf '89\n'; }
+  bounded_user_pw_metadata() {
+    [[ $ROUTING_MUTATION_CRITICAL == 1 ]] || \
+      fail 'CLI stream cleanup ran outside its critical section'
+    kill -INT "$BASHPID"
+  }
+
+  if clear_owned_routing "$user"; then
+    fail 'signaled CLI stream cleanup reported success'
+  else
+    result=$?
+  fi
+  assert_eq 130 "$result"
+  assert_eq 0 "$ROUTING_MUTATION_CRITICAL"
+  [[ -z $(trap -p INT) && -z $(trap -p TERM) ]] || \
+    fail 'CLI cleanup retained its temporary signal traps'
+  [[ ! -e $ROUTING_STATE_FILE ]] || \
+    fail 'signaled CLI stream cleanup retained stale provenance'
+}
+
 test_runtime_reconciliation_failure_clears_routing() {
   setup_scratch_dir
   load_app
@@ -4168,6 +4229,8 @@ run_test 'invalid initial config clears recorded routing' \
   test_invalid_initial_config_clears_recorded_routing
 run_test 'daemon signal defers during routing mutation' \
   test_daemon_signal_defers_during_routing_mutation
+run_test 'CLI signal defers during routing cleanup' \
+  test_cli_signal_defers_during_routing_cleanup
 run_test 'runtime reconciliation failure clears routing' \
   test_runtime_reconciliation_failure_clears_routing
 run_test 'unmovable stream does not starve routing' test_unmovable_stream_does_not_starve_routing

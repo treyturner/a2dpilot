@@ -167,6 +167,9 @@ declare -gA ROUTING_STREAM_TARGETS=()
 declare -gA ROUTING_PENDING_STREAM_TARGETS=()
 ROUTING_STREAM_CURSOR=
 ROUTING_MUTATION_CRITICAL=0
+ROUTING_MUTATION_SIGNAL_STATUS=0
+ROUTING_MUTATION_OWNS_INT_TRAP=0
+ROUTING_MUTATION_OWNS_TERM_TRAP=0
 DAEMON_STOP_REQUESTED=0
 DAEMON_NEXT_ROUTE_LOG=0
 
@@ -1883,6 +1886,37 @@ routing_default_is_owned() {
        $current == "$ROUTING_PENDING_DEFAULT_NAME" ) ]]
 }
 
+routing_mutation_signal() {
+  ROUTING_MUTATION_SIGNAL_STATUS=$1
+}
+
+begin_routing_cleanup_mutation() {
+  ROUTING_MUTATION_SIGNAL_STATUS=0
+  ROUTING_MUTATION_OWNS_INT_TRAP=0
+  ROUTING_MUTATION_OWNS_TERM_TRAP=0
+  if [[ -z $(trap -p INT) ]]; then
+    trap 'routing_mutation_signal 130' INT
+    ROUTING_MUTATION_OWNS_INT_TRAP=1
+  fi
+  if [[ -z $(trap -p TERM) ]]; then
+    trap 'routing_mutation_signal 143' TERM
+    ROUTING_MUTATION_OWNS_TERM_TRAP=1
+  fi
+  ROUTING_MUTATION_CRITICAL=1
+}
+
+end_routing_cleanup_mutation() {
+  local signal_status
+  (( ROUTING_MUTATION_OWNS_INT_TRAP == 0 )) || trap - INT
+  (( ROUTING_MUTATION_OWNS_TERM_TRAP == 0 )) || trap - TERM
+  ROUTING_MUTATION_CRITICAL=0
+  signal_status=$ROUTING_MUTATION_SIGNAL_STATUS
+  ROUTING_MUTATION_SIGNAL_STATUS=0
+  ROUTING_MUTATION_OWNS_INT_TRAP=0
+  ROUTING_MUTATION_OWNS_TERM_TRAP=0
+  (( signal_status == 0 )) || return "$signal_status"
+}
+
 apply_owned_stream_target() {
   local user=$1 id=$2 serial=$3 target=$4 deadline=$5 remaining result=0
   ROUTING_MUTATION_CRITICAL=1
@@ -2040,7 +2074,7 @@ routing_cleanup_seconds_until_deadline() {
 
 clear_owned_routing() {
   local user=$1 deadline started remaining current current_instance result streams id serial extra
-  local owned pending failed=0
+  local owned pending failed=0 mutation_signal=0
   local -A stream_ids=() owned_streams=()
   load_routing_state || return 1
   [[ -n $ROUTING_STATE_USER ]] || return 0
@@ -2068,7 +2102,7 @@ clear_owned_routing() {
             ROUTING_PENDING_DEFAULT_NAME=
           else
             remaining=$(routing_cleanup_seconds_until_deadline "$deadline") || return 1
-            ROUTING_MUTATION_CRITICAL=1
+            begin_routing_cleanup_mutation
             if bounded_user_wpctl "$user" "$remaining" \
               clear-default 0 >/dev/null 2>&1; then
               ROUTING_DEFAULT_NAME=
@@ -2077,7 +2111,8 @@ clear_owned_routing() {
             else
               failed=1
             fi
-            ROUTING_MUTATION_CRITICAL=0
+            end_routing_cleanup_mutation || mutation_signal=$?
+            (( mutation_signal == 0 )) || return "$mutation_signal"
             (( DAEMON_STOP_REQUESTED == 0 )) || return 1
           fi
         else
@@ -2156,7 +2191,7 @@ clear_owned_routing() {
           if [[ ( -n $owned && $current == "$owned" ) ||
                 ( -n $pending && $current == "$pending" ) ]]; then
             remaining=$(routing_cleanup_seconds_until_deadline "$deadline") || return 1
-            ROUTING_MUTATION_CRITICAL=1
+            begin_routing_cleanup_mutation
             if bounded_user_pw_metadata "$user" "$remaining" \
               -d -n default "$id" target.object >/dev/null 2>&1; then
               unset "ROUTING_STREAM_TARGETS[$serial]"
@@ -2165,7 +2200,8 @@ clear_owned_routing() {
             else
               failed=1
             fi
-            ROUTING_MUTATION_CRITICAL=0
+            end_routing_cleanup_mutation || mutation_signal=$?
+            (( mutation_signal == 0 )) || return "$mutation_signal"
             (( DAEMON_STOP_REQUESTED == 0 )) || return 1
           else
             unset "ROUTING_STREAM_TARGETS[$serial]"
@@ -3082,7 +3118,9 @@ forget_action() {
   fi
   if [[ -n $routing_user ]]; then
     clear_owned_routing "$routing_user" || {
+      result=$?
       release_lock
+      (( result != 130 && result != 143 )) || return "$result"
       die "Could not clear audio routing for $mac; device configuration was left unchanged."
     }
   fi
@@ -4543,7 +4581,7 @@ restore_managed_files() {
 
 uninstall_action() {
   require_root
-  local bond_request=ask bond_policy bond_failure=0 rollback_failure=0 routing_user=''
+  local bond_request=ask bond_policy bond_failure=0 rollback_failure=0 routing_user='' result
   while [[ $# -gt 0 ]]; do
     case $1 in
       --keep-bonds) [[ $bond_request == ask ]] || die "Bond-policy flags are mutually exclusive."; bond_request=keep; shift ;;
@@ -4562,9 +4600,11 @@ uninstall_action() {
     IFS= read -r routing_user < "$STATE_DIR/runtime-user" || routing_user=
     if [[ -n $routing_user ]] && id "$routing_user" >/dev/null 2>&1; then
       clear_owned_routing "$routing_user" || {
+        result=$?
         warn "Could not fully clear A2DPilot-owned audio routing overrides."
         write_state_file failed || warn "Could not mark the retained installation snapshot as failed."
         release_lock
+        (( result != 130 && result != 143 )) || return "$result"
         die "Rollback was incomplete; recovery state remains at $STATE_DIR."
       }
     fi
