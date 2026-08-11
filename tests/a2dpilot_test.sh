@@ -709,6 +709,59 @@ test_uninstall_keeps_packages_and_reports_empty_bond_policy() {
   [[ ! -e $STATE_DIR ]] || fail 'package-retaining uninstall retained state'
 }
 
+test_uninstall_preserves_audio_session_after_routing_cleanup_failure() {
+  local user output rc cleanup_count
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  cleanup_count=$TEST_SCRATCH/cleanup-count
+  user=$(id -un)
+  render_state_file "$STATE_FILE" installed
+  printf '%s\n' "$user" > "$STATE_DIR/runtime-user"
+  : > "$STATE_DIR/created-bonds"
+  printf '0\n' > "$cleanup_count"
+
+  require_root() { :; }
+  acquire_lock() { :; }
+  release_lock() { printf 'release\n' >> "$TEST_SCRATCH/lock.log"; }
+  systemctl() {
+    if [[ $1 == show ]]; then
+      printf 'loaded\n'
+    else
+      printf '%s\n' "$*" >> "$TEST_SCRATCH/systemctl.log"
+    fi
+  }
+  clear_owned_routing() {
+    local count
+    count=$(< "$cleanup_count")
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$cleanup_count"
+    (( count > 1 ))
+  }
+  restore_managed_files() { printf 'files\n' >> "$TEST_SCRATCH/restore.log"; }
+  restore_all_user_states() { printf 'users\n' >> "$TEST_SCRATCH/restore.log"; }
+  restore_controller_state() { printf 'controller\n' >> "$TEST_SCRATCH/restore.log"; }
+  restore_rfkill_state() { printf 'rfkill\n' >> "$TEST_SCRATCH/restore.log"; }
+  restore_system_service_states() { printf 'services\n' >> "$TEST_SCRATCH/restore.log"; }
+
+  set +e
+  output=$(uninstall_action --keep-bonds 2>&1)
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'uninstall continued after routing cleanup failed'
+  assert_contains "$output" 'Could not fully clear A2DPilot-owned audio routing overrides'
+  assert_contains "$output" "recovery state remains at $STATE_DIR"
+  assert_file_contains "$STATE_FILE" 'INSTALL_PHASE=failed'
+  [[ -f $STATE_DIR/runtime-user ]] || fail 'failed cleanup discarded its audio user'
+  [[ ! -e $TEST_SCRATCH/restore.log ]] || \
+    fail 'failed routing cleanup restored managed state or the audio session'
+
+  output=$(uninstall_action --keep-bonds)
+  assert_contains "$output" 'managed system state was restored'
+  assert_file_contains "$TEST_SCRATCH/restore.log" 'users'
+  [[ ! -e $STATE_DIR ]] || fail 'successful uninstall retry retained recovery state'
+}
+
 test_failed_install_rollback_retains_packages() {
   local output rc mock
   setup_scratch_dir
@@ -2310,6 +2363,8 @@ EOF
         fi
         ;;
       set-default)
+        assert_file_contains "$ROUTING_STATE_FILE" \
+          $'default\tbluez_output.AA_BB_CC_DD_EE_FF.1'
         default_sink=bluez_output.AA_BB_CC_DD_EE_FF.1
         printf 'set-default %s\n' "$4" >> "$TEST_SCRATCH/routing.log"
         ;;
@@ -2327,6 +2382,7 @@ EOF
       stream_target=
       printf 'clear-target 95\n' >> "$TEST_SCRATCH/routing.log"
     elif [[ $* == *'95 target.object 89 Spa:Id'* ]]; then
+      assert_file_contains "$ROUTING_STATE_FILE" $'stream\t138\t89'
       stream_target=89
       stream_driver=83
       printf 'set-target 95 89\n' >> "$TEST_SCRATCH/routing.log"
@@ -2377,6 +2433,37 @@ EOF
   ROUTING_DEFAULT_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
   if write_routing_state; then fail 'routing state followed a symlink'; fi
   assert_eq sentinel "$(< "$TEST_SCRATCH/redirected-routing-state")"
+}
+
+test_routing_write_failure_prevents_mutation() {
+  local user mac=AA:BB:CC:DD:EE:FF output rc
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  CFG_AUDIO_USER=$user
+  now_seconds() { printf '100\n'; }
+  find_a2dp_node_id() { printf '83\n'; }
+  configured_default_sink() { printf 'alsa_output.builtin\n'; }
+  bounded_user_wpctl() {
+    if [[ $3 == inspect ]]; then
+      printf '%s\n' '  * object.serial = "89"' \
+        '  * node.name = "bluez_output.AA_BB_CC_DD_EE_FF.1"' \
+        '  * media.class = "Audio/Sink"'
+    else
+      : > "$TEST_SCRATCH/routing-mutated"
+    fi
+  }
+  write_routing_state() { return 1; }
+
+  set +e
+  output=$(reconcile_speaker_routing "$mac" 2>&1)
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'routing succeeded after its provenance write failed'
+  assert_eq '' "$output"
+  [[ ! -e $TEST_SCRATCH/routing-mutated ]] || \
+    fail 'routing metadata changed after its provenance write failed'
 }
 
 test_unmovable_stream_does_not_starve_routing() {
@@ -3311,6 +3398,8 @@ run_test 'WirePlumber config path safety' test_wireplumber_config_path_safety
 run_test 'Triggerhappy config rejects symlinked parent' test_trigger_config_rejects_symlinked_parent
 run_test 'non-interactive install and uninstall fixture' test_noninteractive_install_and_uninstall_fixture
 run_test 'uninstall keeps packages and reports empty bond policy' test_uninstall_keeps_packages_and_reports_empty_bond_policy
+run_test 'uninstall preserves audio session after routing cleanup failure' \
+  test_uninstall_preserves_audio_session_after_routing_cleanup_failure
 run_test 'failed install rollback retains packages' test_failed_install_rollback_retains_packages
 run_test 'install recovery needs no package snapshot' test_install_recovery_needs_no_package_snapshot
 run_test 'update source selection and validation' test_update_source_selection_and_validation
@@ -3343,6 +3432,7 @@ run_test 'optimistic codec reporting' test_codec_reporting_is_optimistic
 run_test 'PipeWire codec property parsing' test_codec_property_parsing
 run_test 'PipeWire routing parsers' test_pipewire_routing_parsers
 run_test 'default routing and owned cleanup' test_default_routing_and_owned_cleanup
+run_test 'routing write failure prevents mutation' test_routing_write_failure_prevents_mutation
 run_test 'unmovable stream does not starve routing' test_unmovable_stream_does_not_starve_routing
 run_test 'PipeWire codec profile discovery' test_pipewire_codec_profile_discovery
 run_test 'per-speaker codec selection' test_per_speaker_codec_selection

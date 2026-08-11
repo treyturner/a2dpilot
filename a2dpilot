@@ -1970,10 +1970,13 @@ reconcile_speaker_routing() {
   fi
   (( result == 0 || result == 2 )) || return 1
   if [[ $current != "$sink_name" ]]; then
-    remaining=$(seconds_until_deadline "$deadline") || return 1
-    bounded_user_wpctl "$CFG_AUDIO_USER" "$remaining" set-default "$sink" >/dev/null 2>&1 || return 1
+    # Record the conditional cleanup before changing persistent metadata. If
+    # the command times out or this process is interrupted, a later cleanup
+    # can safely discard the record when the live value does not match it.
     ROUTING_DEFAULT_NAME=$sink_name
     write_routing_state || return 1
+    remaining=$(seconds_until_deadline "$deadline") || return 1
+    bounded_user_wpctl "$CFG_AUDIO_USER" "$remaining" set-default "$sink" >/dev/null 2>&1 || return 1
     while true; do
       remaining=$(seconds_until_deadline "$deadline") || {
         write_routing_state || true
@@ -2008,11 +2011,11 @@ reconcile_speaker_routing() {
         fi
         (( result == 0 || result == 2 )) || return 1
         if [[ $target != "$sink_serial" ]]; then
+          ROUTING_STREAM_TARGETS[$serial]=$sink_serial
+          write_routing_state || return 1
           remaining=$(seconds_until_deadline "$deadline") || return 1
           bounded_user_pw_metadata "$CFG_AUDIO_USER" "$remaining" -n default \
             "$id" target.object "$sink_serial" Spa:Id >/dev/null 2>&1 || return 1
-          ROUTING_STREAM_TARGETS[$serial]=$sink_serial
-          write_routing_state || return 1
         fi
         pending_streams[$serial]=$id
       elif [[ -n ${ROUTING_STREAM_TARGETS[$serial]:-} ]]; then
@@ -4113,7 +4116,9 @@ uninstall_action() {
     if [[ -n $routing_user ]] && id "$routing_user" >/dev/null 2>&1; then
       clear_owned_routing "$routing_user" || {
         warn "Could not fully clear A2DPilot-owned audio routing overrides."
-        rollback_failure=1
+        write_state_file failed || warn "Could not mark the retained installation snapshot as failed."
+        release_lock
+        die "Rollback was incomplete; recovery state remains at $STATE_DIR."
       }
     fi
   fi
