@@ -2048,13 +2048,64 @@ wait_for_device_connection() {
 
 pair_on_controller() {
   local mac=$1 agent=$2
-  local pair_pid coproc_input_fd coproc_output_fd input_fd output_fd
+  local pair_pid='' coproc_input_fd coproc_output_fd input_fd='' output_fd=''
   local tty_output='' forward_pid='' char output_buffer=''
-  local result=1 completed=0 interactive=0 original_pairable
+  local result=1 completed=0 interactive=0 original_pairable cleanup_done=0
+  local owns_exit_trap=0 owns_hup_trap=0 owns_int_trap=0 owns_term_trap=0
+
+  cleanup_pairing_session() {
+    (( cleanup_done == 0 )) || return 0
+    cleanup_done=1
+    (( owns_exit_trap == 0 )) || trap - EXIT
+    (( owns_hup_trap == 0 )) || trap - HUP
+    (( owns_int_trap == 0 )) || trap - INT
+    (( owns_term_trap == 0 )) || trap - TERM
+    if [[ -n $forward_pid ]]; then
+      kill "$forward_pid" 2>/dev/null || true
+      wait "$forward_pid" 2>/dev/null || true
+      forward_pid=
+    fi
+    if [[ -n $input_fd ]]; then
+      exec {input_fd}>&- || true
+      input_fd=
+    fi
+    if [[ -n $output_fd ]]; then
+      exec {output_fd}<&- || true
+      output_fd=
+    fi
+    if [[ -n $tty_output ]]; then
+      exec {tty_output}>&- || true
+      tty_output=
+    fi
+    if [[ -n $pair_pid ]]; then
+      kill "$pair_pid" 2>/dev/null || true
+      wait "$pair_pid" 2>/dev/null || true
+      pair_pid=
+    fi
+    restore_controller_pairable_state "$CFG_CONTROLLER" "$original_pairable" || \
+      warn "Could not restore the controller's pairable state."
+  }
+
   original_pairable=$(controller_pairable_state "$CFG_CONTROLLER") || {
     warn "Could not determine the controller's pairable state; refusing to change it."
     return 1
   }
+  if [[ -z $(trap -p EXIT) ]]; then
+    trap cleanup_pairing_session EXIT
+    owns_exit_trap=1
+  fi
+  if [[ -z $(trap -p HUP) ]]; then
+    trap 'cleanup_pairing_session; exit 129' HUP
+    owns_hup_trap=1
+  fi
+  if [[ -z $(trap -p INT) ]]; then
+    trap 'cleanup_pairing_session; exit 130' INT
+    owns_int_trap=1
+  fi
+  if [[ -z $(trap -p TERM) ]]; then
+    trap 'cleanup_pairing_session; exit 143' TERM
+    owns_term_trap=1
+  fi
   has_tty && interactive=1
   coproc A2DPILOT_PAIR_SESSION {
     run_bounded_bluetoothctl 60 --agent "$agent" 2>&1
@@ -2097,29 +2148,11 @@ pair_on_controller() {
       else
         printf '\n'
       fi
-      if [[ -n $forward_pid ]]; then
-        kill "$forward_pid" 2>/dev/null || true
-        wait "$forward_pid" 2>/dev/null || true
-      fi
-      forward_pid=
-      exec {input_fd}>&-
-      input_fd=
-      exec {output_fd}<&-
-      output_fd=
-      kill "$pair_pid" 2>/dev/null || true
       break
     fi
   done
-  [[ -z $forward_pid ]] || {
-    kill "$forward_pid" 2>/dev/null || true
-    wait "$forward_pid" 2>/dev/null || true
-  }
-  [[ -z $input_fd ]] || exec {input_fd}>&-
-  [[ -z $output_fd ]] || exec {output_fd}<&-
-  (( interactive == 0 )) || exec {tty_output}>&-
-  wait "$pair_pid" 2>/dev/null || true
-  restore_controller_pairable_state "$CFG_CONTROLLER" "$original_pairable" || \
-    warn "Could not restore the controller's pairable state."
+  cleanup_pairing_session
+  unset -f cleanup_pairing_session
   return "$result"
 }
 

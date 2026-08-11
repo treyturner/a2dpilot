@@ -1925,7 +1925,8 @@ test_pairing_provenance_and_existing_bond() {
 }
 
 test_pairing_session_terminates_after_bonding() {
-  local mac=AA:BB:CC:DD:EE:FF controller=12:34:56:78:9A:BC pair_failure=0
+  local mac=AA:BB:CC:DD:EE:FF controller=12:34:56:78:9A:BC
+  local pair_failure=0 pair_hang=0 session_pid rc attempt
   setup_scratch_dir
   load_app
   configure_scratch_paths
@@ -1956,7 +1957,10 @@ test_pairing_session_terminates_after_bonding() {
         'pairable on') printf 'yes\n' > "$TEST_SCRATCH/pairable-state" ;;
         'pairable off') printf 'no\n' > "$TEST_SCRATCH/pairable-state" ;;
         "pair $mac")
-          if (( pair_failure )); then
+          if (( pair_hang )); then
+            : > "$TEST_SCRATCH/pair-session-started"
+            while true; do sleep 1; done
+          elif (( pair_failure )); then
             printf 'Failed to pair: org.bluez.Error.AuthenticationFailed\n'
           else
             printf 'Pairing successful\n'
@@ -1981,14 +1985,33 @@ test_pairing_session_terminates_after_bonding() {
   fi
   assert_eq no "$(< "$TEST_SCRATCH/pairable-state")"
 
-  assert_eq 3 "$(grep -Fc 'args: --agent NoInputNoOutput' "$TEST_SCRATCH/pair-sessions")"
-  assert_eq 3 "$(grep -Fc 'pairable on' "$TEST_SCRATCH/pair-sessions")"
-  assert_eq 3 "$(grep -Fc "pair $mac" "$TEST_SCRATCH/pair-sessions")"
+  pair_failure=0
+  pair_hang=1
+  CFG_CONTROLLER=auto
+  pair_on_controller "$mac" NoInputNoOutput >/dev/null &
+  session_pid=$!
+  for attempt in {1..50}; do
+    [[ -e $TEST_SCRATCH/pair-session-started ]] && break
+    sleep 0.05
+  done
+  [[ -e $TEST_SCRATCH/pair-session-started ]] || fail 'interrupted pairing session did not start'
+  assert_eq yes "$(< "$TEST_SCRATCH/pairable-state")"
+  builtin kill -TERM "$session_pid"
+  set +e
+  wait "$session_pid" 2>/dev/null
+  rc=$?
+  set -e
+  assert_eq 143 "$rc"
+  assert_eq no "$(< "$TEST_SCRATCH/pairable-state")"
+
+  assert_eq 4 "$(grep -Fc 'args: --agent NoInputNoOutput' "$TEST_SCRATCH/pair-sessions")"
+  assert_eq 4 "$(grep -Fc 'pairable on' "$TEST_SCRATCH/pair-sessions")"
+  assert_eq 4 "$(grep -Fc "pair $mac" "$TEST_SCRATCH/pair-sessions")"
   assert_file_not_contains "$TEST_SCRATCH/pair-sessions" 'quit'
-  assert_eq 3 "$(wc -l < "$TEST_SCRATCH/terminated-pair-sessions")"
-  assert_eq 2 "$(grep -Fc 'pairable off' "$TEST_SCRATCH/pairable-restores")"
+  assert_eq 4 "$(wc -l < "$TEST_SCRATCH/terminated-pair-sessions")"
+  assert_eq 3 "$(grep -Fc 'pairable off' "$TEST_SCRATCH/pairable-restores")"
   assert_eq 1 "$(grep -Fc 'pairable on' "$TEST_SCRATCH/pairable-restores")"
-  assert_eq 3 "$(grep -Fc 'quit' "$TEST_SCRATCH/pairable-restores")"
+  assert_eq 4 "$(grep -Fc 'quit' "$TEST_SCRATCH/pairable-restores")"
   assert_eq 2 "$(grep -Fc "select $controller" "$TEST_SCRATCH/pair-sessions")"
   assert_eq $'args: --agent NoInputNoOutput\npairable on\npair AA:BB:CC:DD:EE:FF' \
     "$(sed -n '1,/session-end/{ /session-end/d; p; }' "$TEST_SCRATCH/pair-sessions")"
