@@ -2700,6 +2700,43 @@ test_routing_cleanup_checkpoints_deadline_progress() {
   assert_file_contains "$ROUTING_STATE_FILE" $'stream\t'"$remaining_serial"$'\t89'
 }
 
+test_default_cleanup_revalidates_and_retires_missing_user() {
+  local user missing_user=a2dpilot-user-that-does-not-exist queries
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  ROUTING_STATE_USER=$user
+  ROUTING_DEFAULT_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
+  write_routing_state
+  printf '0\n' > "$TEST_SCRATCH/default-queries"
+  configured_default_sink() {
+    queries=$(< "$TEST_SCRATCH/default-queries")
+    queries=$((queries + 1))
+    printf '%s\n' "$queries" > "$TEST_SCRATCH/default-queries"
+    if (( queries == 1 )); then
+      printf 'bluez_output.AA_BB_CC_DD_EE_FF.1\n'
+    else
+      printf 'alsa_output.user-choice\n'
+    fi
+  }
+  bounded_user_wpctl() { : > "$TEST_SCRATCH/new-default-cleared"; }
+
+  clear_owned_routing "$user"
+  [[ ! -e $TEST_SCRATCH/new-default-cleared ]] || \
+    fail 'cleanup cleared a default that changed after ownership validation'
+  [[ ! -e $ROUTING_STATE_FILE ]] || \
+    fail 'changed default retained stale routing provenance'
+
+  ROUTING_STATE_USER=$missing_user
+  ROUTING_DEFAULT_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
+  write_routing_state
+  configured_default_sink() { fail 'missing-user cleanup queried PipeWire'; }
+  clear_owned_routing "$missing_user"
+  [[ ! -e $ROUTING_STATE_FILE ]] || \
+    fail 'missing audio user retained unusable routing provenance'
+}
+
 test_recycled_sink_is_not_defaulted() {
   local user mac=AA:BB:CC:DD:EE:FF inspections=0
   setup_scratch_dir
@@ -4109,6 +4146,8 @@ run_test 'default routing and owned cleanup' test_default_routing_and_owned_clea
 run_test 'routing write failure prevents mutation' test_routing_write_failure_prevents_mutation
 run_test 'routing cleanup checkpoints deadline progress' \
   test_routing_cleanup_checkpoints_deadline_progress
+run_test 'default cleanup revalidates and retires missing user' \
+  test_default_cleanup_revalidates_and_retires_missing_user
 run_test 'recycled sink is not defaulted' test_recycled_sink_is_not_defaulted
 run_test 'interrupted routing transition preserves prior owner' \
   test_interrupted_routing_transition_preserves_prior_owner

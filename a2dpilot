@@ -1876,6 +1876,13 @@ normalize_stream_routing_ownership() {
   fi
 }
 
+routing_default_is_owned() {
+  local current=$1
+  [[ ( -n $ROUTING_DEFAULT_NAME && $current == "$ROUTING_DEFAULT_NAME" ) ||
+     ( -n $ROUTING_PENDING_DEFAULT_NAME &&
+       $current == "$ROUTING_PENDING_DEFAULT_NAME" ) ]]
+}
+
 apply_owned_stream_target() {
   local user=$1 id=$2 serial=$3 target=$4 deadline=$5 remaining result=0
   ROUTING_MUTATION_CRITICAL=1
@@ -1930,7 +1937,6 @@ load_routing_state() {
     case $kind in
       user)
         (( have_user == 0 )) && [[ -n $first && -z $second ]] || return 1
-        id "$first" >/dev/null 2>&1 || return 1
         ROUTING_STATE_USER=$first
         have_user=1
         ;;
@@ -2039,26 +2045,50 @@ clear_owned_routing() {
   load_routing_state || return 1
   [[ -n $ROUTING_STATE_USER ]] || return 0
   [[ $ROUTING_STATE_USER == "$user" ]] || return 1
+  if ! id -- "$user" >/dev/null 2>&1; then
+    ROUTING_DEFAULT_NAME=
+    ROUTING_PENDING_DEFAULT_NAME=
+    ROUTING_PIPEWIRE_INSTANCE=
+    ROUTING_STREAM_TARGETS=()
+    ROUTING_PENDING_STREAM_TARGETS=()
+    write_routing_state
+    return 0
+  fi
   started=$(routing_now_seconds) || return 1
   deadline=$((started + ROUTING_TIMEOUT))
 
   if [[ -n $ROUTING_DEFAULT_NAME || -n $ROUTING_PENDING_DEFAULT_NAME ]]; then
     remaining=$(routing_cleanup_seconds_until_deadline "$deadline") || return 1
     if current=$(configured_default_sink "$user" "$remaining"); then
-      if [[ ( -n $ROUTING_DEFAULT_NAME && $current == "$ROUTING_DEFAULT_NAME" ) ||
-            ( -n $ROUTING_PENDING_DEFAULT_NAME &&
-              $current == "$ROUTING_PENDING_DEFAULT_NAME" ) ]]; then
+      if routing_default_is_owned "$current"; then
         remaining=$(routing_cleanup_seconds_until_deadline "$deadline") || return 1
-        ROUTING_MUTATION_CRITICAL=1
-        if bounded_user_wpctl "$user" "$remaining" clear-default 0 >/dev/null 2>&1; then
-          ROUTING_DEFAULT_NAME=
-          ROUTING_PENDING_DEFAULT_NAME=
-          write_routing_state || failed=1
+        if current=$(configured_default_sink "$user" "$remaining"); then
+          if ! routing_default_is_owned "$current"; then
+            ROUTING_DEFAULT_NAME=
+            ROUTING_PENDING_DEFAULT_NAME=
+          else
+            remaining=$(routing_cleanup_seconds_until_deadline "$deadline") || return 1
+            ROUTING_MUTATION_CRITICAL=1
+            if bounded_user_wpctl "$user" "$remaining" \
+              clear-default 0 >/dev/null 2>&1; then
+              ROUTING_DEFAULT_NAME=
+              ROUTING_PENDING_DEFAULT_NAME=
+              write_routing_state || failed=1
+            else
+              failed=1
+            fi
+            ROUTING_MUTATION_CRITICAL=0
+            (( DAEMON_STOP_REQUESTED == 0 )) || return 1
+          fi
         else
-          failed=1
+          result=$?
+          if (( result == 2 )); then
+            ROUTING_DEFAULT_NAME=
+            ROUTING_PENDING_DEFAULT_NAME=
+          else
+            failed=1
+          fi
         fi
-        ROUTING_MUTATION_CRITICAL=0
-        (( DAEMON_STOP_REQUESTED == 0 )) || return 1
       else
         ROUTING_DEFAULT_NAME=
         ROUTING_PENDING_DEFAULT_NAME=
