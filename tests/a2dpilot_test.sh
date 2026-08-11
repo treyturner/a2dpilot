@@ -824,6 +824,7 @@ EOF
 
 test_update_source_selection_and_validation() {
   local sha=0123456789abcdef0123456789abcdef01234567 ref parsed_version version_file
+  local major minor patch newer_version
   local -a valid_refs=(main feat/update_command release/v1.2.3 v1.2.3+build one@two -tag)
   local -a invalid_refs=('' '@' '/main' 'main/' 'main.' 'feat//one' 'feat/../one' \
     'feat/@{one' '.hidden' 'feat/.hidden' 'release.lock' 'feat/release.lock' 'has space' \
@@ -845,12 +846,16 @@ test_update_source_selection_and_validation() {
     if valid_update_ref "$ref"; then fail "invalid update ref was accepted: $ref"; fi
   done
   valid_a2dpilot_version "$A2DPILOT_VERSION" || fail 'running version is invalid'
+  a2dpilot_version_is_older 0.1.0 "$A2DPILOT_VERSION" || \
+    fail 'pre-routing-state application version was not detected as older'
   a2dpilot_version_is_older 0.0.9 "$A2DPILOT_VERSION" || \
     fail 'older candidate version was not detected'
   if a2dpilot_version_is_older "$A2DPILOT_VERSION" "$A2DPILOT_VERSION"; then
     fail 'equal candidate version was treated as older'
   fi
-  if a2dpilot_version_is_older 0.2.0 "$A2DPILOT_VERSION"; then
+  IFS=. read -r major minor patch <<< "$A2DPILOT_VERSION"
+  newer_version=$major.$minor.$((patch + 1))
+  if a2dpilot_version_is_older "$newer_version" "$A2DPILOT_VERSION"; then
     fail 'newer candidate version was treated as older'
   fi
   a2dpilot_version_is_older 99999999999999999999.0.0 100000000000000000000.0.0 || \
@@ -2787,6 +2792,29 @@ test_routing_write_failure_prevents_mutation() {
   [[ -e $ROUTING_STATE_FILE ]] || fail 'routing removal-failure fixture disappeared'
 }
 
+test_unchanged_routing_state_is_not_replaced() {
+  local user original_inode current_inode
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  ROUTING_STATE_USER=$user
+  ROUTING_DEFAULT_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
+  write_routing_state
+  original_inode=$(stat -c %i -- "$ROUTING_STATE_FILE")
+
+  write_routing_state
+  current_inode=$(stat -c %i -- "$ROUTING_STATE_FILE")
+  assert_eq "$original_inode" "$current_inode"
+
+  chmod 0644 "$ROUTING_STATE_FILE"
+  write_routing_state
+  assert_eq 600 "$(stat -c %a -- "$ROUTING_STATE_FILE")"
+  current_inode=$(stat -c %i -- "$ROUTING_STATE_FILE")
+  [[ $current_inode != "$original_inode" ]] || \
+    fail 'routing-state metadata repair did not replace the file'
+}
+
 test_routing_cleanup_checkpoints_deadline_progress() {
   local user clock=100 deleted_id deleted_serial remaining_serial
   setup_scratch_dir
@@ -4147,6 +4175,25 @@ test_audio_user_reconciliation() {
   assert_eq "$new_user" "$(< "$STATE_DIR/runtime-user")"
 }
 
+test_missing_previous_audio_user_retires_routing() {
+  local old_user=a2dpilot-user-that-does-not-exist new_user
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  new_user=$(id -un)
+  printf '%s\n' "$old_user" > "$STATE_DIR/runtime-user"
+  ROUTING_STATE_USER=$old_user
+  ROUTING_DEFAULT_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
+  write_routing_state
+  ensure_audio_user() { :; }
+  restore_user_state() { fail 'missing previous audio user was restored'; }
+
+  reconcile_audio_user "$new_user"
+  [[ ! -e $ROUTING_STATE_FILE ]] || \
+    fail 'missing previous audio user retained routing state'
+  assert_eq "$new_user" "$(< "$STATE_DIR/runtime-user")"
+}
+
 test_audio_user_units_are_unmasked_before_enablement() {
   local user unmask_line enable_line expected
   setup_scratch_dir
@@ -4613,6 +4660,8 @@ run_test 'PipeWire routing parsers' test_pipewire_routing_parsers
 run_test 'default routing and owned cleanup' test_default_routing_and_owned_cleanup
 run_test 'default failure still routes streams' test_default_failure_still_routes_streams
 run_test 'routing write failure prevents mutation' test_routing_write_failure_prevents_mutation
+run_test 'unchanged routing state is not replaced' \
+  test_unchanged_routing_state_is_not_replaced
 run_test 'routing cleanup checkpoints deadline progress' \
   test_routing_cleanup_checkpoints_deadline_progress
 run_test 'reconciliation checkpoints retired stream' \
@@ -4651,6 +4700,8 @@ run_test 'strict codec policy fails over to next speaker' test_daemon_codec_poli
 run_test 'daemon cooldown and bounded backoff' test_daemon_cooldown_and_backoff
 run_test 'removed active speaker is disconnected after restart' test_daemon_disconnects_removed_active_speaker
 run_test 'audio-user reconciliation' test_audio_user_reconciliation
+run_test 'missing previous audio user retires routing' \
+  test_missing_previous_audio_user_retires_routing
 run_test 'audio-user units are unmasked before enablement' test_audio_user_units_are_unmasked_before_enablement
 run_test 'user socket enablement is restored after services' test_user_unit_enablement_restores_sockets_last
 run_test 'rfkill snapshot, restore, and hard blocks' test_rfkill_snapshot_restore_and_hard_block

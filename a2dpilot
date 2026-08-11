@@ -17,7 +17,7 @@ fi
 
 set -Eeuo pipefail
 
-A2DPILOT_VERSION=0.1.0
+A2DPILOT_VERSION=0.2.0
 SCRIPT_PATH=$(readlink -f -- "${BASH_SOURCE[0]}")
 INSTALLED_CLI=/usr/local/sbin/a2dpilot
 CONFIG_FILE=/etc/a2dpilot.conf
@@ -1118,7 +1118,7 @@ reconcile_audio_user() {
   [[ -d $STATE_DIR ]] || return 0
   [[ -f $STATE_DIR/runtime-user ]] && old_user=$(< "$STATE_DIR/runtime-user")
   [[ $old_user == "$new_user" ]] && return 0
-  if [[ -n $old_user && $old_user != "$new_user" ]] && id "$old_user" >/dev/null 2>&1; then
+  if [[ -n $old_user && $old_user != "$new_user" ]]; then
     clear_owned_routing "$old_user" || return 1
   fi
   ensure_audio_user "$new_user" || return 1
@@ -2090,7 +2090,7 @@ load_routing_state() {
 }
 
 write_routing_state() {
-  local mac serial temp write_failed=0
+  local mac serial temp line content existing mode write_failed=0
   [[ -n $ROUTING_STATE_USER ]] || return 1
   if [[ -z $ROUTING_DEFAULT_NAME && -z $ROUTING_PENDING_DEFAULT_NAME &&
         ${#ROUTING_STREAM_TARGETS[@]} -eq 0 &&
@@ -2106,30 +2106,46 @@ write_routing_state() {
     valid_pipewire_instance_id "$ROUTING_PIPEWIRE_INSTANCE" || return 1
   fi
   [[ ! -e $ROUTING_STATE_FILE || -f $ROUTING_STATE_FILE && ! -L $ROUTING_STATE_FILE ]] || return 1
-  temp=$(mktemp "$STATE_DIR/.routing-overrides.XXXXXX") || return 1
-  {
-    printf 'user\t%s\n' "$ROUTING_STATE_USER" || write_failed=1
-    for mac in "${!ROUTING_STATE_SPEAKERS[@]}"; do
-      printf 'speaker\t%s\n' "$mac" || write_failed=1
-    done
-    if [[ -n $ROUTING_DEFAULT_NAME ]]; then
-      printf 'default\t%s\n' "$ROUTING_DEFAULT_NAME" || write_failed=1
-    fi
-    if [[ -n $ROUTING_PENDING_DEFAULT_NAME ]]; then
-      printf 'default-pending\t%s\n' "$ROUTING_PENDING_DEFAULT_NAME" || write_failed=1
-    fi
-    if (( ${#ROUTING_STREAM_TARGETS[@]} + ${#ROUTING_PENDING_STREAM_TARGETS[@]} > 0 )); then
-      printf 'instance\t%s\n' "$ROUTING_PIPEWIRE_INSTANCE" || write_failed=1
-    fi
+  printf -v content 'user\t%s' "$ROUTING_STATE_USER"
+  for mac in "${!ROUTING_STATE_SPEAKERS[@]}"; do
+    printf -v line '\nspeaker\t%s' "$mac"
+    content+=$line
+  done
+  if [[ -n $ROUTING_DEFAULT_NAME ]]; then
+    printf -v line '\ndefault\t%s' "$ROUTING_DEFAULT_NAME"
+    content+=$line
+  fi
+  if [[ -n $ROUTING_PENDING_DEFAULT_NAME ]]; then
+    printf -v line '\ndefault-pending\t%s' "$ROUTING_PENDING_DEFAULT_NAME"
+    content+=$line
+  fi
+  if (( ${#ROUTING_STREAM_TARGETS[@]} + ${#ROUTING_PENDING_STREAM_TARGETS[@]} > 0 )); then
+    printf -v line '\ninstance\t%s' "$ROUTING_PIPEWIRE_INSTANCE"
+    content+=$line
+  fi
+  if (( ${#ROUTING_STREAM_TARGETS[@]} > 0 )); then
     for serial in "${!ROUTING_STREAM_TARGETS[@]}"; do
-      printf 'stream\t%s\t%s\n' "$serial" "${ROUTING_STREAM_TARGETS[$serial]}" || \
-        write_failed=1
+      printf -v line '\nstream\t%s\t%s' "$serial" "${ROUTING_STREAM_TARGETS[$serial]}"
+      content+=$line
     done
+  fi
+  if (( ${#ROUTING_PENDING_STREAM_TARGETS[@]} > 0 )); then
     for serial in "${!ROUTING_PENDING_STREAM_TARGETS[@]}"; do
-      printf 'stream-pending\t%s\t%s\n' \
-        "$serial" "${ROUTING_PENDING_STREAM_TARGETS[$serial]}" || write_failed=1
+      printf -v line '\nstream-pending\t%s\t%s' \
+        "$serial" "${ROUTING_PENDING_STREAM_TARGETS[$serial]}"
+      content+=$line
     done
-  } > "$temp" || write_failed=1
+  fi
+  if [[ -f $ROUTING_STATE_FILE && ! -L $ROUTING_STATE_FILE &&
+        -O $ROUTING_STATE_FILE && -G $ROUTING_STATE_FILE ]]; then
+    mode=$(stat -c %a -- "$ROUTING_STATE_FILE") || mode=
+    existing=$(< "$ROUTING_STATE_FILE")
+    if [[ $mode == 600 && $existing == "$content" ]]; then
+      return 0
+    fi
+  fi
+  temp=$(mktemp "$STATE_DIR/.routing-overrides.XXXXXX") || return 1
+  printf '%s\n' "$content" > "$temp" || write_failed=1
   if (( write_failed )); then
     rm -f -- "$temp"
     return 1
