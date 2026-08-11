@@ -2144,6 +2144,21 @@ apply_owned_stream_target() {
     unset "ROUTING_PENDING_STREAM_SPEAKERS[$serial]"
     write_routing_state || true
     result=1
+  elif ! inspect_pipewire_node "$user" "$id" "$remaining"; then
+    unset "ROUTING_PENDING_STREAM_TARGETS[$serial]"
+    unset "ROUTING_PENDING_STREAM_SPEAKERS[$serial]"
+    write_routing_state || result=1
+    (( result != 0 )) || result=2
+  elif [[ $PIPEWIRE_NODE_CLASS != Stream/Output/Audio ||
+          $PIPEWIRE_NODE_SERIAL != "$serial" ]]; then
+    clear_stream_routing_ownership "$serial"
+    write_routing_state || result=1
+    (( result != 0 )) || result=3
+  elif ! remaining=$(routing_seconds_until_deadline "$deadline"); then
+    unset "ROUTING_PENDING_STREAM_TARGETS[$serial]"
+    unset "ROUTING_PENDING_STREAM_SPEAKERS[$serial]"
+    write_routing_state || true
+    result=1
   elif ! bounded_user_pw_metadata "$user" "$remaining" -n default \
     "$id" target.object "$target" Spa:Id >/dev/null 2>&1; then
     # The command was attempted and may have changed metadata before failing,
@@ -3684,7 +3699,7 @@ remember_daemon_codec_policy() {
   local -a codecs=()
   if [[ -z $policy ]]; then
     rm -f -- "$path"
-    return 0
+    return
   fi
   valid_mac "$mac" || return 1
   read -r -a codecs <<< "$policy"
@@ -3693,9 +3708,11 @@ remember_daemon_codec_policy() {
     valid_a2dp_codec "$codec" || return 1
   done
   temp=$(mktemp "$STATE_DIR/.active-codec-policy.XXXXXX") || return 1
-  printf '%s\t%s\n' "$mac" "$policy" > "$temp"
-  chmod 0600 "$temp"
-  mv -f -- "$temp" "$path"
+  if ! printf '%s\t%s\n' "$mac" "$policy" > "$temp" ||
+     ! chmod 0600 "$temp" || ! mv -f -- "$temp" "$path"; then
+    rm -f -- "$temp" || true
+    return 1
+  fi
 }
 
 load_daemon_codec_policy() {
@@ -3725,17 +3742,20 @@ load_daemon_codec_policy() {
 
 remember_daemon_active() {
   local mac=${1:-} path=$STATE_DIR/active-speaker temp
-  DAEMON_ACTIVE=$mac
   if [[ -z $mac ]]; then
-    rm -f -- "$path"
-    remember_daemon_codec_policy '' ''
+    remember_daemon_codec_policy '' '' || return 1
+    rm -f -- "$path" || return 1
+    DAEMON_ACTIVE=
     return 0
   fi
   valid_mac "$mac" || return 1
   temp=$(mktemp "$STATE_DIR/.active-speaker.XXXXXX") || return 1
-  printf '%s\n' "$mac" > "$temp"
-  chmod 0600 "$temp"
-  mv -f -- "$temp" "$path"
+  if ! printf '%s\n' "$mac" > "$temp" || ! chmod 0600 "$temp" ||
+     ! mv -f -- "$temp" "$path"; then
+    rm -f -- "$temp" || true
+    return 1
+  fi
+  DAEMON_ACTIVE=$mac
 }
 
 read_daemon_active_state() {
@@ -4565,6 +4585,11 @@ print_routing_status() {
           }
           if ! remaining=$(routing_seconds_until_deadline "$stream_deadline") || \
              ! inspect_pipewire_node "$CFG_AUDIO_USER" "$id" "$remaining"; then
+            inspection_failed=1
+            break
+          fi
+          if [[ $PIPEWIRE_NODE_CLASS != Stream/Output/Audio ||
+                $PIPEWIRE_NODE_SERIAL != "$serial" ]]; then
             inspection_failed=1
             break
           fi

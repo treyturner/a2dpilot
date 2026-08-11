@@ -2092,6 +2092,35 @@ test_status_rejects_unverified_or_recycled_active_node() {
   assert_contains "$output" 'Playback streams off active sink: n/a'
 }
 
+test_status_rejects_recycled_playback_stream() {
+  local user output
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  CFG_AUDIO_USER=$user
+  printf 'AA:BB:CC:DD:EE:FF\n' > "$STATE_DIR/active-speaker"
+  find_a2dp_node_id() { printf '83\n'; }
+  configured_default_sink() { return 2; }
+  enumerate_playback_streams() { printf '95 138\n'; }
+  inspect_pipewire_node() {
+    if [[ $2 == 83 ]]; then
+      PIPEWIRE_NODE_SERIAL=89
+      PIPEWIRE_NODE_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
+      PIPEWIRE_NODE_CLASS=Audio/Sink
+      PIPEWIRE_NODE_DRIVER=
+    else
+      PIPEWIRE_NODE_SERIAL=999
+      PIPEWIRE_NODE_NAME='Recycled Player ID'
+      PIPEWIRE_NODE_CLASS=Stream/Output/Audio
+      PIPEWIRE_NODE_DRIVER=83
+    fi
+  }
+
+  output=$(print_routing_status)
+  assert_contains "$output" 'Playback streams off active sink: unknown'
+}
+
 test_pairing_provenance_and_existing_bond() {
   local user mac=AA:BB:CC:DD:EE:FF paired=0 paired_file trusted_file
   setup_scratch_dir
@@ -2504,6 +2533,35 @@ test_forget_failure_preserves_routing_and_configuration() {
   assert_file_contains "$CONFIG_FILE" "speaker = $mac"
   assert_file_contains "$ROUTING_STATE_FILE" \
     $'default\tbluez_output.AA_BB_CC_DD_EE_FF.1\tAA:BB:CC:DD:EE:FF'
+}
+
+test_forget_active_state_failure_preserves_configuration() {
+  local user mac=AA:BB:CC:DD:EE:FF output rc
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  write_test_config "$CONFIG_FILE" "$user" "$mac"
+  printf '%s\n' "$mac" > "$STATE_DIR/active-speaker"
+  printf '%s\t%s\n' "$mac" 'aptx sbc' > "$STATE_DIR/active-codec-policy"
+  : > "$STATE_FILE"
+  require_root() { :; }
+  acquire_lock() { :; }
+  release_lock() { :; }
+  rm() {
+    if [[ ${*: -1} == "$STATE_DIR/active-speaker" ]]; then return 1; fi
+    command rm "$@"
+  }
+  disconnect_bluetooth_device() { fail 'active-state failure disconnected the speaker'; }
+
+  set +e
+  output=$(forget_action "$mac" --yes 2>&1)
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'forget succeeded after active-state deletion failed'
+  assert_contains "$output" "Could not clear active-speaker state for $mac"
+  assert_file_contains "$CONFIG_FILE" "speaker = $mac"
+  assert_eq "$mac" "$(< "$STATE_DIR/active-speaker")"
 }
 
 test_media_control_health_modes() {
@@ -4055,7 +4113,7 @@ test_recycled_stream_is_not_targeted() {
         stream_inspections=$(< "$stream_inspections_file")
         stream_inspections=$((stream_inspections + 1))
         printf '%s\n' "$stream_inspections" > "$stream_inspections_file"
-        if (( stream_inspections == 1 )); then
+        if (( stream_inspections <= 2 )); then
           printf '%s\n' '  * object.serial = "138"' \
             '  * node.name = "Short-lived Player"' \
             '    node.driver-id = "35"' \
@@ -5027,6 +5085,8 @@ run_test 'status stream inspection shares one deadline' \
   test_status_stream_inspection_shared_deadline
 run_test 'status rejects an unverified or recycled active node' \
   test_status_rejects_unverified_or_recycled_active_node
+run_test 'status rejects a recycled playback stream' \
+  test_status_rejects_recycled_playback_stream
 run_test 'pairing provenance and existing bonds' test_pairing_provenance_and_existing_bond
 run_test 'pairing session terminates after bonding' test_pairing_session_terminates_after_bonding
 run_test 'pair --all attempts every configured speaker' test_pair_all_attempts_every_configured_speaker
@@ -5041,6 +5101,8 @@ run_test 'forget commits before routing cleanup failure' \
   test_forget_commits_before_routing_cleanup_failure
 run_test 'forget failure preserves routing and configuration' \
   test_forget_failure_preserves_routing_and_configuration
+run_test 'forget active-state failure preserves configuration' \
+  test_forget_active_state_failure_preserves_configuration
 run_test 'media-control health modes' test_media_control_health_modes
 run_test 'optimistic codec reporting' test_codec_reporting_is_optimistic
 run_test 'PipeWire codec property parsing' test_codec_property_parsing
