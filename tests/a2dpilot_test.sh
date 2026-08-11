@@ -2275,13 +2275,14 @@ test_forget_removes_config_and_provenance() {
     fail 'forgotten active speaker retained daemon state'
 }
 
-test_forget_clears_routing_without_active_state() {
-  local user mac=AA:BB:CC:DD:EE:FF
+test_forget_clears_routing_for_prior_speaker() {
+  local user mac=AA:BB:CC:DD:EE:FF active=10:20:30:40:50:60
   setup_scratch_dir
   load_app
   configure_scratch_paths
   user=$(id -un)
-  write_test_config "$CONFIG_FILE" "$user" "$mac"
+  write_test_config "$CONFIG_FILE" "$user" "$mac" "$active"
+  printf '%s\n' "$active" > "$STATE_DIR/active-speaker"
   : > "$STATE_FILE"
   ROUTING_STATE_USER=$user
   ROUTING_DEFAULT_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
@@ -2301,7 +2302,8 @@ test_forget_clears_routing_without_active_state() {
   forget_action "$mac" --yes
   assert_eq "$user" "$(< "$TEST_SCRATCH/forget-routing-user")"
   [[ ! -e $ROUTING_STATE_FILE ]] || \
-    fail 'forget retained routing provenance when active-speaker state was absent'
+    fail 'forget retained routing provenance for a prior speaker'
+  assert_eq "$active" "$(< "$STATE_DIR/active-speaker")"
 }
 
 test_forget_retains_active_speaker_after_routing_cleanup_failure() {
@@ -2621,6 +2623,52 @@ EOF
   assert_eq sentinel "$(< "$TEST_SCRATCH/redirected-routing-state")"
 }
 
+test_default_failure_still_routes_streams() {
+  local user mac=AA:BB:CC:DD:EE:FF stream_target=77 stream_driver=35
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  CFG_AUDIO_USER=$user
+  routing_now_seconds() { printf '100\n'; }
+  find_a2dp_node_id() { printf '83\n'; }
+  configured_default_sink() { printf 'alsa_output.builtin\n'; }
+  pipewire_instance_id() { printf '01234567-89ab-cdef-0123-456789abcdef:4321:987654\n'; }
+  enumerate_playback_streams() { printf '95 138\n'; }
+  inspect_pipewire_node() {
+    if [[ $2 == 83 ]]; then
+      PIPEWIRE_NODE_SERIAL=89
+      PIPEWIRE_NODE_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
+      PIPEWIRE_NODE_CLASS=Audio/Sink
+      PIPEWIRE_NODE_DRIVER=
+    else
+      PIPEWIRE_NODE_SERIAL=138
+      PIPEWIRE_NODE_NAME='Long-lived Player'
+      PIPEWIRE_NODE_CLASS=Stream/Output/Audio
+      PIPEWIRE_NODE_DRIVER=$stream_driver
+    fi
+  }
+  bounded_user_wpctl() {
+    [[ $3 == set-default ]] || return 1
+    return 1
+  }
+  stream_target_serial() { printf '%s\n' "$stream_target"; }
+  bounded_user_pw_metadata() {
+    [[ $* == *'95 target.object 89 Spa:Id'* ]] || return 1
+    stream_target=89
+    stream_driver=83
+  }
+
+  if reconcile_speaker_routing "$mac"; then
+    fail 'failed default selection reported complete routing success'
+  fi
+  assert_eq 89 "$stream_target"
+  assert_eq 83 "$stream_driver"
+  assert_file_contains "$ROUTING_STATE_FILE" \
+    $'default-pending\tbluez_output.AA_BB_CC_DD_EE_FF.1'
+  assert_file_contains "$ROUTING_STATE_FILE" $'stream\t138\t89'
+}
+
 test_routing_write_failure_prevents_mutation() {
   local user mac=AA:BB:CC:DD:EE:FF output rc
   setup_scratch_dir
@@ -2740,8 +2788,28 @@ test_default_cleanup_revalidates_and_retires_missing_user() {
   [[ ! -e $ROUTING_STATE_FILE ]] || \
     fail 'changed default retained stale routing provenance'
 
+  ROUTING_STATE_USER=$user
+  ROUTING_DEFAULT_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
+  ROUTING_PIPEWIRE_INSTANCE=01234567-89ab-cdef-0123-456789abcdef:4321:987654
+  ROUTING_STREAM_TARGETS=([138]=89)
+  write_routing_state
+  configured_default_sink() { printf 'alsa_output.user-choice\n'; }
+  pipewire_instance_id() {
+    assert_file_not_contains "$ROUTING_STATE_FILE" \
+      $'default\tbluez_output.AA_BB_CC_DD_EE_FF.1' || return 1
+    return 1
+  }
+  if clear_owned_routing "$user"; then
+    fail 'failed stream discovery reported complete routing cleanup'
+  fi
+  assert_file_not_contains "$ROUTING_STATE_FILE" \
+    $'default\tbluez_output.AA_BB_CC_DD_EE_FF.1'
+  assert_file_contains "$ROUTING_STATE_FILE" $'stream\t138\t89'
+
   ROUTING_STATE_USER=$missing_user
   ROUTING_DEFAULT_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
+  ROUTING_PIPEWIRE_INSTANCE=
+  ROUTING_STREAM_TARGETS=()
   write_routing_state
   configured_default_sink() { fail 'missing-user cleanup queried PipeWire'; }
   clear_owned_routing "$missing_user"
@@ -4207,8 +4275,8 @@ run_test 'pairing session terminates after bonding' test_pairing_session_termina
 run_test 'pair --all attempts every configured speaker' test_pair_all_attempts_every_configured_speaker
 run_test 'interactive scan selection' test_interactive_scan_selection
 run_test 'forget removes config and provenance' test_forget_removes_config_and_provenance
-run_test 'forget clears routing without active state' \
-  test_forget_clears_routing_without_active_state
+run_test 'forget clears routing for a prior speaker' \
+  test_forget_clears_routing_for_prior_speaker
 run_test 'forget retains active speaker after routing cleanup failure' \
   test_forget_retains_active_speaker_after_routing_cleanup_failure
 run_test 'media-control health modes' test_media_control_health_modes
@@ -4216,6 +4284,7 @@ run_test 'optimistic codec reporting' test_codec_reporting_is_optimistic
 run_test 'PipeWire codec property parsing' test_codec_property_parsing
 run_test 'PipeWire routing parsers' test_pipewire_routing_parsers
 run_test 'default routing and owned cleanup' test_default_routing_and_owned_cleanup
+run_test 'default failure still routes streams' test_default_failure_still_routes_streams
 run_test 'routing write failure prevents mutation' test_routing_write_failure_prevents_mutation
 run_test 'routing cleanup checkpoints deadline progress' \
   test_routing_cleanup_checkpoints_deadline_progress

@@ -1890,7 +1890,7 @@ routing_mutation_signal() {
   ROUTING_MUTATION_SIGNAL_STATUS=$1
 }
 
-begin_routing_cleanup_mutation() {
+begin_routing_cleanup() {
   ROUTING_MUTATION_SIGNAL_STATUS=0
   ROUTING_MUTATION_OWNS_INT_TRAP=0
   ROUTING_MUTATION_OWNS_TERM_TRAP=0
@@ -1905,7 +1905,7 @@ begin_routing_cleanup_mutation() {
   ROUTING_MUTATION_CRITICAL=1
 }
 
-end_routing_cleanup_mutation() {
+end_routing_cleanup() {
   local signal_status
   (( ROUTING_MUTATION_OWNS_INT_TRAP == 0 )) || trap - INT
   (( ROUTING_MUTATION_OWNS_TERM_TRAP == 0 )) || trap - TERM
@@ -2072,9 +2072,9 @@ routing_cleanup_seconds_until_deadline() {
   fi
 }
 
-clear_owned_routing() {
+clear_owned_routing_impl() {
   local user=$1 deadline started remaining current current_instance result streams id serial extra
-  local owned pending failed=0 mutation_signal=0
+  local owned pending failed=0
   local -A stream_ids=() owned_streams=()
   load_routing_state || return 1
   [[ -n $ROUTING_STATE_USER ]] || return 0
@@ -2102,7 +2102,6 @@ clear_owned_routing() {
             ROUTING_PENDING_DEFAULT_NAME=
           else
             remaining=$(routing_cleanup_seconds_until_deadline "$deadline") || return 1
-            begin_routing_cleanup_mutation
             if bounded_user_wpctl "$user" "$remaining" \
               clear-default 0 >/dev/null 2>&1; then
               ROUTING_DEFAULT_NAME=
@@ -2111,8 +2110,6 @@ clear_owned_routing() {
             else
               failed=1
             fi
-            end_routing_cleanup_mutation || mutation_signal=$?
-            (( mutation_signal == 0 )) || return "$mutation_signal"
             (( DAEMON_STOP_REQUESTED == 0 )) || return 1
           fi
         else
@@ -2138,6 +2135,9 @@ clear_owned_routing() {
       fi
     fi
   fi
+  # Default ownership may have been retired without issuing a mutation. Make
+  # that decision durable before stream inspection can block or be interrupted.
+  write_routing_state || return 1
 
   if (( ${#ROUTING_STREAM_TARGETS[@]} + ${#ROUTING_PENDING_STREAM_TARGETS[@]} > 0 )); then
     remaining=$(routing_cleanup_seconds_until_deadline "$deadline") || return 1
@@ -2191,7 +2191,6 @@ clear_owned_routing() {
           if [[ ( -n $owned && $current == "$owned" ) ||
                 ( -n $pending && $current == "$pending" ) ]]; then
             remaining=$(routing_cleanup_seconds_until_deadline "$deadline") || return 1
-            begin_routing_cleanup_mutation
             if bounded_user_pw_metadata "$user" "$remaining" \
               -d -n default "$id" target.object >/dev/null 2>&1; then
               unset "ROUTING_STREAM_TARGETS[$serial]"
@@ -2200,8 +2199,6 @@ clear_owned_routing() {
             else
               failed=1
             fi
-            end_routing_cleanup_mutation || mutation_signal=$?
-            (( mutation_signal == 0 )) || return "$mutation_signal"
             (( DAEMON_STOP_REQUESTED == 0 )) || return 1
           else
             unset "ROUTING_STREAM_TARGETS[$serial]"
@@ -2221,6 +2218,15 @@ clear_owned_routing() {
   fi
   write_routing_state || return 1
   (( failed == 0 ))
+}
+
+clear_owned_routing() {
+  local result=0 signal_status=0
+  begin_routing_cleanup
+  clear_owned_routing_impl "$@" || result=$?
+  end_routing_cleanup || signal_status=$?
+  (( signal_status == 0 )) || return "$signal_status"
+  return "$result"
 }
 
 reconcile_speaker_routing() {
@@ -2300,26 +2306,25 @@ reconcile_speaker_routing() {
       set-default "$sink" >/dev/null 2>&1; then
       # Retain the pending value because the attempted command may have changed
       # metadata before returning failure or timing out.
-      mutation_result=1
+      mutation_result=2
     else
       ROUTING_DEFAULT_NAME=$sink_name
       ROUTING_PENDING_DEFAULT_NAME=
       write_routing_state || mutation_result=1
     fi
     ROUTING_MUTATION_CRITICAL=0
-    (( mutation_result == 0 )) || return 1
     (( DAEMON_STOP_REQUESTED == 0 )) || return 1
-    while true; do
-      remaining=$(routing_seconds_until_deadline "$deadline") || {
-        write_routing_state || true
-        return 1
-      }
-      if current=$(configured_default_sink "$CFG_AUDIO_USER" "$remaining") && \
-         [[ $current == "$sink_name" ]]; then
-        break
-      fi
-      sleep 0.1
-    done
+    case $mutation_result in
+      0)
+        if ! remaining=$(routing_seconds_until_deadline "$deadline") || \
+           ! current=$(configured_default_sink "$CFG_AUDIO_USER" "$remaining") || \
+           [[ $current != "$sink_name" ]]; then
+          routing_failed=1
+        fi
+        ;;
+      1) return 1 ;;
+      2) routing_failed=1 ;;
+    esac
   fi
 
   remaining=$(routing_seconds_until_deadline "$deadline") || return 1
@@ -3107,13 +3112,13 @@ forget_action() {
       release_lock
       die "Could not safely read the active-speaker state."
     fi
-    load_routing_state || {
-      release_lock
-      die "Could not safely read the audio-routing state."
-    }
-    routing_user=$ROUTING_STATE_USER
   fi
-  if [[ $active_speaker == "$mac" ]]; then
+  load_routing_state || {
+    release_lock
+    die "Could not safely read the audio-routing state."
+  }
+  routing_user=$ROUTING_STATE_USER
+  if [[ -z $routing_user && $active_speaker == "$mac" ]]; then
     routing_user=$CFG_AUDIO_USER
   fi
   if [[ -n $routing_user ]]; then
