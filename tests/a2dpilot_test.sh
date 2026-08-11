@@ -2906,6 +2906,48 @@ test_daemon_signal_defers_during_routing_mutation() {
   assert_eq 0 "$ROUTING_MUTATION_CRITICAL"
   assert_file_contains "$ROUTING_STATE_FILE" $'default\tbluez_output.AA_BB_CC_DD_EE_FF.1'
   assert_file_not_contains "$ROUTING_STATE_FILE" 'default-pending'
+
+  DAEMON_STOP_REQUESTED=0
+  bounded_user_wpctl() {
+    [[ $ROUTING_MUTATION_CRITICAL == 1 ]] || \
+      fail 'default cleanup ran outside its critical section'
+    default_sink=
+    daemon_signal
+  }
+  if clear_owned_routing "$user"; then
+    fail 'stop-requested default cleanup reported success'
+  fi
+  assert_eq 1 "$DAEMON_STOP_REQUESTED"
+  assert_eq 0 "$ROUTING_MUTATION_CRITICAL"
+  [[ ! -e $ROUTING_STATE_FILE ]] || \
+    fail 'interrupted default cleanup retained stale provenance'
+
+  DAEMON_STOP_REQUESTED=0
+  ROUTING_STATE_USER=$user
+  ROUTING_PIPEWIRE_INSTANCE=01234567-89ab-cdef-0123-456789abcdef:4321:987654
+  ROUTING_STREAM_TARGETS=([138]=89)
+  write_routing_state
+  pipewire_instance_id() { printf '01234567-89ab-cdef-0123-456789abcdef:4321:987654\n'; }
+  enumerate_playback_streams() { printf '95 138\n'; }
+  inspect_pipewire_node() {
+    PIPEWIRE_NODE_SERIAL=138
+    PIPEWIRE_NODE_NAME='Long-lived Player'
+    PIPEWIRE_NODE_CLASS=Stream/Output/Audio
+    PIPEWIRE_NODE_DRIVER=83
+  }
+  stream_target_serial() { printf '89\n'; }
+  bounded_user_pw_metadata() {
+    [[ $ROUTING_MUTATION_CRITICAL == 1 ]] || \
+      fail 'stream cleanup ran outside its critical section'
+    daemon_signal
+  }
+  if clear_owned_routing "$user"; then
+    fail 'stop-requested stream cleanup reported success'
+  fi
+  assert_eq 1 "$DAEMON_STOP_REQUESTED"
+  assert_eq 0 "$ROUTING_MUTATION_CRITICAL"
+  [[ ! -e $ROUTING_STATE_FILE ]] || \
+    fail 'interrupted stream cleanup retained stale provenance'
 }
 
 test_runtime_reconciliation_failure_clears_routing() {

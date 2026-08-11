@@ -2049,12 +2049,16 @@ clear_owned_routing() {
             ( -n $ROUTING_PENDING_DEFAULT_NAME &&
               $current == "$ROUTING_PENDING_DEFAULT_NAME" ) ]]; then
         remaining=$(routing_cleanup_seconds_until_deadline "$deadline") || return 1
+        ROUTING_MUTATION_CRITICAL=1
         if bounded_user_wpctl "$user" "$remaining" clear-default 0 >/dev/null 2>&1; then
           ROUTING_DEFAULT_NAME=
           ROUTING_PENDING_DEFAULT_NAME=
+          write_routing_state || failed=1
         else
           failed=1
         fi
+        ROUTING_MUTATION_CRITICAL=0
+        (( DAEMON_STOP_REQUESTED == 0 )) || return 1
       else
         ROUTING_DEFAULT_NAME=
         ROUTING_PENDING_DEFAULT_NAME=
@@ -2122,13 +2126,17 @@ clear_owned_routing() {
           if [[ ( -n $owned && $current == "$owned" ) ||
                 ( -n $pending && $current == "$pending" ) ]]; then
             remaining=$(routing_cleanup_seconds_until_deadline "$deadline") || return 1
+            ROUTING_MUTATION_CRITICAL=1
             if bounded_user_pw_metadata "$user" "$remaining" \
               -d -n default "$id" target.object >/dev/null 2>&1; then
               unset "ROUTING_STREAM_TARGETS[$serial]"
               unset "ROUTING_PENDING_STREAM_TARGETS[$serial]"
+              write_routing_state || failed=1
             else
               failed=1
             fi
+            ROUTING_MUTATION_CRITICAL=0
+            (( DAEMON_STOP_REQUESTED == 0 )) || return 1
           else
             unset "ROUTING_STREAM_TARGETS[$serial]"
             unset "ROUTING_PENDING_STREAM_TARGETS[$serial]"
