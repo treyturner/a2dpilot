@@ -1389,9 +1389,13 @@ test_onboard_audio_status_and_matching() {
 	id 52, type PipeWire:Interface:Device/3
 		device.api = "v4l2"
 		media.class = "Video/Device"
+	id 53, type PipeWire:Interface:Device/3
+		device.api = "bluez5"
+		media.class = "Audio/Device"
 EOF
       return 0
     fi
+    printf '%s\n' "$4" >> "$TEST_SCRATCH/onboard-inspections"
     case $4 in
       48) cat <<'EOF'
 	id: 48
@@ -1435,6 +1439,7 @@ EOF
   visible_onboard_devices
   assert_eq 1 "$ONBOARD_ANALOG_VISIBLE"
   assert_eq 1 "$ONBOARD_HDMI_VISIBLE"
+  assert_file_not_contains "$TEST_SCRATCH/onboard-inspections" '53'
   output=$(print_onboard_audio_status all)
   assert_contains "$output" 'Onboard analog: enabled (1 visible matching devices)'
   assert_contains "$output" 'Onboard HDMI: enabled (1 visible matching devices)'

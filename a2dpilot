@@ -2480,8 +2480,11 @@ list_onboard_audio_device_ids() {
       if [[ -n $id ]]; then
         [[ -n $class ]] || invalid=1
         if [[ $class == Audio/Device ]]; then
-          [[ $api == alsa ]] || invalid=1
-          ONBOARD_DEVICE_IDS+=("$id")
+          if [[ -z $api ]]; then
+            invalid=1
+          elif [[ $api == alsa ]]; then
+            ONBOARD_DEVICE_IDS+=("$id")
+          fi
         fi
       fi
       id=${BASH_REMATCH[1]}
@@ -2500,8 +2503,11 @@ list_onboard_audio_device_ids() {
   if [[ -n $id ]]; then
     [[ -n $class ]] || invalid=1
     if [[ $class == Audio/Device ]]; then
-      [[ $api == alsa ]] || invalid=1
-      ONBOARD_DEVICE_IDS+=("$id")
+      if [[ -z $api ]]; then
+        invalid=1
+      elif [[ $api == alsa ]]; then
+        ONBOARD_DEVICE_IDS+=("$id")
+      fi
     fi
   fi
   (( invalid == 0 ))
