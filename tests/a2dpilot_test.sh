@@ -2582,7 +2582,12 @@ test_routing_write_failure_prevents_mutation() {
       : > "$TEST_SCRATCH/routing-mutated"
     fi
   }
-  write_routing_state() { return 1; }
+  chmod() {
+    if [[ ${1:-} == 0600 && ${2:-} == "$STATE_DIR"/.routing-overrides.* ]]; then
+      return 1
+    fi
+    /usr/bin/chmod "$@"
+  }
 
   set +e
   output=$(reconcile_speaker_routing "$mac" 2>&1)
@@ -2592,6 +2597,8 @@ test_routing_write_failure_prevents_mutation() {
   assert_eq '' "$output"
   [[ ! -e $TEST_SCRATCH/routing-mutated ]] || \
     fail 'routing metadata changed after its provenance write failed'
+  [[ -z $(find "$STATE_DIR" -maxdepth 1 -name '.routing-overrides.*' -print -quit) ]] || \
+    fail 'failed routing-state write retained its temporary file'
 }
 
 test_unmovable_stream_does_not_starve_routing() {
@@ -2732,6 +2739,58 @@ EOF
   reconcile_speaker_routing "$mac"
   assert_file_not_contains "$ROUTING_STATE_FILE" $'stream\t138\t89'
   assert_file_contains "$ROUTING_STATE_FILE" $'stream\t139\t89'
+}
+
+test_recycled_stream_is_not_targeted() {
+  local user mac=AA:BB:CC:DD:EE:FF stream_inspections stream_inspections_file
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  stream_inspections_file=$TEST_SCRATCH/stream-inspections
+  printf '0\n' > "$stream_inspections_file"
+  CFG_AUDIO_USER=$user
+  now_seconds() { printf '100\n'; }
+  find_a2dp_node_id() { printf '83\n'; }
+  configured_default_sink() { printf 'bluez_output.AA_BB_CC_DD_EE_FF.1\n'; }
+  bounded_user_pw_cli() {
+    printf '%s\n' $'\tid 95, type PipeWire:Interface:Node/3' \
+      $'\t\tobject.serial = "138"' \
+      $'\t\tmedia.class = "Stream/Output/Audio"'
+  }
+  bounded_user_wpctl() {
+    case $4 in
+      83)
+        printf '%s\n' '  * object.serial = "89"' \
+          '  * node.name = "bluez_output.AA_BB_CC_DD_EE_FF.1"' \
+          '  * media.class = "Audio/Sink"'
+        ;;
+      95)
+        stream_inspections=$(< "$stream_inspections_file")
+        stream_inspections=$((stream_inspections + 1))
+        printf '%s\n' "$stream_inspections" > "$stream_inspections_file"
+        if (( stream_inspections == 1 )); then
+          printf '%s\n' '  * object.serial = "138"' \
+            '  * node.name = "Short-lived Player"' \
+            '    node.driver-id = "35"' \
+            '  * media.class = "Stream/Output/Audio"'
+        else
+          printf '%s\n' '  * object.serial = "999"' \
+            '  * node.name = "Replacement Player"' \
+            '    node.driver-id = "35"' \
+            '  * media.class = "Stream/Output/Audio"'
+        fi
+        ;;
+    esac
+  }
+  stream_target_serial() { return 2; }
+  bounded_user_pw_metadata() { : > "$TEST_SCRATCH/recycled-stream-targeted"; }
+
+  reconcile_speaker_routing "$mac"
+  [[ ! -e $TEST_SCRATCH/recycled-stream-targeted ]] || \
+    fail 'routing targeted a recycled stream ID'
+  [[ ! -e $ROUTING_STATE_FILE ]] || \
+    fail 'recycled stream retained write-ahead routing provenance'
 }
 
 mock_a2dp_enum_profiles() {
@@ -3636,6 +3695,7 @@ run_test 'default routing and owned cleanup' test_default_routing_and_owned_clea
 run_test 'routing write failure prevents mutation' test_routing_write_failure_prevents_mutation
 run_test 'unmovable stream does not starve routing' test_unmovable_stream_does_not_starve_routing
 run_test 'vanished stream does not starve routing' test_vanished_stream_does_not_starve_routing
+run_test 'recycled stream is not targeted' test_recycled_stream_is_not_targeted
 run_test 'PipeWire codec profile discovery' test_pipewire_codec_profile_discovery
 run_test 'per-speaker codec selection' test_per_speaker_codec_selection
 run_test 'non-preemptive failover order' test_daemon_nonpreemption_and_failover_order

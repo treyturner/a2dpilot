@@ -1852,7 +1852,7 @@ load_routing_state() {
 }
 
 write_routing_state() {
-  local serial temp
+  local serial temp write_failed=0
   [[ -n $ROUTING_STATE_USER ]] || return 1
   if [[ -z $ROUTING_DEFAULT_NAME && ${#ROUTING_STREAM_TARGETS[@]} -eq 0 ]]; then
     rm -f -- "$ROUTING_STATE_FILE"
@@ -1861,14 +1861,27 @@ write_routing_state() {
   [[ ! -e $ROUTING_STATE_FILE || -f $ROUTING_STATE_FILE && ! -L $ROUTING_STATE_FILE ]] || return 1
   temp=$(mktemp "$STATE_DIR/.routing-overrides.XXXXXX") || return 1
   {
-    printf 'user\t%s\n' "$ROUTING_STATE_USER"
-    [[ -z $ROUTING_DEFAULT_NAME ]] || printf 'default\t%s\n' "$ROUTING_DEFAULT_NAME"
+    printf 'user\t%s\n' "$ROUTING_STATE_USER" || write_failed=1
+    if [[ -n $ROUTING_DEFAULT_NAME ]]; then
+      printf 'default\t%s\n' "$ROUTING_DEFAULT_NAME" || write_failed=1
+    fi
     for serial in "${!ROUTING_STREAM_TARGETS[@]}"; do
-      printf 'stream\t%s\t%s\n' "$serial" "${ROUTING_STREAM_TARGETS[$serial]}"
+      printf 'stream\t%s\t%s\n' "$serial" "${ROUTING_STREAM_TARGETS[$serial]}" || \
+        write_failed=1
     done
-  } > "$temp"
-  chmod 0600 "$temp"
-  mv -f -- "$temp" "$ROUTING_STATE_FILE"
+  } > "$temp" || write_failed=1
+  if (( write_failed )); then
+    rm -f -- "$temp"
+    return 1
+  fi
+  chmod 0600 "$temp" || {
+    rm -f -- "$temp"
+    return 1
+  }
+  mv -f -- "$temp" "$ROUTING_STATE_FILE" || {
+    rm -f -- "$temp"
+    return 1
+  }
 }
 
 clear_owned_routing() {
@@ -2030,6 +2043,17 @@ reconcile_speaker_routing() {
         if [[ $target != "$sink_serial" ]]; then
           ROUTING_STREAM_TARGETS[$serial]=$sink_serial
           write_routing_state || return 1
+          remaining=$(seconds_until_deadline "$deadline") || return 1
+          if ! inspect_pipewire_node "$CFG_AUDIO_USER" "$id" "$remaining"; then
+            routing_failed=1
+            continue
+          fi
+          if [[ $PIPEWIRE_NODE_CLASS != Stream/Output/Audio ||
+                $PIPEWIRE_NODE_SERIAL != "$serial" ]]; then
+            unset "ROUTING_STREAM_TARGETS[$serial]"
+            write_routing_state || return 1
+            continue
+          fi
           remaining=$(seconds_until_deadline "$deadline") || return 1
           bounded_user_pw_metadata "$CFG_AUDIO_USER" "$remaining" -n default \
             "$id" target.object "$sink_serial" Spa:Id >/dev/null 2>&1 || return 1
