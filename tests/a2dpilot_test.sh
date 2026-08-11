@@ -119,6 +119,16 @@ write_test_config() {
   } > "$path"
 }
 
+write_update_payload() {
+  local path=$1
+  shift
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'A2DPILOT_VERSION=%s\n' "$A2DPILOT_VERSION"
+    printf '%s\n' "$@"
+  } > "$path"
+}
+
 run_test() {
   local name=$1 test_function=$2 rc
   TESTS_RUN=$((TESTS_RUN + 1))
@@ -753,11 +763,12 @@ EOF
 }
 
 test_update_source_selection_and_validation() {
-  local sha=0123456789abcdef0123456789abcdef01234567 ref
+  local sha=0123456789abcdef0123456789abcdef01234567 ref parsed_version version_file
   local -a valid_refs=(main feat/update_command release/v1.2.3 v1.2.3+build one@two -tag)
   local -a invalid_refs=('' '@' '/main' 'main/' 'main.' 'feat//one' 'feat/../one' \
     'feat/@{one' '.hidden' 'feat/.hidden' 'release.lock' 'feat/release.lock' 'has space' \
     'question?' 'star*' 'back\slash')
+  setup_scratch_dir
   load_app
   assert_eq 'https://raw.githubusercontent.com/treyturner/a2dpilot/refs/heads/main/a2dpilot' \
     "$(update_source_url branch main)"
@@ -773,6 +784,21 @@ test_update_source_selection_and_validation() {
   for ref in "${invalid_refs[@]}"; do
     if valid_update_ref "$ref"; then fail "invalid update ref was accepted: $ref"; fi
   done
+  valid_a2dpilot_version "$A2DPILOT_VERSION" || fail 'running version is invalid'
+  a2dpilot_version_is_older 0.0.9 "$A2DPILOT_VERSION" || \
+    fail 'older candidate version was not detected'
+  if a2dpilot_version_is_older "$A2DPILOT_VERSION" "$A2DPILOT_VERSION"; then
+    fail 'equal candidate version was treated as older'
+  fi
+  if a2dpilot_version_is_older 0.2.0 "$A2DPILOT_VERSION"; then
+    fail 'newer candidate version was treated as older'
+  fi
+  a2dpilot_version_is_older 99999999999999999999.0.0 100000000000000000000.0.0 || \
+    fail 'large older candidate version was not detected'
+  version_file=$TEST_SCRATCH/versioned-executable
+  write_update_payload "$version_file" '# version fixture'
+  read_a2dpilot_version "$version_file" parsed_version || fail 'valid version was not read'
+  assert_eq "$A2DPILOT_VERSION" "$parsed_version"
 
   require_root() { :; }
   expect_failure_contains 'mutually exclusive' update_action --tag v1.0.0 --branch main
@@ -809,11 +835,8 @@ test_update_executable_only_transaction() {
   payload=$TEST_SCRATCH/update-payload
   UPDATE_EXECUTION_LOG=$TEST_SCRATCH/candidate-execution.log
   export UPDATE_EXECUTION_LOG
-  cat > "$payload" <<'EOF'
-#!/usr/bin/env bash
-printf 'executed\n' >> "$UPDATE_EXECUTION_LOG"
-# updated main
-EOF
+  write_update_payload "$payload" \
+    'printf '\''executed\n'\'' >> "$UPDATE_EXECUTION_LOG"' '# updated main'
 
   require_root() { :; }
   acquire_lock() { printf 'acquire\n' >> "$TEST_SCRATCH/lock.log"; }
@@ -892,15 +915,15 @@ EOF
   : > "$TEST_SCRATCH/systemctl.log"
 
   service_active=0
-  printf '#!/usr/bin/env bash\n# updated branch\n' > "$payload"
+  write_update_payload "$payload" '# updated branch'
   update_action --branch feat/update_command >/dev/null
   assert_file_contains "$TEST_SCRATCH/curl.log" \
     'https://raw.githubusercontent.com/treyturner/a2dpilot/refs/heads/feat/update_command/a2dpilot'
-  printf '#!/usr/bin/env bash\n# updated tag\n' > "$payload"
+  write_update_payload "$payload" '# updated tag'
   update_action --tag v1.2.3 >/dev/null
   assert_file_contains "$TEST_SCRATCH/curl.log" \
     'https://raw.githubusercontent.com/treyturner/a2dpilot/refs/tags/v1.2.3/a2dpilot'
-  printf '#!/usr/bin/env bash\n# updated sha\n' > "$payload"
+  write_update_payload "$payload" '# updated sha'
   update_action --sha "$upper_sha" >/dev/null
   assert_file_contains "$TEST_SCRATCH/curl.log" \
     'https://raw.githubusercontent.com/treyturner/a2dpilot/abcdef0123456789abcdef0123456789abcdef01/a2dpilot'
@@ -947,10 +970,17 @@ test_update_rejects_bad_candidates_and_targets() {
       empty) : > "$output_path" ;;
       no-shebang) printf 'printf "valid Bash without a shebang"\n' > "$output_path" ;;
       invalid) printf '#!/usr/bin/env bash\nif broken syntax\n' > "$output_path" ;;
+      missing-version) printf '#!/usr/bin/env bash\n# no version\n' > "$output_path" ;;
+      malformed-version) printf '#!/usr/bin/env bash\nA2DPILOT_VERSION=latest\n' > "$output_path" ;;
+      duplicate-version)
+        printf '#!/usr/bin/env bash\nA2DPILOT_VERSION=%s\nA2DPILOT_VERSION=%s\n' \
+          "$A2DPILOT_VERSION" "$A2DPILOT_VERSION" > "$output_path"
+        ;;
+      downgrade) printf '#!/usr/bin/env bash\nA2DPILOT_VERSION=0.0.9\n' > "$output_path" ;;
     esac
   }
 
-  for mode in fail empty no-shebang invalid; do
+  for mode in fail empty no-shebang invalid missing-version malformed-version duplicate-version downgrade; do
     : > "$TEST_SCRATCH/lock.log"
     set +e
     output=$(update_action 2>&1)
@@ -962,6 +992,13 @@ test_update_rejects_bad_candidates_and_targets() {
       empty) assert_contains "$output" 'empty or unsafe' ;;
       no-shebang) assert_contains "$output" 'lacks the expected Bash shebang' ;;
       invalid) assert_contains "$output" 'failed Bash syntax validation' ;;
+      missing-version|malformed-version|duplicate-version)
+        assert_contains "$output" 'must declare exactly one valid A2DPILOT_VERSION'
+        ;;
+      downgrade)
+        assert_contains "$output" "Refusing to downgrade A2DPilot from $A2DPILOT_VERSION to 0.0.9"
+        assert_contains "$output" 'sudo a2dpilot uninstall --keep-bonds'
+        ;;
     esac
     candidate=$(< "$TEST_SCRATCH/candidate-path")
     [[ ! -e $candidate ]] || fail "$mode update left its candidate behind"
@@ -1004,7 +1041,7 @@ test_update_activation_rollback_and_interruption() {
   printf '#!/usr/bin/env bash\n# old executable\n' > "$INSTALLED_CLI"
   chmod 0755 "$INSTALLED_CLI"
   payload=$TEST_SCRATCH/update-payload
-  printf '#!/usr/bin/env bash\n# new executable\n' > "$payload"
+  write_update_payload "$payload" '# new executable'
   restart_count=$TEST_SCRATCH/restart-count
   atomic_count=$TEST_SCRATCH/atomic-count
   printf '0\n' > "$restart_count"
@@ -1163,7 +1200,7 @@ test_update_activation_rollback_and_interruption() {
     fail 'interrupted update retained temporary files'
 
   printf '#!/usr/bin/env bash\n# old executable before query failure\n' > "$INSTALLED_CLI"
-  printf '#!/usr/bin/env bash\n# candidate before query failure\n' > "$payload"
+  write_update_payload "$payload" '# candidate before query failure'
   rm -f -- "$TEST_SCRATCH/unexpected-replacement"
   systemctl() {
     case $1 in
