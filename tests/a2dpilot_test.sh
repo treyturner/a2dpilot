@@ -2386,7 +2386,25 @@ EOF
 
 test_pipewire_routing_parsers() {
   local output
+  setup_scratch_dir
   load_app
+  KERNEL_BOOT_ID_FILE=$TEST_SCRATCH/boot-id
+  PROC_ROOT=$TEST_SCRATCH/proc
+  install -d "$PROC_ROOT/4321"
+  printf '%s\n' '01234567-89ab-cdef-0123-456789abcdef' > "$KERNEL_BOOT_ID_FILE"
+  printf '%s\n' \
+    '4321 (PipeWire worker) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 987654' \
+    > "$PROC_ROOT/4321/stat"
+  bounded_user_systemctl() { printf '4321\n'; }
+  assert_eq '01234567-89ab-cdef-0123-456789abcdef:4321:987654' \
+    "$(pipewire_instance_id audio 3)"
+  valid_pipewire_instance_id \
+    '01234567-89ab-cdef-0123-456789abcdef:4321:987654' || \
+    fail 'valid PipeWire instance identity was rejected'
+  if valid_pipewire_instance_id '01234567-89ab-cdef-0123-456789abcdef:4321'; then
+    fail 'incomplete PipeWire instance identity was accepted'
+  fi
+
   bounded_user_pw_cli() { mock_pipewire_nodes_for_routing; }
   output=$(enumerate_playback_streams audio 3)
   assert_eq '95 138' "$output"
@@ -2441,6 +2459,7 @@ test_default_routing_and_owned_cleanup() {
   user=$(id -un)
   CFG_AUDIO_USER=$user
   now_seconds() { printf '100\n'; }
+  pipewire_instance_id() { printf '01234567-89ab-cdef-0123-456789abcdef:4321:987654\n'; }
   find_a2dp_node_id() { printf '83\n'; }
   bounded_user_pw_cli() { mock_pipewire_nodes_for_routing; }
   bounded_user_wpctl() {
@@ -2495,6 +2514,8 @@ EOF
   assert_eq 83 "$stream_driver"
   assert_eq 89 "$stream_target"
   assert_file_contains "$ROUTING_STATE_FILE" $'default\tbluez_output.AA_BB_CC_DD_EE_FF.1'
+  assert_file_contains "$ROUTING_STATE_FILE" \
+    $'instance\t01234567-89ab-cdef-0123-456789abcdef:4321:987654'
   assert_file_contains "$ROUTING_STATE_FILE" $'stream\t138\t89'
 
   clear_owned_routing "$user"
@@ -2508,6 +2529,7 @@ EOF
   cleanup_log=$(< "$TEST_SCRATCH/routing.log")
   ROUTING_STATE_USER=$user
   ROUTING_DEFAULT_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
+  ROUTING_PIPEWIRE_INSTANCE=01234567-89ab-cdef-0123-456789abcdef:4321:987654
   ROUTING_STREAM_TARGETS=([138]=89)
   write_routing_state
   clear_owned_routing "$user"
@@ -2520,6 +2542,7 @@ EOF
   stream_target=89
   ROUTING_STATE_USER=$user
   ROUTING_DEFAULT_NAME=
+  ROUTING_PIPEWIRE_INSTANCE=01234567-89ab-cdef-0123-456789abcdef:4321:987654
   ROUTING_STREAM_TARGETS=([138]=89)
   write_routing_state
   bounded_user_pw_cli() { mock_pipewire_nodes_for_routing; }
@@ -2533,6 +2556,7 @@ EOF
   stream_target=89
   ROUTING_STATE_USER=$user
   ROUTING_DEFAULT_NAME=
+  ROUTING_PIPEWIRE_INSTANCE=01234567-89ab-cdef-0123-456789abcdef:4321:987654
   ROUTING_STREAM_TARGETS=([138]=89)
   write_routing_state
   inspect_stream_fails=1
@@ -2548,6 +2572,7 @@ EOF
 
   ROUTING_STATE_USER=$user
   ROUTING_DEFAULT_NAME=
+  ROUTING_PIPEWIRE_INSTANCE=01234567-89ab-cdef-0123-456789abcdef:4321:987654
   ROUTING_STREAM_TARGETS=([999]=89)
   write_routing_state
   bounded_user_pw_cli() { :; }
@@ -2612,6 +2637,7 @@ test_unmovable_stream_does_not_starve_routing() {
   CFG_AUDIO_USER=$user
   now_seconds() { printf '%s\n' "$clock"; }
   sleep() { clock=$((clock + 1)); }
+  pipewire_instance_id() { printf '01234567-89ab-cdef-0123-456789abcdef:4321:987654\n'; }
   find_a2dp_node_id() { printf '83\n'; }
   configured_default_sink() { printf 'bluez_output.AA_BB_CC_DD_EE_FF.1\n'; }
   bounded_user_pw_cli() {
@@ -2681,10 +2707,12 @@ test_vanished_stream_does_not_starve_routing() {
   user=$(id -un)
   CFG_AUDIO_USER=$user
   now_seconds() { printf '100\n'; }
+  pipewire_instance_id() { printf '01234567-89ab-cdef-0123-456789abcdef:4321:987654\n'; }
   find_a2dp_node_id() { printf '83\n'; }
   configured_default_sink() { printf 'bluez_output.AA_BB_CC_DD_EE_FF.1\n'; }
   ROUTING_STATE_USER=$user
   ROUTING_DEFAULT_NAME=
+  ROUTING_PIPEWIRE_INSTANCE=01234567-89ab-cdef-0123-456789abcdef:4321:987654
   ROUTING_STREAM_TARGETS=([138]=89)
   write_routing_state
   bounded_user_pw_cli() {
@@ -2751,6 +2779,7 @@ test_recycled_stream_is_not_targeted() {
   printf '0\n' > "$stream_inspections_file"
   CFG_AUDIO_USER=$user
   now_seconds() { printf '100\n'; }
+  pipewire_instance_id() { printf '01234567-89ab-cdef-0123-456789abcdef:4321:987654\n'; }
   find_a2dp_node_id() { printf '83\n'; }
   configured_default_sink() { printf 'bluez_output.AA_BB_CC_DD_EE_FF.1\n'; }
   bounded_user_pw_cli() {
@@ -2791,6 +2820,37 @@ test_recycled_stream_is_not_targeted() {
     fail 'routing targeted a recycled stream ID'
   [[ ! -e $ROUTING_STATE_FILE ]] || \
     fail 'recycled stream retained write-ahead routing provenance'
+}
+
+test_pipewire_restart_discards_stream_provenance() {
+  local user
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  now_seconds() { printf '100\n'; }
+  ROUTING_STATE_USER=$user
+  ROUTING_DEFAULT_NAME=
+  ROUTING_PIPEWIRE_INSTANCE=01234567-89ab-cdef-0123-456789abcdef:4321:987654
+  ROUTING_STREAM_TARGETS=([138]=89)
+  write_routing_state
+  pipewire_instance_id() { printf 'fedcba98-7654-3210-fedc-ba9876543210:9876:123456\n'; }
+  enumerate_playback_streams() { : > "$TEST_SCRATCH/stale-stream-enumerated"; return 1; }
+  inspect_pipewire_node() { : > "$TEST_SCRATCH/stale-stream-inspected"; return 1; }
+  bounded_user_pw_metadata() { : > "$TEST_SCRATCH/stale-target-cleared"; return 1; }
+
+  clear_owned_routing "$user"
+  [[ ! -e $ROUTING_STATE_FILE ]] || \
+    fail 'stream provenance from a former PipeWire instance remained'
+  [[ ! -e $TEST_SCRATCH/stale-stream-enumerated &&
+     ! -e $TEST_SCRATCH/stale-stream-inspected &&
+     ! -e $TEST_SCRATCH/stale-target-cleared ]] || \
+    fail 'stale PipeWire stream provenance touched the new server instance'
+
+  printf 'user\t%s\nstream\t138\t89\n' "$user" > "$ROUTING_STATE_FILE"
+  if load_routing_state; then
+    fail 'stream provenance without a PipeWire instance was accepted'
+  fi
 }
 
 mock_a2dp_enum_profiles() {
@@ -3696,6 +3756,8 @@ run_test 'routing write failure prevents mutation' test_routing_write_failure_pr
 run_test 'unmovable stream does not starve routing' test_unmovable_stream_does_not_starve_routing
 run_test 'vanished stream does not starve routing' test_vanished_stream_does_not_starve_routing
 run_test 'recycled stream is not targeted' test_recycled_stream_is_not_targeted
+run_test 'PipeWire restart discards stream provenance' \
+  test_pipewire_restart_discards_stream_provenance
 run_test 'PipeWire codec profile discovery' test_pipewire_codec_profile_discovery
 run_test 'per-speaker codec selection' test_per_speaker_codec_selection
 run_test 'non-preemptive failover order' test_daemon_nonpreemption_and_failover_order

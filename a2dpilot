@@ -43,6 +43,8 @@ VOLUME_STEP=5
 MEDIA_ACTION_TIMEOUT=2
 MEDIA_CONNECT_TIMEOUT=1
 MEDIA_MONOTONIC_CLOCK=/proc/uptime
+KERNEL_BOOT_ID_FILE=/proc/sys/kernel/random/boot_id
+PROC_ROOT=/proc
 UPDATE_BASE_URL=https://raw.githubusercontent.com/treyturner/a2dpilot
 UPDATE_CONNECT_TIMEOUT=10
 UPDATE_TOTAL_TIMEOUT=60
@@ -158,6 +160,7 @@ PIPEWIRE_NODE_CLASS=
 PIPEWIRE_NODE_DRIVER=
 ROUTING_STATE_USER=
 ROUTING_DEFAULT_NAME=
+ROUTING_PIPEWIRE_INSTANCE=
 declare -gA ROUTING_STREAM_TARGETS=()
 DAEMON_NEXT_ROUTE_LOG=0
 
@@ -904,6 +907,18 @@ bounded_user_pw_metadata() {
   local user=$1 seconds=$2
   shift 2
   bounded_user_pipewire_command "$user" "$seconds" pw-metadata "$@"
+}
+
+bounded_user_systemctl() {
+  local user=$1 seconds=$2 uid runtime home
+  shift 2
+  [[ $seconds =~ ^[1-9][0-9]*$ ]] || return 1
+  uid=$(id -u "$user")
+  runtime=/run/user/$uid
+  home=$(user_home "$user")
+  runuser -u "$user" -- env HOME="$home" XDG_RUNTIME_DIR="$runtime" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus" \
+    timeout --signal=TERM --kill-after=1 "$seconds" systemctl --user "$@"
 }
 
 system_unit_enabled_state() {
@@ -1719,6 +1734,28 @@ valid_pipewire_name() {
   [[ $1 =~ ^[A-Za-z0-9_.:+-]+$ ]]
 }
 
+valid_pipewire_instance_id() {
+  [[ $1 =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}:[1-9][0-9]*:[1-9][0-9]*$ ]]
+}
+
+pipewire_instance_id() {
+  local user=$1 seconds=$2 pid boot_id stat_line stat_fields start_time
+  [[ $seconds =~ ^[1-9][0-9]*$ ]] || return 1
+  pid=$(bounded_user_systemctl "$user" "$seconds" show pipewire.service \
+    --property=MainPID --value 2>/dev/null) || return 1
+  [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
+  IFS= read -r boot_id < "$KERNEL_BOOT_ID_FILE" || return 1
+  [[ $boot_id =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || return 1
+  IFS= read -r stat_line < "$PROC_ROOT/$pid/stat" || return 1
+  [[ $stat_line == "$pid ("* && $stat_line == *") "* ]] || return 1
+  stat_line=${stat_line##*) }
+  read -r -a stat_fields <<< "$stat_line"
+  (( ${#stat_fields[@]} >= 20 )) || return 1
+  start_time=${stat_fields[19]}
+  [[ ${stat_fields[0]} =~ ^[A-Za-z]$ && $start_time =~ ^[1-9][0-9]*$ ]] || return 1
+  printf '%s:%s:%s\n' "${boot_id,,}" "$pid" "$start_time"
+}
+
 inspect_pipewire_node() {
   local user=$1 node=$2 seconds=$3 output line
   local serial='' name='' class='' driver=''
@@ -1819,9 +1856,10 @@ stream_target_serial() {
 }
 
 load_routing_state() {
-  local kind first second extra have_user=0 have_default=0
+  local kind first second extra have_user=0 have_default=0 have_instance=0
   ROUTING_STATE_USER=
   ROUTING_DEFAULT_NAME=
+  ROUTING_PIPEWIRE_INSTANCE=
   ROUTING_STREAM_TARGETS=()
   [[ -e $ROUTING_STATE_FILE || -L $ROUTING_STATE_FILE ]] || return 0
   [[ -f $ROUTING_STATE_FILE && ! -L $ROUTING_STATE_FILE ]] || return 1
@@ -1840,6 +1878,12 @@ load_routing_state() {
         ROUTING_DEFAULT_NAME=$first
         have_default=1
         ;;
+      instance)
+        (( have_instance == 0 )) && [[ -n $first && -z $second ]] || return 1
+        valid_pipewire_instance_id "$first" || return 1
+        ROUTING_PIPEWIRE_INSTANCE=${first,,}
+        have_instance=1
+        ;;
       stream)
         [[ $first =~ ^[0-9]+$ && $second =~ ^[0-9]+$ && \
            ! ${ROUTING_STREAM_TARGETS[$first]+present} ]] || return 1
@@ -1848,7 +1892,12 @@ load_routing_state() {
       *) return 1 ;;
     esac
   done < "$ROUTING_STATE_FILE"
-  (( have_user == 1 ))
+  (( have_user == 1 )) || return 1
+  if (( ${#ROUTING_STREAM_TARGETS[@]} > 0 )); then
+    (( have_instance == 1 ))
+  else
+    (( have_instance == 0 ))
+  fi
 }
 
 write_routing_state() {
@@ -1858,12 +1907,18 @@ write_routing_state() {
     rm -f -- "$ROUTING_STATE_FILE"
     return 0
   fi
+  if (( ${#ROUTING_STREAM_TARGETS[@]} > 0 )); then
+    valid_pipewire_instance_id "$ROUTING_PIPEWIRE_INSTANCE" || return 1
+  fi
   [[ ! -e $ROUTING_STATE_FILE || -f $ROUTING_STATE_FILE && ! -L $ROUTING_STATE_FILE ]] || return 1
   temp=$(mktemp "$STATE_DIR/.routing-overrides.XXXXXX") || return 1
   {
     printf 'user\t%s\n' "$ROUTING_STATE_USER" || write_failed=1
     if [[ -n $ROUTING_DEFAULT_NAME ]]; then
       printf 'default\t%s\n' "$ROUTING_DEFAULT_NAME" || write_failed=1
+    fi
+    if (( ${#ROUTING_STREAM_TARGETS[@]} > 0 )); then
+      printf 'instance\t%s\n' "$ROUTING_PIPEWIRE_INSTANCE" || write_failed=1
     fi
     for serial in "${!ROUTING_STREAM_TARGETS[@]}"; do
       printf 'stream\t%s\t%s\n' "$serial" "${ROUTING_STREAM_TARGETS[$serial]}" || \
@@ -1885,7 +1940,7 @@ write_routing_state() {
 }
 
 clear_owned_routing() {
-  local user=$1 deadline remaining current result streams id serial extra failed=0
+  local user=$1 deadline remaining current current_instance result streams id serial extra failed=0
   local -A stream_ids=()
   load_routing_state || return 1
   [[ -n $ROUTING_STATE_USER ]] || return 0
@@ -1913,58 +1968,65 @@ clear_owned_routing() {
 
   if (( ${#ROUTING_STREAM_TARGETS[@]} > 0 )); then
     remaining=$(seconds_until_deadline "$deadline") || return 1
-    streams=$(enumerate_playback_streams "$user" "$remaining") || return 1
-    if [[ -n $streams ]]; then
-      while read -r id serial extra; do
-        [[ -z $extra && $id =~ ^[0-9]+$ && $serial =~ ^[0-9]+$ ]] || return 1
-        stream_ids[$serial]=$id
-      done <<< "$streams"
-    fi
-    for serial in "${!ROUTING_STREAM_TARGETS[@]}"; do
-      id=${stream_ids[$serial]:-}
-      if [[ -z $id ]]; then
-        unset "ROUTING_STREAM_TARGETS[$serial]"
-        continue
-      fi
+    current_instance=$(pipewire_instance_id "$user" "$remaining") || return 1
+    if [[ $current_instance != "$ROUTING_PIPEWIRE_INSTANCE" ]]; then
+      ROUTING_STREAM_TARGETS=()
+      ROUTING_PIPEWIRE_INSTANCE=
+    else
       remaining=$(seconds_until_deadline "$deadline") || return 1
-      if ! inspect_pipewire_node "$user" "$id" "$remaining"; then
-        failed=1
-        continue
+      streams=$(enumerate_playback_streams "$user" "$remaining") || return 1
+      if [[ -n $streams ]]; then
+        while read -r id serial extra; do
+          [[ -z $extra && $id =~ ^[0-9]+$ && $serial =~ ^[0-9]+$ ]] || return 1
+          stream_ids[$serial]=$id
+        done <<< "$streams"
       fi
-      if [[ $PIPEWIRE_NODE_CLASS != Stream/Output/Audio ||
-            $PIPEWIRE_NODE_SERIAL != "$serial" ]]; then
-        unset "ROUTING_STREAM_TARGETS[$serial]"
-        continue
-      fi
-      remaining=$(seconds_until_deadline "$deadline") || return 1
-      if current=$(stream_target_serial "$user" "$id" "$remaining"); then
-        if [[ $current == "${ROUTING_STREAM_TARGETS[$serial]}" ]]; then
-          remaining=$(seconds_until_deadline "$deadline") || return 1
-          if bounded_user_pw_metadata "$user" "$remaining" \
-            -d -n default "$id" target.object >/dev/null 2>&1; then
+      for serial in "${!ROUTING_STREAM_TARGETS[@]}"; do
+        id=${stream_ids[$serial]:-}
+        if [[ -z $id ]]; then
+          unset "ROUTING_STREAM_TARGETS[$serial]"
+          continue
+        fi
+        remaining=$(seconds_until_deadline "$deadline") || return 1
+        if ! inspect_pipewire_node "$user" "$id" "$remaining"; then
+          failed=1
+          continue
+        fi
+        if [[ $PIPEWIRE_NODE_CLASS != Stream/Output/Audio ||
+              $PIPEWIRE_NODE_SERIAL != "$serial" ]]; then
+          unset "ROUTING_STREAM_TARGETS[$serial]"
+          continue
+        fi
+        remaining=$(seconds_until_deadline "$deadline") || return 1
+        if current=$(stream_target_serial "$user" "$id" "$remaining"); then
+          if [[ $current == "${ROUTING_STREAM_TARGETS[$serial]}" ]]; then
+            remaining=$(seconds_until_deadline "$deadline") || return 1
+            if bounded_user_pw_metadata "$user" "$remaining" \
+              -d -n default "$id" target.object >/dev/null 2>&1; then
+              unset "ROUTING_STREAM_TARGETS[$serial]"
+            else
+              failed=1
+            fi
+          else
+            unset "ROUTING_STREAM_TARGETS[$serial]"
+          fi
+        else
+          result=$?
+          if (( result == 2 )); then
             unset "ROUTING_STREAM_TARGETS[$serial]"
           else
             failed=1
           fi
-        else
-          unset "ROUTING_STREAM_TARGETS[$serial]"
         fi
-      else
-        result=$?
-        if (( result == 2 )); then
-          unset "ROUTING_STREAM_TARGETS[$serial]"
-        else
-          failed=1
-        fi
-      fi
-    done
+      done
+    fi
   fi
   write_routing_state || return 1
   (( failed == 0 ))
 }
 
 reconcile_speaker_routing() {
-  local mac=$1 deadline remaining sink current result streams id serial extra target
+  local mac=$1 deadline remaining sink current current_instance result streams id serial extra target
   local routing_failed=0
   local -A seen_streams=() pending_streams=()
   deadline=$(( $(now_seconds) + ROUTING_TIMEOUT ))
@@ -2017,6 +2079,15 @@ reconcile_speaker_routing() {
 
   remaining=$(seconds_until_deadline "$deadline") || return 1
   streams=$(enumerate_playback_streams "$CFG_AUDIO_USER" "$remaining") || return 1
+  if [[ -n $streams || ${#ROUTING_STREAM_TARGETS[@]} -gt 0 ]]; then
+    remaining=$(seconds_until_deadline "$deadline") || return 1
+    current_instance=$(pipewire_instance_id "$CFG_AUDIO_USER" "$remaining") || return 1
+    if [[ -n $ROUTING_PIPEWIRE_INSTANCE &&
+          $ROUTING_PIPEWIRE_INSTANCE != "$current_instance" ]]; then
+      ROUTING_STREAM_TARGETS=()
+    fi
+    ROUTING_PIPEWIRE_INSTANCE=$current_instance
+  fi
   if [[ -n $streams ]]; then
     while read -r id serial extra; do
       [[ -z $extra && $id =~ ^[0-9]+$ && $serial =~ ^[0-9]+$ ]] || return 1
