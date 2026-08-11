@@ -2386,6 +2386,35 @@ test_forget_preserves_unrelated_routing() {
   assert_eq "$active" "$(< "$STATE_DIR/active-speaker")"
 }
 
+test_forget_active_speaker_preserves_different_routing_owner() {
+  local user mac=AA:BB:CC:DD:EE:FF owner=10:20:30:40:50:60
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  write_test_config "$CONFIG_FILE" "$user" "$owner" "$mac"
+  printf '%s\n' "$mac" > "$STATE_DIR/active-speaker"
+  : > "$STATE_FILE"
+  ROUTING_STATE_USER=$user
+  ROUTING_STATE_SPEAKERS=(["$owner"]=1)
+  ROUTING_DEFAULT_NAME=bluez_output.10_20_30_40_50_60.1
+  write_routing_state
+  require_root() { :; }
+  acquire_lock() { :; }
+  release_lock() { :; }
+  atomic_install_file() { cp "$1" "$2"; }
+  clear_owned_routing() { fail 'forget cleared routing owned by another speaker'; }
+  disconnect_bluetooth_device() { :; }
+  device_info() { return 1; }
+  systemctl() { :; }
+
+  forget_action "$mac" --yes
+  assert_file_contains "$ROUTING_STATE_FILE" \
+    $'default\tbluez_output.10_20_30_40_50_60.1'
+  [[ ! -e $STATE_DIR/active-speaker ]] || \
+    fail 'forgotten active speaker retained daemon state'
+}
+
 test_forget_retains_active_speaker_after_routing_cleanup_failure() {
   local user mac=AA:BB:CC:DD:EE:FF output rc
   setup_scratch_dir
@@ -3128,14 +3157,20 @@ test_pipewire_restart_during_target_assignment() {
   }
   stream_target_serial() { return 2; }
   bounded_user_pw_metadata() { : > "$TEST_SCRATCH/restarted-instance-targeted"; }
+  ROUTING_STATE_USER=$user
+  ROUTING_DEFAULT_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
+  write_routing_state
 
   if reconcile_speaker_routing "$mac"; then
     fail 'mid-assignment PipeWire restart reported routing success'
   fi
   [[ ! -e $TEST_SCRATCH/restarted-instance-targeted ]] || \
     fail 'a stream target was written after PipeWire restarted'
-  [[ ! -e $ROUTING_STATE_FILE ]] || \
-    fail 'a PipeWire restart retained obsolete routing ownership'
+  assert_file_contains "$ROUTING_STATE_FILE" \
+    $'default\tbluez_output.AA_BB_CC_DD_EE_FF.1'
+  assert_file_contains "$ROUTING_STATE_FILE" $'speaker\tAA:BB:CC:DD:EE:FF'
+  assert_file_not_contains "$ROUTING_STATE_FILE" $'instance\t'
+  assert_file_not_contains "$ROUTING_STATE_FILE" $'stream\t'
 }
 
 test_stale_owned_target_is_rewritten_after_relink() {
@@ -4747,6 +4782,8 @@ run_test 'forget removes config and provenance' test_forget_removes_config_and_p
 run_test 'forget clears routing for a prior speaker' \
   test_forget_clears_routing_for_prior_speaker
 run_test 'forget preserves unrelated routing' test_forget_preserves_unrelated_routing
+run_test 'forget active speaker preserves different routing owner' \
+  test_forget_active_speaker_preserves_different_routing_owner
 run_test 'forget retains active speaker after routing cleanup failure' \
   test_forget_retains_active_speaker_after_routing_cleanup_failure
 run_test 'media-control health modes' test_media_control_health_modes
