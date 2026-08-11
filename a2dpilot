@@ -38,6 +38,7 @@ RFKILL_SYSFS=/sys/class/rfkill
 CONNECT_TIMEOUT=10
 ONBOARD_STATUS_TIMEOUT=3
 ROUTING_TIMEOUT=3
+ROUTING_DEFAULT_TIMEOUT=1
 SCAN_TIMEOUT=15
 VOLUME_STEP=5
 MEDIA_ACTION_TIMEOUT=2
@@ -2376,13 +2377,16 @@ clear_owned_routing() {
 }
 
 reconcile_speaker_routing_impl() {
-  local mac=$1 deadline started remaining sink current current_instance result streams id serial extra target
+  local mac=$1 deadline default_deadline started remaining sink current current_instance
+  local result streams id serial extra target
   local mac_key=${mac//:/_}
-  local routing_failed=0 mutation_result=0 mutation_was_critical=0 count index offset start=0
+  local routing_failed=0 default_ready=1 mutation_result=0 mutation_was_critical=0
+  local count index offset start=0
   local -A seen_streams=() pending_streams=()
   local -a playback_ids=() playback_serials=()
   started=$(routing_now_seconds) || return 1
   deadline=$((started + ROUTING_TIMEOUT))
+  default_deadline=$((started + ROUTING_DEFAULT_TIMEOUT))
   load_routing_state || return 1
   if [[ -n $ROUTING_STATE_USER && $ROUTING_STATE_USER != "$CFG_AUDIO_USER" ]]; then
     clear_owned_routing "$ROUTING_STATE_USER" || return 1
@@ -2401,14 +2405,17 @@ reconcile_speaker_routing_impl() {
   local sink_serial=$PIPEWIRE_NODE_SERIAL sink_name=$PIPEWIRE_NODE_NAME
   ROUTING_STATE_SPEAKERS[$mac]=1
 
-  remaining=$(routing_seconds_until_deadline "$deadline") || return 1
-  if current=$(configured_default_sink "$CFG_AUDIO_USER" "$remaining"); then
-    result=0
+  if remaining=$(routing_seconds_until_deadline "$default_deadline"); then
+    if current=$(configured_default_sink "$CFG_AUDIO_USER" "$remaining"); then
+      result=0
+    else
+      result=$?
+      current=
+    fi
   else
-    result=$?
+    result=1
     current=
   fi
-  (( result == 0 || result == 2 )) || return 1
   if (( result == 0 )); then
     if [[ -n $ROUTING_PENDING_DEFAULT_NAME &&
           $current == "$ROUTING_PENDING_DEFAULT_NAME" ]]; then
@@ -2420,11 +2427,14 @@ reconcile_speaker_routing_impl() {
     else
       ROUTING_PENDING_DEFAULT_NAME=
     fi
-  else
+  elif (( result == 2 )); then
     ROUTING_DEFAULT_NAME=
     ROUTING_PENDING_DEFAULT_NAME=
+  else
+    routing_failed=1
+    default_ready=0
   fi
-  if [[ $current != "$sink_name" ]]; then
+  if (( default_ready )) && [[ $current != "$sink_name" ]]; then
     # From the attempted-state write through the final owner write, catchable
     # daemon termination is deferred so pending intent cannot be abandoned.
     mutation_was_critical=$ROUTING_MUTATION_CRITICAL
@@ -2432,24 +2442,20 @@ reconcile_speaker_routing_impl() {
     ROUTING_PENDING_DEFAULT_NAME=$sink_name
     if ! write_routing_state; then
       mutation_result=1
-    elif ! remaining=$(routing_seconds_until_deadline "$deadline"); then
+    elif ! remaining=$(routing_seconds_until_deadline "$default_deadline"); then
       ROUTING_PENDING_DEFAULT_NAME=
-      write_routing_state || true
-      mutation_result=1
+      if write_routing_state; then mutation_result=3; else mutation_result=1; fi
     elif ! inspect_pipewire_node "$CFG_AUDIO_USER" "$sink" "$remaining"; then
       ROUTING_PENDING_DEFAULT_NAME=
-      write_routing_state || true
-      mutation_result=1
+      if write_routing_state; then mutation_result=3; else mutation_result=1; fi
     elif [[ $PIPEWIRE_NODE_CLASS != Audio/Sink ||
             $PIPEWIRE_NODE_SERIAL != "$sink_serial" ||
             $PIPEWIRE_NODE_NAME != "$sink_name" ]]; then
       ROUTING_PENDING_DEFAULT_NAME=
-      write_routing_state || true
-      mutation_result=1
-    elif ! remaining=$(routing_seconds_until_deadline "$deadline"); then
+      if write_routing_state; then mutation_result=3; else mutation_result=1; fi
+    elif ! remaining=$(routing_seconds_until_deadline "$default_deadline"); then
       ROUTING_PENDING_DEFAULT_NAME=
-      write_routing_state || true
-      mutation_result=1
+      if write_routing_state; then mutation_result=3; else mutation_result=1; fi
     elif ! bounded_user_wpctl "$CFG_AUDIO_USER" "$remaining" \
       set-default "$sink" >/dev/null 2>&1; then
       # Retain the pending value because the attempted command may have changed
@@ -2464,14 +2470,14 @@ reconcile_speaker_routing_impl() {
     (( DAEMON_STOP_REQUESTED == 0 )) || return 1
     case $mutation_result in
       0)
-        if ! remaining=$(routing_seconds_until_deadline "$deadline") || \
+        if ! remaining=$(routing_seconds_until_deadline "$default_deadline") || \
            ! current=$(configured_default_sink "$CFG_AUDIO_USER" "$remaining") || \
            [[ $current != "$sink_name" ]]; then
           routing_failed=1
         fi
         ;;
       1) return 1 ;;
-      2) routing_failed=1 ;;
+      2|3) routing_failed=1 ;;
     esac
   fi
 

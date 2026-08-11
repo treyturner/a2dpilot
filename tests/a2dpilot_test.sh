@@ -2697,15 +2697,18 @@ EOF
 }
 
 test_default_failure_still_routes_streams() {
-  local user mac=AA:BB:CC:DD:EE:FF stream_target=77 stream_driver=35
+  local user mac=AA:BB:CC:DD:EE:FF stream_target=77 stream_driver=35 clock=100
   setup_scratch_dir
   load_app
   configure_scratch_paths
   user=$(id -un)
   CFG_AUDIO_USER=$user
-  routing_now_seconds() { printf '100\n'; }
+  routing_now_seconds() { printf '%s\n' "$clock"; }
   find_a2dp_node_id() { printf '83\n'; }
-  configured_default_sink() { printf 'alsa_output.builtin\n'; }
+  configured_default_sink() {
+    assert_eq 1 "$2" || return 1
+    printf 'alsa_output.builtin\n'
+  }
   pipewire_instance_id() { printf '01234567-89ab-cdef-0123-456789abcdef:4321:987654\n'; }
   enumerate_playback_streams() { printf '95 138\n'; }
   inspect_pipewire_node() {
@@ -2723,6 +2726,8 @@ test_default_failure_still_routes_streams() {
   }
   bounded_user_wpctl() {
     [[ $3 == set-default ]] || return 1
+    assert_eq 1 "$2" || return 1
+    clock=101
     return 1
   }
   stream_target_serial() { printf '%s\n' "$stream_target"; }
