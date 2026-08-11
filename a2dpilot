@@ -1893,6 +1893,8 @@ load_routing_state() {
     esac
   done < "$ROUTING_STATE_FILE"
   (( have_user == 1 )) || return 1
+  # Server-scoped routing ownership debuts with this state format. A missing
+  # instance is malformed state, not a supported transitional snapshot.
   if (( ${#ROUTING_STREAM_TARGETS[@]} > 0 )); then
     (( have_instance == 1 ))
   else
