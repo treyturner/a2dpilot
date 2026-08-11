@@ -1997,10 +1997,18 @@ reconcile_speaker_routing() {
   if [[ -n $streams ]]; then
     while read -r id serial extra; do
       [[ -z $extra && $id =~ ^[0-9]+$ && $serial =~ ^[0-9]+$ ]] || return 1
-      seen_streams[$serial]=1
       remaining=$(seconds_until_deadline "$deadline") || return 1
-      inspect_pipewire_node "$CFG_AUDIO_USER" "$id" "$remaining" || return 1
-      [[ $PIPEWIRE_NODE_CLASS == Stream/Output/Audio && $PIPEWIRE_NODE_SERIAL == "$serial" ]] || return 1
+      if ! inspect_pipewire_node "$CFG_AUDIO_USER" "$id" "$remaining"; then
+        routing_failed=1
+        unset "ROUTING_STREAM_TARGETS[$serial]"
+        continue
+      fi
+      if [[ $PIPEWIRE_NODE_CLASS != Stream/Output/Audio ||
+            $PIPEWIRE_NODE_SERIAL != "$serial" ]]; then
+        unset "ROUTING_STREAM_TARGETS[$serial]"
+        continue
+      fi
+      seen_streams[$serial]=1
       if [[ $PIPEWIRE_NODE_DRIVER != "$sink" ]]; then
         remaining=$(seconds_until_deadline "$deadline") || return 1
         if target=$(stream_target_serial "$CFG_AUDIO_USER" "$id" "$remaining"); then
@@ -2689,7 +2697,7 @@ pair_action() {
 forget_action() {
   require_root
   [[ -f $STATE_FILE ]] || die "A2DPilot is not installed."
-  local mac='' assume_yes=0 answer
+  local mac='' assume_yes=0 answer active_speaker='' result
   while [[ $# -gt 0 ]]; do
     case $1 in
       --yes) assume_yes=1; shift ;;
@@ -2716,6 +2724,25 @@ forget_action() {
     release_lock
     die "$error"
   }
+  if read_daemon_active_state active_speaker; then
+    :
+  else
+    result=$?
+    if (( result != 2 )); then
+      release_lock
+      die "Could not safely read the active-speaker state."
+    fi
+  fi
+  if [[ $active_speaker == "$mac" ]]; then
+    clear_owned_routing "$CFG_AUDIO_USER" || {
+      release_lock
+      die "Could not clear audio routing for $mac; device configuration was left unchanged."
+    }
+    remember_daemon_active '' || {
+      release_lock
+      die "Could not clear active-speaker state for $mac; device configuration was left unchanged."
+    }
+  fi
   disconnect_bluetooth_device "$mac" || true
   if device_info "$mac" >/dev/null 2>&1; then
     remove_bluetooth_device "$mac" || {
@@ -2869,14 +2896,30 @@ remember_daemon_active() {
   mv -f -- "$temp" "$path"
 }
 
+read_daemon_active_state() {
+  local target=$1 path=$STATE_DIR/active-speaker parsed_value
+  local -a lines=()
+  if [[ ! -e $path && ! -L $path ]]; then
+    printf -v "$target" '%s' ''
+    return 2
+  fi
+  [[ -f $path && ! -L $path ]] || return 1
+  mapfile -t lines < "$path" || return 1
+  (( ${#lines[@]} == 1 )) || return 1
+  parsed_value=${lines[0]}
+  valid_mac "$parsed_value" || return 1
+  printf -v "$target" '%s' "$(normalize_mac "$parsed_value")"
+}
+
 load_daemon_active() {
-  local path=$STATE_DIR/active-speaker saved
-  [[ -z $DAEMON_ACTIVE && -f $path && ! -L $path ]] || return 0
-  IFS= read -r saved < "$path" || saved=
-  if valid_mac "$saved"; then
-    DAEMON_ACTIVE=$(normalize_mac "$saved")
+  local path=$STATE_DIR/active-speaker saved result
+  [[ -z $DAEMON_ACTIVE ]] || return 0
+  if read_daemon_active_state saved; then
+    DAEMON_ACTIVE=$saved
     load_daemon_codec_policy
   else
+    result=$?
+    (( result != 2 )) || return 0
     rm -f -- "$path"
     remember_daemon_codec_policy '' ''
   fi

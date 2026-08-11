@@ -2240,11 +2240,17 @@ test_forget_removes_config_and_provenance() {
   user=$(id -un)
   write_test_config "$CONFIG_FILE" "$user" "$mac aptx_hd aptx sbc" 10:20:30:40:50:60
   printf '12:34:56:78:9A:BC %s\n' "$mac" > "$STATE_DIR/created-bonds"
+  printf '%s\n' "$mac" > "$STATE_DIR/active-speaker"
+  printf '%s\taptx_hd aptx sbc\n' "$mac" > "$STATE_DIR/active-codec-policy"
   : > "$STATE_FILE"
   require_root() { :; }
   acquire_lock() { :; }
   release_lock() { :; }
   atomic_install_file() { cp "$1" "$2"; }
+  clear_owned_routing() { printf 'clear-routing %s\n' "$1" >> "$TEST_SCRATCH/forget-order"; }
+  disconnect_bluetooth_device() {
+    printf 'disconnect %s\n' "$1" >> "$TEST_SCRATCH/forget-order"
+  }
   device_info() { (( present )) && printf 'Paired: yes\n'; }
   remove_bluetooth_device() {
     present=0
@@ -2263,6 +2269,37 @@ test_forget_removes_config_and_provenance() {
   [[ ! -s $STATE_DIR/created-bonds ]] || fail 'forgotten bond remained in provenance ledger'
   assert_file_contains "$TEST_SCRATCH/bluetooth.log" "current $mac"
   assert_file_contains "$TEST_SCRATCH/bluetooth.log" "12:34:56:78:9A:BC $mac"
+  assert_eq $'clear-routing '"$user"$'\ndisconnect '"$mac" \
+    "$(< "$TEST_SCRATCH/forget-order")"
+  [[ ! -e $STATE_DIR/active-speaker && ! -e $STATE_DIR/active-codec-policy ]] || \
+    fail 'forgotten active speaker retained daemon state'
+}
+
+test_forget_retains_active_speaker_after_routing_cleanup_failure() {
+  local user mac=AA:BB:CC:DD:EE:FF output rc
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  write_test_config "$CONFIG_FILE" "$user" "$mac"
+  printf '%s\n' "$mac" > "$STATE_DIR/active-speaker"
+  : > "$STATE_FILE"
+  require_root() { :; }
+  acquire_lock() { :; }
+  release_lock() { :; }
+  clear_owned_routing() { return 1; }
+  disconnect_bluetooth_device() { fail 'failed routing cleanup disconnected the speaker'; }
+  remove_bluetooth_device() { fail 'failed routing cleanup removed the bond'; }
+  atomic_install_file() { fail 'failed routing cleanup changed the configuration'; }
+
+  set +e
+  output=$(forget_action "$mac" --yes 2>&1)
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'forget succeeded after routing cleanup failed'
+  assert_contains "$output" "Could not clear audio routing for $mac"
+  assert_file_contains "$CONFIG_FILE" "speaker = $mac"
+  assert_eq "$mac" "$(< "$STATE_DIR/active-speaker")"
 }
 
 test_media_control_health_modes() {
@@ -2595,6 +2632,63 @@ EOF
   assert_file_contains "$TEST_SCRATCH/routing-targets" 'target 96'
   [[ -e $TEST_SCRATCH/second-stream-routed ]] || \
     fail 'movable stream was not verified after the pinned stream'
+}
+
+test_vanished_stream_does_not_starve_routing() {
+  local user mac=AA:BB:CC:DD:EE:FF second_driver=35 output rc
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  CFG_AUDIO_USER=$user
+  now_seconds() { printf '100\n'; }
+  find_a2dp_node_id() { printf '83\n'; }
+  configured_default_sink() { printf 'bluez_output.AA_BB_CC_DD_EE_FF.1\n'; }
+  ROUTING_STATE_USER=$user
+  ROUTING_DEFAULT_NAME=
+  ROUTING_STREAM_TARGETS=([138]=89)
+  write_routing_state
+  bounded_user_pw_cli() {
+    cat <<'EOF'
+	id 95, type PipeWire:Interface:Node/3
+		object.serial = "138"
+		media.class = "Stream/Output/Audio"
+	id 96, type PipeWire:Interface:Node/3
+		object.serial = "139"
+		media.class = "Stream/Output/Audio"
+EOF
+  }
+  bounded_user_wpctl() {
+    case $4 in
+      83)
+        printf '%s\n' '  * object.serial = "89"' \
+          '  * node.name = "bluez_output.AA_BB_CC_DD_EE_FF.1"' \
+          '  * media.class = "Audio/Sink"'
+        ;;
+      95) return 1 ;;
+      96)
+        printf '%s\n' '  * object.serial = "139"' \
+          '  * node.name = "Long-lived Player"' \
+          "    node.driver-id = \"$second_driver\"" \
+          '  * media.class = "Stream/Output/Audio"'
+        ;;
+    esac
+  }
+  stream_target_serial() { return 2; }
+  bounded_user_pw_metadata() {
+    second_driver=83
+    printf 'target %s\n' "$5" >> "$TEST_SCRATCH/routing-targets"
+  }
+
+  set +e
+  output=$(reconcile_speaker_routing "$mac" 2>&1)
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'vanished stream inspection reported complete routing success'
+  assert_eq '' "$output"
+  assert_file_contains "$TEST_SCRATCH/routing-targets" 'target 96'
+  assert_file_not_contains "$ROUTING_STATE_FILE" $'stream\t138\t89'
+  assert_file_contains "$ROUTING_STATE_FILE" $'stream\t139\t89'
 }
 
 mock_a2dp_enum_profiles() {
@@ -3489,6 +3583,8 @@ run_test 'pairing session terminates after bonding' test_pairing_session_termina
 run_test 'pair --all attempts every configured speaker' test_pair_all_attempts_every_configured_speaker
 run_test 'interactive scan selection' test_interactive_scan_selection
 run_test 'forget removes config and provenance' test_forget_removes_config_and_provenance
+run_test 'forget retains active speaker after routing cleanup failure' \
+  test_forget_retains_active_speaker_after_routing_cleanup_failure
 run_test 'media-control health modes' test_media_control_health_modes
 run_test 'optimistic codec reporting' test_codec_reporting_is_optimistic
 run_test 'PipeWire codec property parsing' test_codec_property_parsing
@@ -3496,6 +3592,7 @@ run_test 'PipeWire routing parsers' test_pipewire_routing_parsers
 run_test 'default routing and owned cleanup' test_default_routing_and_owned_cleanup
 run_test 'routing write failure prevents mutation' test_routing_write_failure_prevents_mutation
 run_test 'unmovable stream does not starve routing' test_unmovable_stream_does_not_starve_routing
+run_test 'vanished stream does not starve routing' test_vanished_stream_does_not_starve_routing
 run_test 'PipeWire codec profile discovery' test_pipewire_codec_profile_discovery
 run_test 'per-speaker codec selection' test_per_speaker_codec_selection
 run_test 'non-preemptive failover order' test_daemon_nonpreemption_and_failover_order
