@@ -227,6 +227,70 @@ tty_read() {
   IFS= read -r "$variable" < /dev/tty
 }
 
+tty_confirm() {
+  local prompt=$1 answer
+  while true; do
+    tty_print '%s [y/N]: ' "$prompt"
+    if ! tty_read answer; then
+      tty_print '\n'
+      return 1
+    fi
+    case ${answer,,} in
+      y|yes) return 0 ;;
+      ''|n|no) return 1 ;;
+      *) tty_print 'Please answer y or n.\n' ;;
+    esac
+  done
+}
+
+detect_install_onboard_audio() {
+  local model_path=${1:-/proc/device-tree/model}
+  local cards_path=${2:-/proc/asound/cards}
+  local sound_class=${3:-/sys/class/sound}
+  local model='' line card value driver
+  INSTALL_ONBOARD_ANALOG_AVAILABLE=0
+  INSTALL_ONBOARD_HDMI_AVAILABLE=0
+
+  [[ -r $model_path ]] || return 1
+  IFS= read -r -d '' model < "$model_path" || true
+  [[ $model == Raspberry\ Pi* ]] || return 1
+
+  if [[ -r $cards_path ]]; then
+    while IFS= read -r line || [[ -n $line ]]; do
+      case $line in
+        *bcm2835*) INSTALL_ONBOARD_ANALOG_AVAILABLE=1 ;;
+      esac
+      case $line in
+        *vc4-hdmi*|*vc4hdmi*) INSTALL_ONBOARD_HDMI_AVAILABLE=1 ;;
+      esac
+    done < "$cards_path"
+  fi
+
+  for card in "$sound_class"/card*; do
+    [[ -d $card ]] || continue
+    value=
+    if [[ -r $card/id ]]; then
+      IFS= read -r value < "$card/id" || true
+    fi
+    case $value in
+      *bcm2835*|*Headphones*) INSTALL_ONBOARD_ANALOG_AVAILABLE=1 ;;
+    esac
+    case $value in
+      *vc4-hdmi*|*vc4hdmi*) INSTALL_ONBOARD_HDMI_AVAILABLE=1 ;;
+    esac
+    driver=
+    if [[ -L $card/device/driver ]]; then
+      driver=$(readlink -- "$card/device/driver" 2>/dev/null || true)
+    fi
+    case ${driver##*/} in
+      *snd_bcm2835*) INSTALL_ONBOARD_ANALOG_AVAILABLE=1 ;;
+      *vc4_hdmi*) INSTALL_ONBOARD_HDMI_AVAILABLE=1 ;;
+    esac
+  done
+
+  (( INSTALL_ONBOARD_ANALOG_AVAILABLE || INSTALL_ONBOARD_HDMI_AVAILABLE ))
+}
+
 prepare_lock_directory() {
   local directory owner
   directory=$(dirname "$LOCK_FILE")
@@ -682,13 +746,14 @@ parse_config() {
 
 write_default_config() {
   local path=$1 audio_user=$2
+  local onboard_analog=${3:-enabled} onboard_hdmi=${4:-enabled}
   {
     printf 'audio-user = %s\n' "$audio_user"
     printf 'controller = auto\n'
     printf 'reconnect-interval = 5\n'
     printf 'media-controls = auto\n'
-    printf 'onboard-analog = enabled\n'
-    printf 'onboard-hdmi = enabled\n'
+    printf 'onboard-analog = %s\n' "$onboard_analog"
+    printf 'onboard-hdmi = %s\n' "$onboard_hdmi"
     printf 'base-url = http://127.0.0.1:32500\n\n'
     printf 'media-key = KEY_PLAYPAUSE player/playback/playPause?type=music&commandID={command-id}\n'
     printf 'media-key = KEY_PLAY player/playback/play?type=music&commandID={command-id}\n'
@@ -4882,12 +4947,14 @@ install_action() {
   : > "$STATE_DIR/replaced-files"
   : > "$STATE_DIR/created-bonds"
 
-  local audio_user config_seed
+  local audio_user config_seed create_config=0
+  local onboard_analog=enabled onboard_hdmi=enabled
   if [[ -e $CONFIG_FILE || -L $CONFIG_FILE ]]; then
     [[ -z $requested_user ]] || die "--user only applies when creating a new configuration."
     parse_config "$CONFIG_FILE" || die "$CONFIG_ERROR"
     audio_user=$CFG_AUDIO_USER
   else
+    create_config=1
     audio_user=$(infer_audio_user "$requested_user") || \
       die "Could not infer an audio user; use install --user USER."
     id "$audio_user" >/dev/null 2>&1 || die "Audio user does not exist: $audio_user"
@@ -4908,6 +4975,21 @@ install_action() {
   trap 'rollback_failed_install 130' INT
   trap 'rollback_failed_install 143' TERM
 
+  if (( create_config && non_interactive == 0 )) && has_tty; then
+    detect_install_onboard_audio || true
+    if (( INSTALL_ONBOARD_ANALOG_AVAILABLE || INSTALL_ONBOARD_HDMI_AVAILABLE )); then
+      tty_print '\nYou may optionally disable one or more onboard audio interfaces before Bluetooth pairing.\n'
+    fi
+    if (( INSTALL_ONBOARD_ANALOG_AVAILABLE )) && \
+       tty_confirm 'Disable Raspberry Pi onboard analogue audio?'; then
+      onboard_analog=disabled
+    fi
+    if (( INSTALL_ONBOARD_HDMI_AVAILABLE )) && \
+       tty_confirm 'Disable Raspberry Pi onboard HDMI audio?'; then
+      onboard_hdmi=disabled
+    fi
+  fi
+
   note "Installing BlueZ, PipeWire, WirePlumber, Triggerhappy, and A2DP codec support..."
   apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${PACKAGES[@]}"
@@ -4923,7 +5005,7 @@ install_action() {
 
   if [[ ! -e $CONFIG_FILE ]]; then
     config_seed=$(mktemp "$(dirname "$CONFIG_FILE")/.a2dpilot-config.XXXXXX")
-    write_default_config "$config_seed" "$audio_user"
+    write_default_config "$config_seed" "$audio_user" "$onboard_analog" "$onboard_hdmi"
     mv -f -- "$config_seed" "$CONFIG_FILE"
   fi
   chown root:root "$CONFIG_FILE"

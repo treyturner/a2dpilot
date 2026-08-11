@@ -94,6 +94,8 @@ curl -fsSL https://raw.githubusercontent.com/treyturner/a2dpilot/main/a2dpilot \
   | sudo bash -s -- install --user pi
 ```
 
+When creating a new configuration, an interactive install makes a best-effort check for Raspberry Pi onboard analogue and HDMI audio and asks separately whether to suppress each detected class. Undetected devices remain enabled and can be changed later with `a2dpilot audio onboard`. These choices are written before WirePlumber is provisioned and before Bluetooth pairing, avoiding an unnecessary interruption to a newly paired speaker.
+
 After package and service setup, an interactive install scans for Bluetooth Classic devices. Put the desired speaker into pairing mode, select it by number, and repeat to add additional fallbacks. The selection order becomes speaker priority. Enter `r` to rescan or press Enter without a selection to finish.
 
 For unattended installation:
