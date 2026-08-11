@@ -846,6 +846,8 @@ test_update_source_selection_and_validation() {
     if valid_update_ref "$ref"; then fail "invalid update ref was accepted: $ref"; fi
   done
   valid_a2dpilot_version "$A2DPILOT_VERSION" || fail 'running version is invalid'
+  a2dpilot_version_is_older 0.3.0 "$A2DPILOT_VERSION" || \
+    fail 'pre-per-override routing version was not detected as older'
   a2dpilot_version_is_older 0.2.0 "$A2DPILOT_VERSION" || \
     fail 'pre-cleanup-cursor application version was not detected as older'
   a2dpilot_version_is_older 0.1.0 "$A2DPILOT_VERSION" || \
@@ -2065,6 +2067,26 @@ test_status_stream_inspection_shared_deadline() {
   assert_file_not_contains "$TEST_SCRATCH/status-inspections" '97 '
 }
 
+test_status_rejects_unverified_active_node() {
+  local user output
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  CFG_AUDIO_USER=$user
+  printf 'AA:BB:CC:DD:EE:FF\n' > "$STATE_DIR/active-speaker"
+  find_a2dp_node_id() { printf '83\n'; }
+  inspect_pipewire_node() { return 1; }
+  configured_default_sink() { return 2; }
+  enumerate_playback_streams() {
+    fail 'status enumerated streams against an unverified active node'
+  }
+
+  output=$(print_routing_status)
+  assert_contains "$output" 'Active managed sink: none'
+  assert_contains "$output" 'Playback streams off active sink: n/a'
+}
+
 test_pairing_provenance_and_existing_bond() {
   local user mac=AA:BB:CC:DD:EE:FF paired=0 paired_file trusted_file
   setup_scratch_dir
@@ -2298,7 +2320,9 @@ test_forget_removes_config_and_provenance() {
   acquire_lock() { :; }
   release_lock() { :; }
   atomic_install_file() { cp "$1" "$2"; }
-  clear_owned_routing() { printf 'clear-routing %s\n' "$1" >> "$TEST_SCRATCH/forget-order"; }
+  clear_owned_routing() {
+    printf 'clear-routing %s %s\n' "$1" "$2" >> "$TEST_SCRATCH/forget-order"
+  }
   disconnect_bluetooth_device() {
     printf 'disconnect %s\n' "$1" >> "$TEST_SCRATCH/forget-order"
   }
@@ -2320,7 +2344,7 @@ test_forget_removes_config_and_provenance() {
   [[ ! -s $STATE_DIR/created-bonds ]] || fail 'forgotten bond remained in provenance ledger'
   assert_file_contains "$TEST_SCRATCH/bluetooth.log" "current $mac"
   assert_file_contains "$TEST_SCRATCH/bluetooth.log" "12:34:56:78:9A:BC $mac"
-  assert_eq $'clear-routing '"$user"$'\ndisconnect '"$mac" \
+  assert_eq $'disconnect '"$mac"$'\nclear-routing '"$user $mac" \
     "$(< "$TEST_SCRATCH/forget-order")"
   [[ ! -e $STATE_DIR/active-speaker && ! -e $STATE_DIR/active-codec-policy ]] || \
     fail 'forgotten active speaker retained daemon state'
@@ -2345,7 +2369,7 @@ test_forget_clears_routing_for_prior_speaker() {
   release_lock() { :; }
   atomic_install_file() { cp "$1" "$2"; }
   clear_owned_routing() {
-    printf '%s\n' "$1" > "$TEST_SCRATCH/forget-routing-user"
+    printf '%s %s\n' "$1" "$2" > "$TEST_SCRATCH/forget-routing-user"
     rm -f -- "$ROUTING_STATE_FILE"
   }
   disconnect_bluetooth_device() { :; }
@@ -2353,7 +2377,7 @@ test_forget_clears_routing_for_prior_speaker() {
   systemctl() { :; }
 
   forget_action "$mac" --yes
-  assert_eq "$user" "$(< "$TEST_SCRATCH/forget-routing-user")"
+  assert_eq "$user $mac" "$(< "$TEST_SCRATCH/forget-routing-user")"
   [[ ! -e $ROUTING_STATE_FILE ]] || \
     fail 'forget retained routing provenance for a prior speaker'
   assert_eq "$active" "$(< "$STATE_DIR/active-speaker")"
@@ -2417,7 +2441,7 @@ test_forget_active_speaker_preserves_different_routing_owner() {
     fail 'forgotten active speaker retained daemon state'
 }
 
-test_forget_retains_active_speaker_after_routing_cleanup_failure() {
+test_forget_commits_before_routing_cleanup_failure() {
   local user mac=AA:BB:CC:DD:EE:FF output rc
   setup_scratch_dir
   load_app
@@ -2430,18 +2454,51 @@ test_forget_retains_active_speaker_after_routing_cleanup_failure() {
   acquire_lock() { :; }
   release_lock() { :; }
   clear_owned_routing() { return 1; }
-  disconnect_bluetooth_device() { fail 'failed routing cleanup disconnected the speaker'; }
-  remove_bluetooth_device() { fail 'failed routing cleanup removed the bond'; }
-  atomic_install_file() { fail 'failed routing cleanup changed the configuration'; }
+  disconnect_bluetooth_device() { : > "$TEST_SCRATCH/disconnected"; }
+  device_info() { return 1; }
+  atomic_install_file() { cp "$1" "$2"; }
+  systemctl() { :; }
 
   set +e
   output=$(forget_action "$mac" --yes 2>&1)
   rc=$?
   set -e
   (( rc != 0 )) || fail 'forget succeeded after routing cleanup failed'
-  assert_contains "$output" "Could not clear audio routing for $mac"
+  assert_contains "$output" "Forgot $mac, but could not clear all of its audio routing"
+  assert_file_not_contains "$CONFIG_FILE" "speaker = $mac"
+  [[ -e $TEST_SCRATCH/disconnected ]] || fail 'forget did not disconnect before cleanup'
+  [[ ! -e $STATE_DIR/active-speaker ]] || \
+    fail 'forget retained active state after committing configuration removal'
+}
+
+test_forget_failure_preserves_routing_and_configuration() {
+  local user mac=AA:BB:CC:DD:EE:FF output rc
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  write_test_config "$CONFIG_FILE" "$user" "$mac"
+  : > "$STATE_FILE"
+  ROUTING_STATE_USER=$user
+  ROUTING_DEFAULT_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
+  write_routing_state
+  require_root() { :; }
+  acquire_lock() { :; }
+  release_lock() { :; }
+  disconnect_bluetooth_device() { :; }
+  device_info() { return 0; }
+  remove_bluetooth_device() { return 1; }
+  clear_owned_routing() { fail 'failed bond removal cleared audio routing'; }
+
+  set +e
+  output=$(forget_action "$mac" --yes 2>&1)
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'forget succeeded after BlueZ removal failed'
+  assert_contains "$output" "BlueZ could not remove $mac"
   assert_file_contains "$CONFIG_FILE" "speaker = $mac"
-  assert_eq "$mac" "$(< "$STATE_DIR/active-speaker")"
+  assert_file_contains "$ROUTING_STATE_FILE" \
+    $'default\tbluez_output.AA_BB_CC_DD_EE_FF.1\tAA:BB:CC:DD:EE:FF'
 }
 
 test_media_control_health_modes() {
@@ -2710,8 +2767,10 @@ EOF
   cleanup_log=$(< "$TEST_SCRATCH/routing.log")
   ROUTING_STATE_USER=$user
   ROUTING_DEFAULT_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
+  ROUTING_DEFAULT_SPEAKER=$mac
   ROUTING_PIPEWIRE_INSTANCE=01234567-89ab-cdef-0123-456789abcdef:4321:987654
   ROUTING_STREAM_TARGETS=([138]=89)
+  ROUTING_STREAM_SPEAKERS=([138]=$mac)
   write_routing_state
   clear_owned_routing "$user"
   assert_eq alsa_output.user-choice "$default_sink"
@@ -2725,6 +2784,7 @@ EOF
   ROUTING_DEFAULT_NAME=
   ROUTING_PIPEWIRE_INSTANCE=01234567-89ab-cdef-0123-456789abcdef:4321:987654
   ROUTING_STREAM_TARGETS=([138]=89)
+  ROUTING_STREAM_SPEAKERS=([138]=$mac)
   write_routing_state
   bounded_user_pw_cli() { mock_pipewire_nodes_for_routing; }
   clear_owned_routing "$user"
@@ -2739,6 +2799,7 @@ EOF
   ROUTING_DEFAULT_NAME=
   ROUTING_PIPEWIRE_INSTANCE=01234567-89ab-cdef-0123-456789abcdef:4321:987654
   ROUTING_STREAM_TARGETS=([138]=89)
+  ROUTING_STREAM_SPEAKERS=([138]=$mac)
   write_routing_state
   inspect_stream_fails=1
   if clear_owned_routing "$user"; then
@@ -2755,6 +2816,7 @@ EOF
   ROUTING_DEFAULT_NAME=
   ROUTING_PIPEWIRE_INSTANCE=01234567-89ab-cdef-0123-456789abcdef:4321:987654
   ROUTING_STREAM_TARGETS=([999]=89)
+  ROUTING_STREAM_SPEAKERS=([999]=$mac)
   write_routing_state
   bounded_user_pw_cli() { :; }
   clear_owned_routing "$user"
@@ -2765,6 +2827,7 @@ EOF
   ln -s "$TEST_SCRATCH/redirected-routing-state" "$ROUTING_STATE_FILE"
   ROUTING_STATE_USER=$user
   ROUTING_DEFAULT_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
+  ROUTING_DEFAULT_SPEAKER=$mac
   if write_routing_state; then fail 'routing state followed a symlink'; fi
   assert_eq sentinel "$(< "$TEST_SCRATCH/redirected-routing-state")"
 }
@@ -2818,6 +2881,49 @@ test_default_failure_still_routes_streams() {
   assert_file_contains "$ROUTING_STATE_FILE" \
     $'default-pending\tbluez_output.AA_BB_CC_DD_EE_FF.1'
   assert_file_contains "$ROUTING_STATE_FILE" $'stream\t138\t89'
+}
+
+test_routing_cleanup_is_scoped_per_speaker() {
+  local user speaker_a=AA:BB:CC:DD:EE:FF speaker_b=11:22:33:44:55:66
+  local default_sink=bluez_output.11_22_33_44_55_66.1 stream_target=89
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  ROUTING_STATE_USER=$user
+  ROUTING_STATE_SPEAKERS=()
+  ROUTING_DEFAULT_NAME=$default_sink
+  ROUTING_DEFAULT_SPEAKER=$speaker_b
+  ROUTING_PIPEWIRE_INSTANCE=01234567-89ab-cdef-0123-456789abcdef:4321:987654
+  ROUTING_STREAM_TARGETS=([138]=89)
+  ROUTING_STREAM_SPEAKERS=([138]=$speaker_a)
+  write_routing_state
+  configured_default_sink() { printf '%s\n' "$default_sink"; }
+  bounded_user_wpctl() { fail 'speaker A cleanup cleared speaker B default'; }
+  pipewire_instance_id() {
+    printf '01234567-89ab-cdef-0123-456789abcdef:4321:987654\n'
+  }
+  enumerate_playback_streams() { printf '95 138\n'; }
+  inspect_pipewire_node() {
+    PIPEWIRE_NODE_SERIAL=138
+    PIPEWIRE_NODE_NAME='Long-lived Player'
+    PIPEWIRE_NODE_CLASS=Stream/Output/Audio
+    PIPEWIRE_NODE_DRIVER=83
+  }
+  stream_target_serial() { printf '%s\n' "$stream_target"; }
+  bounded_user_pw_metadata() {
+    stream_target=
+    printf 'clear-target 95\n' >> "$TEST_SCRATCH/routing.log"
+  }
+
+  clear_owned_routing "$user" "$speaker_a"
+  assert_eq bluez_output.11_22_33_44_55_66.1 "$default_sink"
+  assert_eq '' "$stream_target"
+  assert_file_contains "$ROUTING_STATE_FILE" \
+    $'default\tbluez_output.11_22_33_44_55_66.1\t11:22:33:44:55:66'
+  assert_file_not_contains "$ROUTING_STATE_FILE" $'speaker\tAA:BB:CC:DD:EE:FF'
+  assert_file_not_contains "$ROUTING_STATE_FILE" $'stream\t138\t89'
+  assert_file_contains "$TEST_SCRATCH/routing.log" 'clear-target 95'
 }
 
 test_routing_write_failure_prevents_mutation() {
@@ -3051,13 +3157,15 @@ test_reconciliation_checkpoints_retired_stream() {
 }
 
 test_default_cleanup_revalidates_and_retires_missing_user() {
-  local user missing_user=a2dpilot-user-that-does-not-exist queries
+  local user mac=AA:BB:CC:DD:EE:FF
+  local missing_user=a2dpilot-user-that-does-not-exist queries
   setup_scratch_dir
   load_app
   configure_scratch_paths
   user=$(id -un)
   ROUTING_STATE_USER=$user
   ROUTING_DEFAULT_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
+  ROUTING_DEFAULT_SPEAKER=$mac
   write_routing_state
   printf '0\n' > "$TEST_SCRATCH/default-queries"
   configured_default_sink() {
@@ -3080,8 +3188,10 @@ test_default_cleanup_revalidates_and_retires_missing_user() {
 
   ROUTING_STATE_USER=$user
   ROUTING_DEFAULT_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
+  ROUTING_DEFAULT_SPEAKER=$mac
   ROUTING_PIPEWIRE_INSTANCE=01234567-89ab-cdef-0123-456789abcdef:4321:987654
   ROUTING_STREAM_TARGETS=([138]=89)
+  ROUTING_STREAM_SPEAKERS=([138]=$mac)
   write_routing_state
   configured_default_sink() { printf 'alsa_output.user-choice\n'; }
   pipewire_instance_id() {
@@ -3098,8 +3208,10 @@ test_default_cleanup_revalidates_and_retires_missing_user() {
 
   ROUTING_STATE_USER=$missing_user
   ROUTING_DEFAULT_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
+  ROUTING_DEFAULT_SPEAKER=$mac
   ROUTING_PIPEWIRE_INSTANCE=
   ROUTING_STREAM_TARGETS=()
+  ROUTING_STREAM_SPEAKERS=()
   write_routing_state
   configured_default_sink() { fail 'missing-user cleanup queried PipeWire'; }
   clear_owned_routing "$missing_user"
@@ -3109,6 +3221,7 @@ test_default_cleanup_revalidates_and_retires_missing_user() {
   ROUTING_STATE_USER=$missing_user
   ROUTING_STATE_SPEAKERS=([AA:BB:CC:DD:EE:FF]=1)
   ROUTING_DEFAULT_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
+  ROUTING_DEFAULT_SPEAKER=$mac
   write_routing_state
   rm() {
     if [[ ${*: -1} == "$ROUTING_STATE_FILE" ]]; then return 1; fi
@@ -3569,6 +3682,7 @@ test_daemon_signal_defers_during_routing_mutation() {
   ROUTING_STATE_USER=$user
   ROUTING_PIPEWIRE_INSTANCE=01234567-89ab-cdef-0123-456789abcdef:4321:987654
   ROUTING_STREAM_TARGETS=([138]=89)
+  ROUTING_STREAM_SPEAKERS=([138]=$mac)
   write_routing_state
   pipewire_instance_id() { printf '01234567-89ab-cdef-0123-456789abcdef:4321:987654\n'; }
   enumerate_playback_streams() { printf '95 138\n'; }
@@ -3594,13 +3708,14 @@ test_daemon_signal_defers_during_routing_mutation() {
 }
 
 test_cli_signal_defers_during_routing_cleanup() {
-  local user result default_sink=alsa_output.builtin
+  local user result mac=AA:BB:CC:DD:EE:FF default_sink=alsa_output.builtin
   setup_scratch_dir
   load_app
   configure_scratch_paths
   user=$(id -un)
   ROUTING_STATE_USER=$user
   ROUTING_DEFAULT_NAME=$default_sink
+  ROUTING_DEFAULT_SPEAKER=$mac
   write_routing_state
   configured_default_sink() { printf '%s\n' "$default_sink"; }
   bounded_user_wpctl() {
@@ -3626,6 +3741,7 @@ test_cli_signal_defers_during_routing_cleanup() {
   ROUTING_STATE_USER=$user
   ROUTING_PIPEWIRE_INSTANCE=01234567-89ab-cdef-0123-456789abcdef:4321:987654
   ROUTING_STREAM_TARGETS=([138]=89)
+  ROUTING_STREAM_SPEAKERS=([138]=$mac)
   write_routing_state
   pipewire_instance_id() { printf '01234567-89ab-cdef-0123-456789abcdef:4321:987654\n'; }
   enumerate_playback_streams() { printf '95 138\n'; }
@@ -3657,6 +3773,7 @@ test_cli_signal_defers_during_routing_cleanup() {
   DAEMON_STOP_REQUESTED=0
   ROUTING_STATE_USER=$user
   ROUTING_DEFAULT_NAME=alsa_output.builtin
+  ROUTING_DEFAULT_SPEAKER=$mac
   ROUTING_PIPEWIRE_INSTANCE=
   ROUTING_STREAM_TARGETS=()
   write_routing_state
@@ -3937,6 +4054,12 @@ test_pipewire_restart_discards_stream_provenance() {
     '01234567-89ab-cdef-0123-456789abcdef:4321:987654' > "$ROUTING_STATE_FILE"
   if load_routing_state; then
     fail 'routing provenance without a speaker identity was accepted'
+  fi
+  printf 'user\t%s\nspeaker\t%s\ndefault\t%s\t%s\n' "$user" \
+    'AA:BB:CC:DD:EE:FF' 'bluez_output.11_22_33_44_55_66.1' \
+    '11:22:33:44:55:66' > "$ROUTING_STATE_FILE"
+  if load_routing_state; then
+    fail 'aggregate routing provenance disagreed with its override owner'
   fi
 }
 
@@ -4848,6 +4971,8 @@ run_test 'media state rejects the wrong identity' test_media_state_rejects_wrong
 run_test 'status reports media URL configuration' test_status_reports_media_url_configuration
 run_test 'status stream inspection shares one deadline' \
   test_status_stream_inspection_shared_deadline
+run_test 'status rejects an unverified active node' \
+  test_status_rejects_unverified_active_node
 run_test 'pairing provenance and existing bonds' test_pairing_provenance_and_existing_bond
 run_test 'pairing session terminates after bonding' test_pairing_session_terminates_after_bonding
 run_test 'pair --all attempts every configured speaker' test_pair_all_attempts_every_configured_speaker
@@ -4858,14 +4983,18 @@ run_test 'forget clears routing for a prior speaker' \
 run_test 'forget preserves unrelated routing' test_forget_preserves_unrelated_routing
 run_test 'forget active speaker preserves different routing owner' \
   test_forget_active_speaker_preserves_different_routing_owner
-run_test 'forget retains active speaker after routing cleanup failure' \
-  test_forget_retains_active_speaker_after_routing_cleanup_failure
+run_test 'forget commits before routing cleanup failure' \
+  test_forget_commits_before_routing_cleanup_failure
+run_test 'forget failure preserves routing and configuration' \
+  test_forget_failure_preserves_routing_and_configuration
 run_test 'media-control health modes' test_media_control_health_modes
 run_test 'optimistic codec reporting' test_codec_reporting_is_optimistic
 run_test 'PipeWire codec property parsing' test_codec_property_parsing
 run_test 'PipeWire routing parsers' test_pipewire_routing_parsers
 run_test 'default routing and owned cleanup' test_default_routing_and_owned_cleanup
 run_test 'default failure still routes streams' test_default_failure_still_routes_streams
+run_test 'routing cleanup is scoped per speaker' \
+  test_routing_cleanup_is_scoped_per_speaker
 run_test 'routing write failure prevents mutation' test_routing_write_failure_prevents_mutation
 run_test 'unchanged routing state is not replaced' \
   test_unchanged_routing_state_is_not_replaced
