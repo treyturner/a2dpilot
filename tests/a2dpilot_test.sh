@@ -2709,6 +2709,64 @@ test_interrupted_routing_transition_preserves_prior_owner() {
     fail 'cleanup lost the prior stream owner after an interrupted transition'
 }
 
+test_routing_rotates_after_deadline() {
+  local user mac=AA:BB:CC:DD:EE:FF clock=100
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  CFG_AUDIO_USER=$user
+  now_seconds() { printf '%s\n' "$clock"; }
+  find_a2dp_node_id() { printf '83\n'; }
+  configured_default_sink() { printf 'bluez_output.AA_BB_CC_DD_EE_FF.1\n'; }
+  pipewire_instance_id() { printf '01234567-89ab-cdef-0123-456789abcdef:4321:987654\n'; }
+  enumerate_playback_streams() {
+    printf '%s\n' '95 138' '96 139' '97 140' '98 141'
+  }
+  inspect_pipewire_node() {
+    if [[ $2 == 83 ]]; then
+      PIPEWIRE_NODE_SERIAL=89
+      PIPEWIRE_NODE_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
+      PIPEWIRE_NODE_CLASS=Audio/Sink
+      PIPEWIRE_NODE_DRIVER=
+      return 0
+    fi
+    printf '%s\n' "$2" >> "$TEST_SCRATCH/rotated-streams"
+    clock=$((clock + ROUTING_TIMEOUT))
+    return 1
+  }
+
+  reconcile_speaker_routing "$mac" || true
+  reconcile_speaker_routing "$mac" || true
+  reconcile_speaker_routing "$mac" || true
+  reconcile_speaker_routing "$mac" || true
+  assert_eq 1 "$(grep -Fc 95 "$TEST_SCRATCH/rotated-streams")"
+  assert_eq 1 "$(grep -Fc 96 "$TEST_SCRATCH/rotated-streams")"
+  assert_eq 1 "$(grep -Fc 97 "$TEST_SCRATCH/rotated-streams")"
+  assert_eq 1 "$(grep -Fc 98 "$TEST_SCRATCH/rotated-streams")"
+}
+
+test_invalid_initial_config_clears_recorded_routing() {
+  local user
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  CFG_AUDIO_USER=
+  ROUTING_STATE_USER=$user
+  ROUTING_DEFAULT_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
+  write_routing_state
+  clear_owned_routing() {
+    printf '%s\n' "$1" > "$TEST_SCRATCH/cleared-routing-user"
+    rm -f -- "$ROUTING_STATE_FILE"
+  }
+
+  clear_daemon_routing_from_state
+  assert_eq "$user" "$(< "$TEST_SCRATCH/cleared-routing-user")"
+  [[ ! -e $ROUTING_STATE_FILE ]] || \
+    fail 'invalid initial configuration retained recorded routing ownership'
+}
+
 test_unmovable_stream_does_not_starve_routing() {
   local user mac=AA:BB:CC:DD:EE:FF clock=100
   local first_driver=35 second_driver=35 first_target='' second_target=''
@@ -3838,6 +3896,9 @@ run_test 'default routing and owned cleanup' test_default_routing_and_owned_clea
 run_test 'routing write failure prevents mutation' test_routing_write_failure_prevents_mutation
 run_test 'interrupted routing transition preserves prior owner' \
   test_interrupted_routing_transition_preserves_prior_owner
+run_test 'routing rotates after a shared deadline' test_routing_rotates_after_deadline
+run_test 'invalid initial config clears recorded routing' \
+  test_invalid_initial_config_clears_recorded_routing
 run_test 'unmovable stream does not starve routing' test_unmovable_stream_does_not_starve_routing
 run_test 'vanished stream does not starve routing' test_vanished_stream_does_not_starve_routing
 run_test 'recycled stream is not targeted' test_recycled_stream_is_not_targeted

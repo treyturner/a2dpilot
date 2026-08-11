@@ -164,6 +164,7 @@ ROUTING_PENDING_DEFAULT_NAME=
 ROUTING_PIPEWIRE_INSTANCE=
 declare -gA ROUTING_STREAM_TARGETS=()
 declare -gA ROUTING_PENDING_STREAM_TARGETS=()
+ROUTING_STREAM_CURSOR=
 DAEMON_NEXT_ROUTE_LOG=0
 
 usage() {
@@ -2090,8 +2091,9 @@ clear_owned_routing() {
 
 reconcile_speaker_routing() {
   local mac=$1 deadline remaining sink current current_instance result streams id serial extra target
-  local routing_failed=0
+  local routing_failed=0 count index offset start=0
   local -A seen_streams=() pending_streams=()
+  local -a playback_ids=() playback_serials=()
   deadline=$(( $(now_seconds) + ROUTING_TIMEOUT ))
   load_routing_state || return 1
   if [[ -n $ROUTING_STATE_USER && $ROUTING_STATE_USER != "$CFG_AUDIO_USER" ]]; then
@@ -2172,8 +2174,26 @@ reconcile_speaker_routing() {
   if [[ -n $streams ]]; then
     while read -r id serial extra; do
       [[ -z $extra && $id =~ ^[0-9]+$ && $serial =~ ^[0-9]+$ ]] || return 1
+      [[ ! ${seen_streams[$serial]+present} ]] || return 1
       seen_streams[$serial]=1
+      playback_ids+=("$id")
+      playback_serials+=("$serial")
+    done <<< "$streams"
+    count=${#playback_ids[@]}
+    for ((index = 0; index < count; index++)); do
+      if [[ ${playback_serials[$index]} == "$ROUTING_STREAM_CURSOR" ]]; then
+        start=$(((index + 1) % count))
+        break
+      fi
+    done
+    for ((offset = 0; offset < count; offset++)); do
+      index=$(((start + offset) % count))
+      id=${playback_ids[$index]}
+      serial=${playback_serials[$index]}
       remaining=$(seconds_until_deadline "$deadline") || return 1
+      # Advance only once this stream has budget to be attempted. If the
+      # attempt consumes the deadline, the next cycle starts with its successor.
+      ROUTING_STREAM_CURSOR=$serial
       if ! inspect_pipewire_node "$CFG_AUDIO_USER" "$id" "$remaining"; then
         routing_failed=1
         continue
@@ -2229,7 +2249,7 @@ reconcile_speaker_routing() {
           fi
         fi
       fi
-    done <<< "$streams"
+    done
   fi
   for serial in "${!ROUTING_STREAM_TARGETS[@]}"; do
     [[ ${seen_streams[$serial]+present} ]] || unset "ROUTING_STREAM_TARGETS[$serial]"
@@ -3026,12 +3046,25 @@ maintain_speaker_routing() {
 }
 
 clear_daemon_routing() {
-  if clear_owned_routing "$CFG_AUDIO_USER"; then
+  local user=${1:-${CFG_AUDIO_USER:-}}
+  [[ -n $user ]] || return 0
+  if clear_owned_routing "$user"; then
     DAEMON_NEXT_ROUTE_LOG=0
     return 0
   fi
   daemon_route_warning "could not fully clear A2DPilot-owned audio routing overrides"
   return 1
+}
+
+clear_daemon_routing_from_state() {
+  local routing_user
+  if ! load_routing_state; then
+    daemon_route_warning "could not read A2DPilot-owned audio routing state"
+    return 1
+  fi
+  routing_user=$ROUTING_STATE_USER
+  [[ -n $routing_user ]] || return 0
+  clear_daemon_routing "$routing_user"
 }
 
 remember_daemon_codec_policy() {
@@ -3255,6 +3288,7 @@ daemon_action() {
         release_lock
         sleep "$CFG_RECONNECT_INTERVAL"
       else
+        clear_daemon_routing_from_state || true
         release_lock
         sleep 5
       fi
