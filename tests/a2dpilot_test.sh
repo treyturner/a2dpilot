@@ -2067,7 +2067,7 @@ test_status_stream_inspection_shared_deadline() {
   assert_file_not_contains "$TEST_SCRATCH/status-inspections" '97 '
 }
 
-test_status_rejects_unverified_active_node() {
+test_status_rejects_unverified_or_recycled_active_node() {
   local user output
   setup_scratch_dir
   load_app
@@ -2076,10 +2076,15 @@ test_status_rejects_unverified_active_node() {
   CFG_AUDIO_USER=$user
   printf 'AA:BB:CC:DD:EE:FF\n' > "$STATE_DIR/active-speaker"
   find_a2dp_node_id() { printf '83\n'; }
-  inspect_pipewire_node() { return 1; }
+  inspect_pipewire_node() {
+    PIPEWIRE_NODE_SERIAL=90
+    PIPEWIRE_NODE_NAME=alsa_output.recycled
+    PIPEWIRE_NODE_CLASS=Audio/Sink
+    PIPEWIRE_NODE_DRIVER=
+  }
   configured_default_sink() { return 2; }
   enumerate_playback_streams() {
-    fail 'status enumerated streams against an unverified active node'
+    fail 'status enumerated streams against an unverified or recycled active node'
   }
 
   output=$(print_routing_status)
@@ -3445,15 +3450,23 @@ test_recycled_stream_is_not_cleared() {
 }
 
 test_changed_stream_target_is_not_cleared() {
-  local user target_queries
+  local user target_queries instance_queries
   setup_scratch_dir
   load_app
   configure_scratch_paths
   user=$(id -un)
   printf '0\n' > "$TEST_SCRATCH/target-queries"
+  printf '0\n' > "$TEST_SCRATCH/instance-queries"
+  printf '89\n' > "$TEST_SCRATCH/stream-target"
   routing_now_seconds() { printf '100\n'; }
   configured_default_sink() { return 2; }
-  pipewire_instance_id() { printf '01234567-89ab-cdef-0123-456789abcdef:4321:987654\n'; }
+  pipewire_instance_id() {
+    instance_queries=$(< "$TEST_SCRATCH/instance-queries")
+    instance_queries=$((instance_queries + 1))
+    printf '%s\n' "$instance_queries" > "$TEST_SCRATCH/instance-queries"
+    if (( instance_queries == 2 )); then printf '77\n' > "$TEST_SCRATCH/stream-target"; fi
+    printf '01234567-89ab-cdef-0123-456789abcdef:4321:987654\n'
+  }
   enumerate_playback_streams() { printf '95 138\n'; }
   inspect_pipewire_node() {
     PIPEWIRE_NODE_CLASS=Stream/Output/Audio
@@ -3465,7 +3478,7 @@ test_changed_stream_target_is_not_cleared() {
     target_queries=$(< "$TEST_SCRATCH/target-queries")
     target_queries=$((target_queries + 1))
     printf '%s\n' "$target_queries" > "$TEST_SCRATCH/target-queries"
-    if (( target_queries == 1 )); then printf '89\n'; else printf '77\n'; fi
+    command cat "$TEST_SCRATCH/stream-target"
   }
   bounded_user_pw_metadata() { : > "$TEST_SCRATCH/changed-target-cleared"; }
   ROUTING_STATE_USER=$user
@@ -3477,9 +3490,50 @@ test_changed_stream_target_is_not_cleared() {
   [[ ! -e $TEST_SCRATCH/changed-target-cleared ]] || \
     fail 'an independently changed stream target was cleared'
   target_queries=$(< "$TEST_SCRATCH/target-queries")
-  assert_eq 2 "$target_queries"
+  assert_eq 3 "$target_queries"
   [[ ! -e $ROUTING_STATE_FILE ]] || \
     fail 'independently changed stream retained stale routing provenance'
+}
+
+test_linked_stream_target_lookup_failure_is_reported() {
+  local user mac=AA:BB:CC:DD:EE:FF
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  CFG_AUDIO_USER=$user
+  routing_now_seconds() { printf '100\n'; }
+  find_a2dp_node_id() { printf '83\n'; }
+  configured_default_sink() { printf 'bluez_output.AA_BB_CC_DD_EE_FF.1\n'; }
+  pipewire_instance_id() {
+    printf '01234567-89ab-cdef-0123-456789abcdef:4321:987654\n'
+  }
+  enumerate_playback_streams() { printf '95 138\n'; }
+  inspect_pipewire_node() {
+    if [[ $2 == 83 ]]; then
+      PIPEWIRE_NODE_SERIAL=89
+      PIPEWIRE_NODE_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
+      PIPEWIRE_NODE_CLASS=Audio/Sink
+      PIPEWIRE_NODE_DRIVER=
+    else
+      PIPEWIRE_NODE_SERIAL=138
+      PIPEWIRE_NODE_NAME='Linked Player'
+      PIPEWIRE_NODE_CLASS=Stream/Output/Audio
+      PIPEWIRE_NODE_DRIVER=83
+    fi
+  }
+  stream_target_serial() { return 1; }
+  bounded_user_pw_metadata() { fail 'lookup failure rewrote stream routing'; }
+  ROUTING_STATE_USER=$user
+  ROUTING_PIPEWIRE_INSTANCE=01234567-89ab-cdef-0123-456789abcdef:4321:987654
+  ROUTING_STREAM_TARGETS=([138]=89)
+  ROUTING_STREAM_SPEAKERS=([138]=$mac)
+  write_routing_state
+
+  if reconcile_speaker_routing "$mac"; then
+    fail 'stream target lookup failure reported routing success'
+  fi
+  assert_file_contains "$ROUTING_STATE_FILE" $'stream\t138\t89\tAA:BB:CC:DD:EE:FF'
 }
 
 test_interrupted_routing_transition_preserves_prior_owner() {
@@ -4971,8 +5025,8 @@ run_test 'media state rejects the wrong identity' test_media_state_rejects_wrong
 run_test 'status reports media URL configuration' test_status_reports_media_url_configuration
 run_test 'status stream inspection shares one deadline' \
   test_status_stream_inspection_shared_deadline
-run_test 'status rejects an unverified active node' \
-  test_status_rejects_unverified_active_node
+run_test 'status rejects an unverified or recycled active node' \
+  test_status_rejects_unverified_or_recycled_active_node
 run_test 'pairing provenance and existing bonds' test_pairing_provenance_and_existing_bond
 run_test 'pairing session terminates after bonding' test_pairing_session_terminates_after_bonding
 run_test 'pair --all attempts every configured speaker' test_pair_all_attempts_every_configured_speaker
@@ -5015,6 +5069,8 @@ run_test 'stale owned target is rewritten after relink' \
   test_stale_owned_target_is_rewritten_after_relink
 run_test 'recycled stream is not cleared' test_recycled_stream_is_not_cleared
 run_test 'changed stream target is not cleared' test_changed_stream_target_is_not_cleared
+run_test 'linked stream target lookup failure is reported' \
+  test_linked_stream_target_lookup_failure_is_reported
 run_test 'interrupted routing transition preserves prior owner' \
   test_interrupted_routing_transition_preserves_prior_owner
 run_test 'routing rotates after a shared deadline' test_routing_rotates_after_deadline

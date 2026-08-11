@@ -2522,6 +2522,31 @@ clear_owned_routing_impl() {
               break
             fi
             remaining=$(routing_cleanup_seconds_until_deadline "$deadline") || return 1
+            if ! inspect_pipewire_node "$user" "$id" "$remaining"; then
+              failed=1
+              continue
+            fi
+            if [[ $PIPEWIRE_NODE_CLASS != Stream/Output/Audio ||
+                  $PIPEWIRE_NODE_SERIAL != "$serial" ]]; then
+              clear_stream_routing_ownership "$serial"
+              continue
+            fi
+            remaining=$(routing_cleanup_seconds_until_deadline "$deadline") || return 1
+            if current=$(stream_target_serial "$user" "$id" "$remaining"); then
+              normalize_stream_routing_ownership "$serial" "$current" 0
+              if ! routing_stream_is_owned_by "$serial" "$speaker"; then
+                continue
+              fi
+            else
+              result=$?
+              if (( result == 2 )); then
+                clear_stream_routing_ownership "$serial"
+              else
+                failed=1
+              fi
+              continue
+            fi
+            remaining=$(routing_cleanup_seconds_until_deadline "$deadline") || return 1
             if bounded_user_pw_metadata "$user" "$remaining" \
               -d -n default "$id" target.object >/dev/null 2>&1; then
               clear_stream_routing_ownership "$serial"
@@ -2768,6 +2793,8 @@ reconcile_speaker_routing_impl() {
           if (( result == 2 )); then
             normalize_stream_routing_ownership "$serial" '' 2
             write_routing_state || return 1
+          else
+            routing_failed=1
           fi
         fi
       fi
@@ -4493,6 +4520,7 @@ devices_action() {
 
 print_routing_status() {
   local active_mac='' active_node='' active_name=none default_name=none
+  local active_mac_key=''
   local streams id serial extra result stream_started stream_deadline remaining
   local off_active=0 inspection_failed=0
   if [[ -f $STATE_DIR/active-speaker && ! -L $STATE_DIR/active-speaker ]]; then
@@ -4500,9 +4528,12 @@ print_routing_status() {
     valid_mac "$active_mac" || active_mac=
   fi
   if [[ -n $active_mac ]]; then
+    active_mac_key=${active_mac//:/_}
     active_node=$(find_a2dp_node_id "$active_mac" "$ROUTING_TIMEOUT" 2>/dev/null || true)
     if [[ $active_node =~ ^[0-9]+$ ]] && \
-       inspect_pipewire_node "$CFG_AUDIO_USER" "$active_node" "$ROUTING_TIMEOUT"; then
+       inspect_pipewire_node "$CFG_AUDIO_USER" "$active_node" "$ROUTING_TIMEOUT" && \
+       [[ $PIPEWIRE_NODE_CLASS == Audio/Sink &&
+          $PIPEWIRE_NODE_NAME == "bluez_output.${active_mac_key}."* ]]; then
       active_name=$PIPEWIRE_NODE_NAME
     else
       active_node=
