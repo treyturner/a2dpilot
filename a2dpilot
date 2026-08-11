@@ -1861,15 +1861,23 @@ configured_default_sink() {
 }
 
 stream_target_serial() {
-  local user=$1 stream=$2 seconds=$3 output line pattern
+  local user=$1 stream=$2 seconds=$3 output line pattern have_banner=0
   [[ $stream =~ ^[0-9]+$ ]] || return 1
   pattern="key:'target\\.object'.*value:'([0-9]+)'.*type:'Spa:Id'"
   output=$(bounded_user_pw_metadata "$user" "$seconds" \
     -n default "$stream" target.object 2>/dev/null) || return 1
   while IFS= read -r line; do
-    [[ $line =~ $pattern ]] || continue
-    printf '%s\n' "${BASH_REMATCH[1]}"
-    return 0
+    if [[ $line =~ $pattern ]]; then
+      printf '%s\n' "${BASH_REMATCH[1]}"
+      return 0
+    fi
+    [[ -z $line ]] && continue
+    if [[ $line =~ ^Found[[:space:]]\"default\"[[:space:]]metadata[[:space:]][0-9]+$ ]]; then
+      (( have_banner == 0 )) || return 1
+      have_banner=1
+      continue
+    fi
+    return 1
   done <<< "$output"
   return 2
 }
@@ -1956,8 +1964,12 @@ end_routing_cleanup() {
 }
 
 apply_owned_stream_target() {
-  local user=$1 id=$2 serial=$3 target=$4 deadline=$5 remaining result=0
+  local user=$1 id=$2 serial=$3 sink=$4 target=$5 sink_name=$6 deadline=$7
+  local remaining result=0
   local previous_critical=$ROUTING_MUTATION_CRITICAL
+  [[ $id =~ ^[0-9]+$ && $serial =~ ^[0-9]+$ && $sink =~ ^[0-9]+$ &&
+     $target =~ ^[0-9]+$ ]] || return 1
+  valid_pipewire_name "$sink_name" || return 1
   ROUTING_MUTATION_CRITICAL=1
   ROUTING_PENDING_STREAM_TARGETS[$serial]=$target
   if ! write_routing_state; then
@@ -1976,6 +1988,20 @@ apply_owned_stream_target() {
     unset "ROUTING_PENDING_STREAM_TARGETS[$serial]"
     write_routing_state || result=1
     (( result != 0 )) || result=3
+  elif ! remaining=$(routing_seconds_until_deadline "$deadline"); then
+    unset "ROUTING_PENDING_STREAM_TARGETS[$serial]"
+    write_routing_state || true
+    result=1
+  elif ! inspect_pipewire_node "$user" "$sink" "$remaining"; then
+    unset "ROUTING_PENDING_STREAM_TARGETS[$serial]"
+    write_routing_state || result=1
+    (( result != 0 )) || result=4
+  elif [[ $PIPEWIRE_NODE_CLASS != Audio/Sink ||
+          $PIPEWIRE_NODE_SERIAL != "$target" ||
+          $PIPEWIRE_NODE_NAME != "$sink_name" ]]; then
+    unset "ROUTING_PENDING_STREAM_TARGETS[$serial]"
+    write_routing_state || result=1
+    (( result != 0 )) || result=4
   elif ! remaining=$(routing_seconds_until_deadline "$deadline"); then
     unset "ROUTING_PENDING_STREAM_TARGETS[$serial]"
     write_routing_state || true
@@ -2451,7 +2477,7 @@ reconcile_speaker_routing_impl() {
         write_routing_state || return 1
         if [[ $target != "$sink_serial" ]]; then
           if apply_owned_stream_target "$CFG_AUDIO_USER" "$id" "$serial" \
-            "$sink_serial" "$deadline"; then
+            "$sink" "$sink_serial" "$sink_name" "$deadline"; then
             :
           else
             result=$?

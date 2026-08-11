@@ -2518,6 +2518,18 @@ EOF
   else
     assert_eq 2 "$?"
   fi
+  bounded_user_pw_metadata() { printf 'malformed target metadata\n'; }
+  if stream_target_serial audio 95 3; then
+    fail 'malformed stream-target metadata was accepted as absent'
+  else
+    assert_eq 1 "$?"
+  fi
+  bounded_user_pw_metadata() { printf 'Found \"default\" metadata 42\n'; }
+  if stream_target_serial audio 95 3; then
+    fail 'stream-target discovery banner was treated as a property'
+  else
+    assert_eq 2 "$?"
+  fi
 
   bounded_user_pw_cli() {
     printf '%s\n' $'\tid 95, type PipeWire:Interface:Node/3' \
@@ -2959,6 +2971,49 @@ test_recycled_sink_is_not_defaulted() {
     fail 'a recycled PipeWire sink ID became the configured default'
   [[ ! -e $ROUTING_STATE_FILE ]] || \
     fail 'recycled sink retained pending routing ownership'
+}
+
+test_recycled_sink_is_not_targeted() {
+  local user mac=AA:BB:CC:DD:EE:FF sink_inspections=0
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  CFG_AUDIO_USER=$user
+  routing_now_seconds() { printf '100\n'; }
+  find_a2dp_node_id() { printf '83\n'; }
+  configured_default_sink() { printf 'bluez_output.AA_BB_CC_DD_EE_FF.1\n'; }
+  pipewire_instance_id() { printf '01234567-89ab-cdef-0123-456789abcdef:4321:987654\n'; }
+  enumerate_playback_streams() { printf '95 138\n'; }
+  inspect_pipewire_node() {
+    if [[ $2 == 83 ]]; then
+      sink_inspections=$((sink_inspections + 1))
+      PIPEWIRE_NODE_CLASS=Audio/Sink
+      PIPEWIRE_NODE_DRIVER=
+      if (( sink_inspections == 1 )); then
+        PIPEWIRE_NODE_SERIAL=89
+        PIPEWIRE_NODE_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
+      else
+        PIPEWIRE_NODE_SERIAL=90
+        PIPEWIRE_NODE_NAME=bluez_output.11_22_33_44_55_66.1
+      fi
+    else
+      PIPEWIRE_NODE_SERIAL=138
+      PIPEWIRE_NODE_NAME='Long-lived Player'
+      PIPEWIRE_NODE_CLASS=Stream/Output/Audio
+      PIPEWIRE_NODE_DRIVER=35
+    fi
+  }
+  stream_target_serial() { return 2; }
+  bounded_user_pw_metadata() { : > "$TEST_SCRATCH/recycled-sink-targeted"; }
+
+  if reconcile_speaker_routing "$mac"; then
+    fail 'recycled sink identity reported stream-routing success'
+  fi
+  [[ ! -e $TEST_SCRATCH/recycled-sink-targeted ]] || \
+    fail 'a recycled PipeWire sink ID received a stream target'
+  [[ ! -e $ROUTING_STATE_FILE ]] || \
+    fail 'recycled sink retained pending stream ownership'
 }
 
 test_interrupted_routing_transition_preserves_prior_owner() {
@@ -4443,6 +4498,7 @@ run_test 'reconciliation checkpoints retired stream' \
 run_test 'default cleanup revalidates and retires missing user' \
   test_default_cleanup_revalidates_and_retires_missing_user
 run_test 'recycled sink is not defaulted' test_recycled_sink_is_not_defaulted
+run_test 'recycled sink is not targeted' test_recycled_sink_is_not_targeted
 run_test 'interrupted routing transition preserves prior owner' \
   test_interrupted_routing_transition_preserves_prior_owner
 run_test 'routing rotates after a shared deadline' test_routing_rotates_after_deadline
