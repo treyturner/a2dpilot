@@ -2512,6 +2512,12 @@ EOF
   else
     assert_eq 1 "$?"
   fi
+  bounded_user_pw_metadata() { printf 'Found \"default\" metadata 42\n'; }
+  if configured_default_sink audio 3; then
+    fail 'configured-default discovery banner was treated as a property'
+  else
+    assert_eq 2 "$?"
+  fi
 
   bounded_user_pw_cli() {
     printf '%s\n' $'\tid 95, type PipeWire:Interface:Node/3' \
@@ -2808,6 +2814,50 @@ test_routing_cleanup_checkpoints_deadline_progress() {
   fi
   assert_file_not_contains "$ROUTING_STATE_FILE" $'stream\t'"$deleted_serial"$'\t89'
   assert_file_contains "$ROUTING_STATE_FILE" $'stream\t'"$remaining_serial"$'\t89'
+}
+
+test_reconciliation_checkpoints_retired_stream() {
+  local user mac=AA:BB:CC:DD:EE:FF
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  CFG_AUDIO_USER=$user
+  routing_now_seconds() { printf '100\n'; }
+  find_a2dp_node_id() { printf '83\n'; }
+  configured_default_sink() { printf 'bluez_output.AA_BB_CC_DD_EE_FF.1\n'; }
+  pipewire_instance_id() { printf '01234567-89ab-cdef-0123-456789abcdef:4321:987654\n'; }
+  enumerate_playback_streams() { printf '%s\n' '95 138' '96 139'; }
+  inspect_pipewire_node() {
+    if [[ $2 == 83 ]]; then
+      PIPEWIRE_NODE_SERIAL=89
+      PIPEWIRE_NODE_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
+      PIPEWIRE_NODE_CLASS=Audio/Sink
+      PIPEWIRE_NODE_DRIVER=
+    else
+      PIPEWIRE_NODE_SERIAL=$([[ $2 == 95 ]] && printf 138 || printf 139)
+      PIPEWIRE_NODE_NAME='Long-lived Player'
+      PIPEWIRE_NODE_CLASS=Stream/Output/Audio
+      PIPEWIRE_NODE_DRIVER=83
+      if [[ $2 == 96 ]]; then
+        daemon_signal
+        return 1
+      fi
+    fi
+  }
+  stream_target_serial() { return 2; }
+  ROUTING_STATE_USER=$user
+  ROUTING_PIPEWIRE_INSTANCE=01234567-89ab-cdef-0123-456789abcdef:4321:987654
+  ROUTING_STREAM_TARGETS=([138]=89)
+  write_routing_state
+
+  if reconcile_speaker_routing "$mac"; then
+    fail 'stop-requested stream retirement reported routing success'
+  fi
+  [[ ! -e $ROUTING_STATE_FILE ]] || \
+    fail 'stop request after stream retirement retained stale provenance'
+  assert_eq 1 "$DAEMON_STOP_REQUESTED"
+  assert_eq 0 "$ROUTING_MUTATION_CRITICAL"
 }
 
 test_default_cleanup_revalidates_and_retires_missing_user() {
@@ -4388,6 +4438,8 @@ run_test 'default failure still routes streams' test_default_failure_still_route
 run_test 'routing write failure prevents mutation' test_routing_write_failure_prevents_mutation
 run_test 'routing cleanup checkpoints deadline progress' \
   test_routing_cleanup_checkpoints_deadline_progress
+run_test 'reconciliation checkpoints retired stream' \
+  test_reconciliation_checkpoints_retired_stream
 run_test 'default cleanup revalidates and retires missing user' \
   test_default_cleanup_revalidates_and_retires_missing_user
 run_test 'recycled sink is not defaulted' test_recycled_sink_is_not_defaulted

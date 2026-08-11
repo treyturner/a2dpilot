@@ -1838,19 +1838,26 @@ enumerate_playback_streams() {
 }
 
 configured_default_sink() {
-  local user=$1 seconds=$2 output line pattern name
+  local user=$1 seconds=$2 output line pattern name have_banner=0
   pattern="key:'default\\.configured\\.audio\\.sink'.*value:'\\{[[:space:]]*\"name\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9_.:+-]+)\"[[:space:]]*\\}'"
   output=$(bounded_user_pw_metadata "$user" "$seconds" \
     -n default 0 default.configured.audio.sink 2>/dev/null) || return 1
   while IFS= read -r line; do
-    [[ $line =~ $pattern ]] || continue
-    name=${BASH_REMATCH[1]}
-    valid_pipewire_name "$name" || return 1
-    printf '%s\n' "$name"
-    return 0
+    if [[ $line =~ $pattern ]]; then
+      name=${BASH_REMATCH[1]}
+      valid_pipewire_name "$name" || return 1
+      printf '%s\n' "$name"
+      return 0
+    fi
+    [[ -z $line ]] && continue
+    if [[ $line =~ ^Found[[:space:]]\"default\"[[:space:]]metadata[[:space:]][0-9]+$ ]]; then
+      (( have_banner == 0 )) || return 1
+      have_banner=1
+      continue
+    fi
+    return 1
   done <<< "$output"
-  [[ -z $output ]] && return 2
-  return 1
+  return 2
 }
 
 stream_target_serial() {
@@ -1880,6 +1887,21 @@ normalize_stream_routing_ownership() {
     unset "ROUTING_STREAM_TARGETS[$serial]"
     unset "ROUTING_PENDING_STREAM_TARGETS[$serial]"
   fi
+}
+
+normalize_routing_speaker_provenance() {
+  local mac=$1 sink_name=$2 sink_serial=$3 target
+  [[ -z $ROUTING_DEFAULT_NAME || $ROUTING_DEFAULT_NAME == "$sink_name" ]] || return 1
+  [[ -z $ROUTING_PENDING_DEFAULT_NAME ||
+     $ROUTING_PENDING_DEFAULT_NAME == "$sink_name" ]] || return 1
+  for target in "${ROUTING_STREAM_TARGETS[@]}"; do
+    [[ $target == "$sink_serial" ]] || return 1
+  done
+  for target in "${ROUTING_PENDING_STREAM_TARGETS[@]}"; do
+    [[ $target == "$sink_serial" ]] || return 1
+  done
+  ROUTING_STATE_SPEAKERS=()
+  ROUTING_STATE_SPEAKERS[$mac]=1
 }
 
 routing_default_is_owned() {
@@ -1935,6 +1957,7 @@ end_routing_cleanup() {
 
 apply_owned_stream_target() {
   local user=$1 id=$2 serial=$3 target=$4 deadline=$5 remaining result=0
+  local previous_critical=$ROUTING_MUTATION_CRITICAL
   ROUTING_MUTATION_CRITICAL=1
   ROUTING_PENDING_STREAM_TARGETS[$serial]=$target
   if ! write_routing_state; then
@@ -1967,7 +1990,7 @@ apply_owned_stream_target() {
     unset "ROUTING_PENDING_STREAM_TARGETS[$serial]"
     write_routing_state || result=1
   fi
-  ROUTING_MUTATION_CRITICAL=0
+  ROUTING_MUTATION_CRITICAL=$previous_critical
   return "$result"
 }
 
@@ -2254,18 +2277,19 @@ clear_owned_routing_impl() {
 }
 
 clear_owned_routing() {
-  local result=0 signal_status=0
+  local result=0 signal_status=0 previous_critical=$ROUTING_MUTATION_CRITICAL
   begin_routing_cleanup
   clear_owned_routing_impl "$@" || result=$?
   end_routing_cleanup || signal_status=$?
+  ROUTING_MUTATION_CRITICAL=$previous_critical
   (( signal_status == 0 )) || return "$signal_status"
   return "$result"
 }
 
-reconcile_speaker_routing() {
+reconcile_speaker_routing_impl() {
   local mac=$1 deadline started remaining sink current current_instance result streams id serial extra target
   local mac_key=${mac//:/_}
-  local routing_failed=0 mutation_result=0 count index offset start=0
+  local routing_failed=0 mutation_result=0 mutation_was_critical=0 count index offset start=0
   local -A seen_streams=() pending_streams=()
   local -a playback_ids=() playback_serials=()
   started=$(routing_now_seconds) || return 1
@@ -2314,6 +2338,7 @@ reconcile_speaker_routing() {
   if [[ $current != "$sink_name" ]]; then
     # From the attempted-state write through the final owner write, catchable
     # daemon termination is deferred so pending intent cannot be abandoned.
+    mutation_was_critical=$ROUTING_MUTATION_CRITICAL
     ROUTING_MUTATION_CRITICAL=1
     ROUTING_PENDING_DEFAULT_NAME=$sink_name
     if ! write_routing_state; then
@@ -2346,7 +2371,7 @@ reconcile_speaker_routing() {
       ROUTING_PENDING_DEFAULT_NAME=
       write_routing_state || mutation_result=1
     fi
-    ROUTING_MUTATION_CRITICAL=0
+    ROUTING_MUTATION_CRITICAL=$mutation_was_critical
     (( DAEMON_STOP_REQUESTED == 0 )) || return 1
     case $mutation_result in
       0)
@@ -2361,6 +2386,8 @@ reconcile_speaker_routing() {
     esac
   fi
 
+  normalize_routing_speaker_provenance "$mac" "$sink_name" "$sink_serial" || true
+  write_routing_state || return 1
   remaining=$(routing_seconds_until_deadline "$deadline") || return 1
   streams=$(enumerate_playback_streams "$CFG_AUDIO_USER" "$remaining") || return 1
   if [[ -n $streams ||
@@ -2406,6 +2433,8 @@ reconcile_speaker_routing() {
             $PIPEWIRE_NODE_SERIAL != "$serial" ]]; then
         unset "ROUTING_STREAM_TARGETS[$serial]"
         unset "ROUTING_PENDING_STREAM_TARGETS[$serial]"
+        normalize_routing_speaker_provenance "$mac" "$sink_name" "$sink_serial" || true
+        write_routing_state || return 1
         continue
       fi
       if [[ $PIPEWIRE_NODE_DRIVER != "$sink" ]]; then
@@ -2418,6 +2447,8 @@ reconcile_speaker_routing() {
         fi
         (( result == 0 || result == 2 )) || return 1
         normalize_stream_routing_ownership "$serial" "$target" "$result"
+        normalize_routing_speaker_provenance "$mac" "$sink_name" "$sink_serial" || true
+        write_routing_state || return 1
         if [[ $target != "$sink_serial" ]]; then
           if apply_owned_stream_target "$CFG_AUDIO_USER" "$id" "$serial" \
             "$sink_serial" "$deadline"; then
@@ -2439,10 +2470,14 @@ reconcile_speaker_routing() {
         remaining=$(routing_seconds_until_deadline "$deadline") || return 1
         if target=$(stream_target_serial "$CFG_AUDIO_USER" "$id" "$remaining"); then
           normalize_stream_routing_ownership "$serial" "$target" 0
+          normalize_routing_speaker_provenance "$mac" "$sink_name" "$sink_serial" || true
+          write_routing_state || return 1
         else
           result=$?
           if (( result == 2 )); then
             normalize_stream_routing_ownership "$serial" '' 2
+            normalize_routing_speaker_provenance "$mac" "$sink_name" "$sink_serial" || true
+            write_routing_state || return 1
           fi
         fi
       fi
@@ -2455,11 +2490,8 @@ reconcile_speaker_routing() {
     [[ ${seen_streams[$serial]+present} ]] || \
       unset "ROUTING_PENDING_STREAM_TARGETS[$serial]"
   done
-  if (( routing_failed == 0 )); then
-    # Ownership has moved even if a client has not relinked to its new target.
-    ROUTING_STATE_SPEAKERS=()
-    ROUTING_STATE_SPEAKERS[$mac]=1
-  fi
+  # Ownership may have moved even if a client has not relinked to its target.
+  normalize_routing_speaker_provenance "$mac" "$sink_name" "$sink_serial" || true
   write_routing_state || return 1
 
   # Apply every stream target before waiting for clients to relink. Verify the
@@ -2493,6 +2525,17 @@ reconcile_speaker_routing() {
     routing_failed=1
   fi
   (( routing_failed == 0 ))
+}
+
+reconcile_speaker_routing() {
+  local result=0 previous_critical=$ROUTING_MUTATION_CRITICAL
+  # The pass has one three-second deadline, so delaying daemon termination
+  # across it keeps every in-memory ownership change paired with a checkpoint.
+  ROUTING_MUTATION_CRITICAL=1
+  reconcile_speaker_routing_impl "$@" || result=$?
+  ROUTING_MUTATION_CRITICAL=$previous_critical
+  (( DAEMON_STOP_REQUESTED == 0 )) || return 1
+  return "$result"
 }
 
 find_a2dp_device_id() {
@@ -3500,7 +3543,7 @@ daemon_action() {
   require_root
   prepare_media_state_directory || die "Could not prepare the media-control runtime directory."
   DAEMON_STOP_REQUESTED=0
-  trap daemon_signal TERM INT
+  trap daemon_signal HUP TERM INT
   while true; do
     if ! acquire_lock 1; then
       sleep 1
