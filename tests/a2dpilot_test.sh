@@ -1885,6 +1885,10 @@ test_pairing_provenance_and_existing_bond() {
   systemctl() { :; }
   bluetoothctl() {
     local input=''
+    if [[ ${1:-} == show ]]; then
+      printf '\tPairable: no\n'
+      return 0
+    fi
     if [[ $* == *'--agent '* ]]; then
       while IFS= read -r input; do
         printf '%s\n' "$input" >> "$TEST_SCRATCH/bluetooth.log"
@@ -1921,10 +1925,11 @@ test_pairing_provenance_and_existing_bond() {
 }
 
 test_pairing_session_terminates_after_bonding() {
-  local mac=AA:BB:CC:DD:EE:FF controller=12:34:56:78:9A:BC
+  local mac=AA:BB:CC:DD:EE:FF controller=12:34:56:78:9A:BC pair_failure=0
   setup_scratch_dir
   load_app
   configure_scratch_paths
+  printf 'no\n' > "$TEST_SCRATCH/pairable-state"
   has_tty() { return 1; }
   kill() {
     [[ ${1:-} =~ ^[0-9]+$ ]] && printf '%s\n' "$1" >> "$TEST_SCRATCH/terminated-pair-sessions"
@@ -1932,29 +1937,61 @@ test_pairing_session_terminates_after_bonding() {
   }
   bluetoothctl() {
     local command
-    printf 'args: %s\n' "$*" >> "$TEST_SCRATCH/pair-sessions"
+    if [[ ${1:-} == show ]]; then
+      printf '\tPairable: %s\n' "$(< "$TEST_SCRATCH/pairable-state")"
+      return 0
+    fi
+    if [[ $* == *'--agent '* ]]; then
+      printf 'args: %s\n' "$*" >> "$TEST_SCRATCH/pair-sessions"
+    else
+      printf 'args: %s\n' "$*" >> "$TEST_SCRATCH/pairable-restores"
+    fi
     while IFS= read -r command; do
-      printf '%s\n' "$command" >> "$TEST_SCRATCH/pair-sessions"
-      [[ $command != "pair $mac" ]] || printf 'Pairing successful\n'
+      if [[ $* == *'--agent '* ]]; then
+        printf '%s\n' "$command" >> "$TEST_SCRATCH/pair-sessions"
+      else
+        printf '%s\n' "$command" >> "$TEST_SCRATCH/pairable-restores"
+      fi
+      case $command in
+        'pairable on') printf 'yes\n' > "$TEST_SCRATCH/pairable-state" ;;
+        'pairable off') printf 'no\n' > "$TEST_SCRATCH/pairable-state" ;;
+        "pair $mac")
+          if (( pair_failure )); then
+            printf 'Failed to pair: org.bluez.Error.AuthenticationFailed\n'
+          else
+            printf 'Pairing successful\n'
+          fi
+          ;;
+      esac
     done
   }
 
   CFG_CONTROLLER=auto
   pair_on_controller "$mac" NoInputNoOutput >/dev/null
+  assert_eq no "$(< "$TEST_SCRATCH/pairable-state")"
   printf '%s\n' session-end >> "$TEST_SCRATCH/pair-sessions"
+  printf 'yes\n' > "$TEST_SCRATCH/pairable-state"
   CFG_CONTROLLER=$controller
   pair_on_controller "$mac" NoInputNoOutput >/dev/null
+  assert_eq yes "$(< "$TEST_SCRATCH/pairable-state")"
+  printf 'no\n' > "$TEST_SCRATCH/pairable-state"
+  pair_failure=1
+  if pair_on_controller "$mac" NoInputNoOutput >/dev/null; then
+    fail 'fault-injected pairing failure reported success'
+  fi
+  assert_eq no "$(< "$TEST_SCRATCH/pairable-state")"
 
-  assert_eq 2 "$(grep -Fc 'args: --agent NoInputNoOutput' "$TEST_SCRATCH/pair-sessions")"
-  assert_eq 2 "$(grep -Fc 'pairable on' "$TEST_SCRATCH/pair-sessions")"
-  assert_eq 2 "$(grep -Fc "pair $mac" "$TEST_SCRATCH/pair-sessions")"
+  assert_eq 3 "$(grep -Fc 'args: --agent NoInputNoOutput' "$TEST_SCRATCH/pair-sessions")"
+  assert_eq 3 "$(grep -Fc 'pairable on' "$TEST_SCRATCH/pair-sessions")"
+  assert_eq 3 "$(grep -Fc "pair $mac" "$TEST_SCRATCH/pair-sessions")"
   assert_file_not_contains "$TEST_SCRATCH/pair-sessions" 'quit'
-  assert_eq 2 "$(wc -l < "$TEST_SCRATCH/terminated-pair-sessions")"
-  assert_eq 1 "$(grep -Fc "select $controller" "$TEST_SCRATCH/pair-sessions")"
+  assert_eq 3 "$(wc -l < "$TEST_SCRATCH/terminated-pair-sessions")"
+  assert_eq 2 "$(grep -Fc 'pairable off' "$TEST_SCRATCH/pairable-restores")"
+  assert_eq 1 "$(grep -Fc 'pairable on' "$TEST_SCRATCH/pairable-restores")"
+  assert_eq 3 "$(grep -Fc 'quit' "$TEST_SCRATCH/pairable-restores")"
+  assert_eq 2 "$(grep -Fc "select $controller" "$TEST_SCRATCH/pair-sessions")"
   assert_eq $'args: --agent NoInputNoOutput\npairable on\npair AA:BB:CC:DD:EE:FF' \
     "$(sed -n '1,/session-end/{ /session-end/d; p; }' "$TEST_SCRATCH/pair-sessions")"
-  assert_eq $'args: --agent NoInputNoOutput\nselect 12:34:56:78:9A:BC\npairable on\npair AA:BB:CC:DD:EE:FF' \
-    "$(sed -n '/session-end/,$ { /session-end/d; p; }' "$TEST_SCRATCH/pair-sessions")"
 }
 
 test_pair_all_attempts_every_configured_speaker() {
@@ -2708,6 +2745,10 @@ test_explicit_controller_scopes_device_operations() {
       printf 'Controller %s Selected Adapter [default]\n' "$controller"
       return 0
     fi
+    if [[ ${1:-} == show ]]; then
+      printf '\tPairable: no\n'
+      return 0
+    fi
     if [[ $* == *'--agent '* ]]; then
       while IFS= read -r line; do
         printf '%s\n' "$line" >> "$TEST_SCRATCH/controller-sessions"
@@ -2746,7 +2787,7 @@ test_explicit_controller_scopes_device_operations() {
   devices=$(configured_bluetooth_devices)
   assert_contains "$devices" "$mac"
   pair_on_controller "$mac" NoInputNoOutput >/dev/null
-  assert_eq 4 "$(grep -Fc "select $controller" "$TEST_SCRATCH/controller-sessions")"
+  assert_eq 5 "$(grep -Fc "select $controller" "$TEST_SCRATCH/controller-sessions")"
   assert_file_contains "$TEST_SCRATCH/controller-sessions" "info $mac"
   assert_file_contains "$TEST_SCRATCH/controller-sessions" "trust $mac"
   assert_file_contains "$TEST_SCRATCH/controller-sessions" "pair $mac"

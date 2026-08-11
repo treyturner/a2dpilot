@@ -1511,6 +1511,32 @@ controller_power_state() {
   esac
 }
 
+controller_pairable_state() {
+  local controller=$1 state
+  if [[ $controller == auto ]]; then
+    state=$(bluetoothctl show 2>/dev/null | awk '/^[[:space:]]*Pairable:/ { print $2; exit }')
+  else
+    state=$(bluetoothctl show "$controller" 2>/dev/null | \
+      awk '/^[[:space:]]*Pairable:/ { print $2; exit }')
+  fi
+  case $state in
+    yes|no) printf '%s\n' "$state" ;;
+    *) return 1 ;;
+  esac
+}
+
+restore_controller_pairable_state() {
+  local controller=$1 original=$2 command restored
+  case $original in
+    yes) command='pairable on' ;;
+    no) command='pairable off' ;;
+    *) return 1 ;;
+  esac
+  controller_batch "$controller" 5 "$command" >/dev/null 2>&1 || return 1
+  restored=$(controller_pairable_state "$controller" 2>/dev/null || true)
+  [[ $restored == "$original" ]]
+}
+
 power_controller() {
   hard_blocked && {
     warn "Bluetooth is hard-blocked and cannot be enabled in software."
@@ -2024,7 +2050,11 @@ pair_on_controller() {
   local mac=$1 agent=$2
   local pair_pid coproc_input_fd coproc_output_fd input_fd output_fd
   local tty_output='' forward_pid='' char output_buffer=''
-  local result=1 completed=0 interactive=0
+  local result=1 completed=0 interactive=0 original_pairable
+  original_pairable=$(controller_pairable_state "$CFG_CONTROLLER") || {
+    warn "Could not determine the controller's pairable state; refusing to change it."
+    return 1
+  }
   has_tty && interactive=1
   coproc A2DPILOT_PAIR_SESSION {
     run_bounded_bluetoothctl 60 --agent "$agent" 2>&1
@@ -2088,6 +2118,8 @@ pair_on_controller() {
   [[ -z $output_fd ]] || exec {output_fd}<&-
   (( interactive == 0 )) || exec {tty_output}>&-
   wait "$pair_pid" 2>/dev/null || true
+  restore_controller_pairable_state "$CFG_CONTROLLER" "$original_pairable" || \
+    warn "Could not restore the controller's pairable state."
   return "$result"
 }
 
