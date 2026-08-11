@@ -2404,6 +2404,10 @@ test_pipewire_routing_parsers() {
   if valid_pipewire_instance_id '01234567-89ab-cdef-0123-456789abcdef:4321'; then
     fail 'incomplete PipeWire instance identity was accepted'
   fi
+  ROUTING_MONOTONIC_CLOCK=$TEST_SCRATCH/uptime
+  printf '123.45 67.89\n' > "$ROUTING_MONOTONIC_CLOCK"
+  assert_eq 123 "$(routing_now_seconds)"
+  assert_eq "$ROUTING_TIMEOUT" "$(routing_seconds_until_deadline 999)"
 
   bounded_user_pw_cli() { mock_pipewire_nodes_for_routing; }
   output=$(enumerate_playback_streams audio 3)
@@ -2626,6 +2630,79 @@ test_routing_write_failure_prevents_mutation() {
     fail 'failed routing-state write retained its temporary file'
 }
 
+test_routing_cleanup_checkpoints_deadline_progress() {
+  local user clock=100 deleted_id deleted_serial remaining_serial
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  routing_now_seconds() { printf '%s\n' "$clock"; }
+  pipewire_instance_id() { printf '01234567-89ab-cdef-0123-456789abcdef:4321:987654\n'; }
+  enumerate_playback_streams() { printf '%s\n' '95 138' '96 139'; }
+  inspect_pipewire_node() {
+    PIPEWIRE_NODE_SERIAL=$([[ $2 == 95 ]] && printf 138 || printf 139)
+    PIPEWIRE_NODE_NAME='Long-lived Player'
+    PIPEWIRE_NODE_CLASS=Stream/Output/Audio
+    PIPEWIRE_NODE_DRIVER=83
+  }
+  stream_target_serial() { printf '89\n'; }
+  bounded_user_pw_metadata() {
+    deleted_id=$6
+    printf '%s\n' "$deleted_id" > "$TEST_SCRATCH/deleted-stream-id"
+    clock=$((clock + ROUTING_TIMEOUT))
+  }
+  ROUTING_STATE_USER=$user
+  ROUTING_PIPEWIRE_INSTANCE=01234567-89ab-cdef-0123-456789abcdef:4321:987654
+  ROUTING_STREAM_TARGETS=([138]=89 [139]=89)
+  write_routing_state
+
+  if clear_owned_routing "$user"; then
+    fail 'deadline-exhausted routing cleanup reported success'
+  fi
+  deleted_id=$(< "$TEST_SCRATCH/deleted-stream-id")
+  if [[ $deleted_id == 95 ]]; then
+    deleted_serial=138
+    remaining_serial=139
+  else
+    deleted_serial=139
+    remaining_serial=138
+  fi
+  assert_file_not_contains "$ROUTING_STATE_FILE" $'stream\t'"$deleted_serial"$'\t89'
+  assert_file_contains "$ROUTING_STATE_FILE" $'stream\t'"$remaining_serial"$'\t89'
+}
+
+test_recycled_sink_is_not_defaulted() {
+  local user mac=AA:BB:CC:DD:EE:FF inspections=0
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  CFG_AUDIO_USER=$user
+  find_a2dp_node_id() { printf '83\n'; }
+  configured_default_sink() { printf 'alsa_output.builtin\n'; }
+  inspect_pipewire_node() {
+    inspections=$((inspections + 1))
+    PIPEWIRE_NODE_CLASS=Audio/Sink
+    PIPEWIRE_NODE_DRIVER=
+    if (( inspections == 1 )); then
+      PIPEWIRE_NODE_SERIAL=89
+      PIPEWIRE_NODE_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
+    else
+      PIPEWIRE_NODE_SERIAL=90
+      PIPEWIRE_NODE_NAME=bluez_output.11_22_33_44_55_66.1
+    fi
+  }
+  bounded_user_wpctl() { : > "$TEST_SCRATCH/recycled-sink-defaulted"; }
+
+  if reconcile_speaker_routing "$mac"; then
+    fail 'recycled sink identity reported routing success'
+  fi
+  [[ ! -e $TEST_SCRATCH/recycled-sink-defaulted ]] || \
+    fail 'a recycled PipeWire sink ID became the configured default'
+  [[ ! -e $ROUTING_STATE_FILE ]] || \
+    fail 'recycled sink retained pending routing ownership'
+}
+
 test_interrupted_routing_transition_preserves_prior_owner() {
   local user mac=AA:BB:CC:DD:EE:FF sink_name=bluez_output.AA_BB_CC_DD_EE_FF.1
   local default_sink=bluez_output.OLD_SPEAKER.1 stream_target=77 stream_driver=35
@@ -2717,6 +2794,7 @@ test_routing_rotates_after_deadline() {
   user=$(id -un)
   CFG_AUDIO_USER=$user
   now_seconds() { printf '%s\n' "$clock"; }
+  routing_now_seconds() { printf '%s\n' "$clock"; }
   find_a2dp_node_id() { printf '83\n'; }
   configured_default_sink() { printf 'bluez_output.AA_BB_CC_DD_EE_FF.1\n'; }
   pipewire_instance_id() { printf '01234567-89ab-cdef-0123-456789abcdef:4321:987654\n'; }
@@ -2838,6 +2916,7 @@ test_unmovable_stream_does_not_starve_routing() {
   user=$(id -un)
   CFG_AUDIO_USER=$user
   now_seconds() { printf '%s\n' "$clock"; }
+  routing_now_seconds() { printf '%s\n' "$clock"; }
   sleep() { clock=$((clock + 1)); }
   pipewire_instance_id() { printf '01234567-89ab-cdef-0123-456789abcdef:4321:987654\n'; }
   find_a2dp_node_id() { printf '83\n'; }
@@ -3955,6 +4034,9 @@ run_test 'PipeWire codec property parsing' test_codec_property_parsing
 run_test 'PipeWire routing parsers' test_pipewire_routing_parsers
 run_test 'default routing and owned cleanup' test_default_routing_and_owned_cleanup
 run_test 'routing write failure prevents mutation' test_routing_write_failure_prevents_mutation
+run_test 'routing cleanup checkpoints deadline progress' \
+  test_routing_cleanup_checkpoints_deadline_progress
+run_test 'recycled sink is not defaulted' test_recycled_sink_is_not_defaulted
 run_test 'interrupted routing transition preserves prior owner' \
   test_interrupted_routing_transition_preserves_prior_owner
 run_test 'routing rotates after a shared deadline' test_routing_rotates_after_deadline

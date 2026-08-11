@@ -43,6 +43,7 @@ VOLUME_STEP=5
 MEDIA_ACTION_TIMEOUT=2
 MEDIA_CONNECT_TIMEOUT=1
 MEDIA_MONOTONIC_CLOCK=/proc/uptime
+ROUTING_MONOTONIC_CLOCK=/proc/uptime
 KERNEL_BOOT_ID_FILE=/proc/sys/kernel/random/boot_id
 PROC_ROOT=/proc
 UPDATE_BASE_URL=https://raw.githubusercontent.com/treyturner/a2dpilot
@@ -1881,7 +1882,7 @@ apply_owned_stream_target() {
   ROUTING_PENDING_STREAM_TARGETS[$serial]=$target
   if ! write_routing_state; then
     result=1
-  elif ! remaining=$(seconds_until_deadline "$deadline"); then
+  elif ! remaining=$(routing_seconds_until_deadline "$deadline"); then
     unset "ROUTING_PENDING_STREAM_TARGETS[$serial]"
     write_routing_state || true
     result=1
@@ -1895,7 +1896,7 @@ apply_owned_stream_target() {
     unset "ROUTING_PENDING_STREAM_TARGETS[$serial]"
     write_routing_state || result=1
     (( result != 0 )) || result=3
-  elif ! remaining=$(seconds_until_deadline "$deadline"); then
+  elif ! remaining=$(routing_seconds_until_deadline "$deadline"); then
     unset "ROUTING_PENDING_STREAM_TARGETS[$serial]"
     write_routing_state || true
     result=1
@@ -2022,22 +2023,32 @@ write_routing_state() {
   }
 }
 
+routing_cleanup_seconds_until_deadline() {
+  local deadline=$1
+  if ! routing_seconds_until_deadline "$deadline"; then
+    # Persist removals completed earlier in this cleanup pass before yielding.
+    write_routing_state || true
+    return 1
+  fi
+}
+
 clear_owned_routing() {
-  local user=$1 deadline remaining current current_instance result streams id serial extra
+  local user=$1 deadline started remaining current current_instance result streams id serial extra
   local owned pending failed=0
   local -A stream_ids=() owned_streams=()
   load_routing_state || return 1
   [[ -n $ROUTING_STATE_USER ]] || return 0
   [[ $ROUTING_STATE_USER == "$user" ]] || return 1
-  deadline=$(( $(now_seconds) + ROUTING_TIMEOUT ))
+  started=$(routing_now_seconds) || return 1
+  deadline=$((started + ROUTING_TIMEOUT))
 
   if [[ -n $ROUTING_DEFAULT_NAME || -n $ROUTING_PENDING_DEFAULT_NAME ]]; then
-    remaining=$(seconds_until_deadline "$deadline") || return 1
+    remaining=$(routing_cleanup_seconds_until_deadline "$deadline") || return 1
     if current=$(configured_default_sink "$user" "$remaining"); then
       if [[ ( -n $ROUTING_DEFAULT_NAME && $current == "$ROUTING_DEFAULT_NAME" ) ||
             ( -n $ROUTING_PENDING_DEFAULT_NAME &&
               $current == "$ROUTING_PENDING_DEFAULT_NAME" ) ]]; then
-        remaining=$(seconds_until_deadline "$deadline") || return 1
+        remaining=$(routing_cleanup_seconds_until_deadline "$deadline") || return 1
         if bounded_user_wpctl "$user" "$remaining" clear-default 0 >/dev/null 2>&1; then
           ROUTING_DEFAULT_NAME=
           ROUTING_PENDING_DEFAULT_NAME=
@@ -2060,18 +2071,27 @@ clear_owned_routing() {
   fi
 
   if (( ${#ROUTING_STREAM_TARGETS[@]} + ${#ROUTING_PENDING_STREAM_TARGETS[@]} > 0 )); then
-    remaining=$(seconds_until_deadline "$deadline") || return 1
-    current_instance=$(pipewire_instance_id "$user" "$remaining") || return 1
+    remaining=$(routing_cleanup_seconds_until_deadline "$deadline") || return 1
+    current_instance=$(pipewire_instance_id "$user" "$remaining") || {
+      write_routing_state || true
+      return 1
+    }
     if [[ $current_instance != "$ROUTING_PIPEWIRE_INSTANCE" ]]; then
       ROUTING_STREAM_TARGETS=()
       ROUTING_PENDING_STREAM_TARGETS=()
       ROUTING_PIPEWIRE_INSTANCE=
     else
-      remaining=$(seconds_until_deadline "$deadline") || return 1
-      streams=$(enumerate_playback_streams "$user" "$remaining") || return 1
+      remaining=$(routing_cleanup_seconds_until_deadline "$deadline") || return 1
+      streams=$(enumerate_playback_streams "$user" "$remaining") || {
+        write_routing_state || true
+        return 1
+      }
       if [[ -n $streams ]]; then
         while read -r id serial extra; do
-          [[ -z $extra && $id =~ ^[0-9]+$ && $serial =~ ^[0-9]+$ ]] || return 1
+          [[ -z $extra && $id =~ ^[0-9]+$ && $serial =~ ^[0-9]+$ ]] || {
+            write_routing_state || true
+            return 1
+          }
           stream_ids[$serial]=$id
         done <<< "$streams"
       fi
@@ -2084,7 +2104,7 @@ clear_owned_routing() {
           unset "ROUTING_PENDING_STREAM_TARGETS[$serial]"
           continue
         fi
-        remaining=$(seconds_until_deadline "$deadline") || return 1
+        remaining=$(routing_cleanup_seconds_until_deadline "$deadline") || return 1
         if ! inspect_pipewire_node "$user" "$id" "$remaining"; then
           failed=1
           continue
@@ -2097,11 +2117,11 @@ clear_owned_routing() {
         fi
         owned=${ROUTING_STREAM_TARGETS[$serial]:-}
         pending=${ROUTING_PENDING_STREAM_TARGETS[$serial]:-}
-        remaining=$(seconds_until_deadline "$deadline") || return 1
+        remaining=$(routing_cleanup_seconds_until_deadline "$deadline") || return 1
         if current=$(stream_target_serial "$user" "$id" "$remaining"); then
           if [[ ( -n $owned && $current == "$owned" ) ||
                 ( -n $pending && $current == "$pending" ) ]]; then
-            remaining=$(seconds_until_deadline "$deadline") || return 1
+            remaining=$(routing_cleanup_seconds_until_deadline "$deadline") || return 1
             if bounded_user_pw_metadata "$user" "$remaining" \
               -d -n default "$id" target.object >/dev/null 2>&1; then
               unset "ROUTING_STREAM_TARGETS[$serial]"
@@ -2130,11 +2150,13 @@ clear_owned_routing() {
 }
 
 reconcile_speaker_routing() {
-  local mac=$1 deadline remaining sink current current_instance result streams id serial extra target
+  local mac=$1 deadline started remaining sink current current_instance result streams id serial extra target
+  local mac_key=${mac//:/_}
   local routing_failed=0 mutation_result=0 count index offset start=0
   local -A seen_streams=() pending_streams=()
   local -a playback_ids=() playback_serials=()
-  deadline=$(( $(now_seconds) + ROUTING_TIMEOUT ))
+  started=$(routing_now_seconds) || return 1
+  deadline=$((started + ROUTING_TIMEOUT))
   load_routing_state || return 1
   if [[ -n $ROUTING_STATE_USER && $ROUTING_STATE_USER != "$CFG_AUDIO_USER" ]]; then
     clear_owned_routing "$ROUTING_STATE_USER" || return 1
@@ -2142,16 +2164,17 @@ reconcile_speaker_routing() {
   fi
   ROUTING_STATE_USER=$CFG_AUDIO_USER
 
-  remaining=$(seconds_until_deadline "$deadline") || return 1
+  remaining=$(routing_seconds_until_deadline "$deadline") || return 1
   sink=$(find_a2dp_node_id "$mac" "$remaining") || return 1
   [[ $sink =~ ^[0-9]+$ ]] || return 1
-  remaining=$(seconds_until_deadline "$deadline") || return 1
+  remaining=$(routing_seconds_until_deadline "$deadline") || return 1
   inspect_pipewire_node "$CFG_AUDIO_USER" "$sink" "$remaining" || return 1
-  [[ $PIPEWIRE_NODE_CLASS == Audio/Sink && $PIPEWIRE_NODE_NAME == bluez_output.* ]] || return 1
+  [[ $PIPEWIRE_NODE_CLASS == Audio/Sink &&
+     $PIPEWIRE_NODE_NAME == "bluez_output.${mac_key}."* ]] || return 1
   valid_pipewire_name "$PIPEWIRE_NODE_NAME" || return 1
   local sink_serial=$PIPEWIRE_NODE_SERIAL sink_name=$PIPEWIRE_NODE_NAME
 
-  remaining=$(seconds_until_deadline "$deadline") || return 1
+  remaining=$(routing_seconds_until_deadline "$deadline") || return 1
   if current=$(configured_default_sink "$CFG_AUDIO_USER" "$remaining"); then
     result=0
   else
@@ -2181,7 +2204,21 @@ reconcile_speaker_routing() {
     ROUTING_PENDING_DEFAULT_NAME=$sink_name
     if ! write_routing_state; then
       mutation_result=1
-    elif ! remaining=$(seconds_until_deadline "$deadline"); then
+    elif ! remaining=$(routing_seconds_until_deadline "$deadline"); then
+      ROUTING_PENDING_DEFAULT_NAME=
+      write_routing_state || true
+      mutation_result=1
+    elif ! inspect_pipewire_node "$CFG_AUDIO_USER" "$sink" "$remaining"; then
+      ROUTING_PENDING_DEFAULT_NAME=
+      write_routing_state || true
+      mutation_result=1
+    elif [[ $PIPEWIRE_NODE_CLASS != Audio/Sink ||
+            $PIPEWIRE_NODE_SERIAL != "$sink_serial" ||
+            $PIPEWIRE_NODE_NAME != "$sink_name" ]]; then
+      ROUTING_PENDING_DEFAULT_NAME=
+      write_routing_state || true
+      mutation_result=1
+    elif ! remaining=$(routing_seconds_until_deadline "$deadline"); then
       ROUTING_PENDING_DEFAULT_NAME=
       write_routing_state || true
       mutation_result=1
@@ -2199,7 +2236,7 @@ reconcile_speaker_routing() {
     (( mutation_result == 0 )) || return 1
     (( DAEMON_STOP_REQUESTED == 0 )) || return 1
     while true; do
-      remaining=$(seconds_until_deadline "$deadline") || {
+      remaining=$(routing_seconds_until_deadline "$deadline") || {
         write_routing_state || true
         return 1
       }
@@ -2211,12 +2248,12 @@ reconcile_speaker_routing() {
     done
   fi
 
-  remaining=$(seconds_until_deadline "$deadline") || return 1
+  remaining=$(routing_seconds_until_deadline "$deadline") || return 1
   streams=$(enumerate_playback_streams "$CFG_AUDIO_USER" "$remaining") || return 1
   if [[ -n $streams ||
         ${#ROUTING_STREAM_TARGETS[@]} -gt 0 ||
         ${#ROUTING_PENDING_STREAM_TARGETS[@]} -gt 0 ]]; then
-    remaining=$(seconds_until_deadline "$deadline") || return 1
+    remaining=$(routing_seconds_until_deadline "$deadline") || return 1
     current_instance=$(pipewire_instance_id "$CFG_AUDIO_USER" "$remaining") || return 1
     if [[ -n $ROUTING_PIPEWIRE_INSTANCE &&
           $ROUTING_PIPEWIRE_INSTANCE != "$current_instance" ]]; then
@@ -2244,7 +2281,7 @@ reconcile_speaker_routing() {
       index=$(((start + offset) % count))
       id=${playback_ids[$index]}
       serial=${playback_serials[$index]}
-      remaining=$(seconds_until_deadline "$deadline") || return 1
+      remaining=$(routing_seconds_until_deadline "$deadline") || return 1
       # Advance only once this stream has budget to be attempted. If the
       # attempt consumes the deadline, the next cycle starts with its successor.
       ROUTING_STREAM_CURSOR=$serial
@@ -2259,7 +2296,7 @@ reconcile_speaker_routing() {
         continue
       fi
       if [[ $PIPEWIRE_NODE_DRIVER != "$sink" ]]; then
-        remaining=$(seconds_until_deadline "$deadline") || return 1
+        remaining=$(routing_seconds_until_deadline "$deadline") || return 1
         if target=$(stream_target_serial "$CFG_AUDIO_USER" "$id" "$remaining"); then
           result=0
         else
@@ -2286,7 +2323,7 @@ reconcile_speaker_routing() {
         pending_streams[$serial]=$id
       elif [[ -n ${ROUTING_STREAM_TARGETS[$serial]:-} ||
               -n ${ROUTING_PENDING_STREAM_TARGETS[$serial]:-} ]]; then
-        remaining=$(seconds_until_deadline "$deadline") || return 1
+        remaining=$(routing_seconds_until_deadline "$deadline") || return 1
         if target=$(stream_target_serial "$CFG_AUDIO_USER" "$id" "$remaining"); then
           normalize_stream_routing_ownership "$serial" "$target" 0
         else
@@ -2313,7 +2350,7 @@ reconcile_speaker_routing() {
   while (( ${#pending_streams[@]} > 0 )); do
     for serial in "${!pending_streams[@]}"; do
       id=${pending_streams[$serial]}
-      remaining=$(seconds_until_deadline "$deadline") || {
+      remaining=$(routing_seconds_until_deadline "$deadline") || {
         routing_failed=1
         pending_streams=()
         break
@@ -2328,7 +2365,7 @@ reconcile_speaker_routing() {
       fi
     done
     (( ${#pending_streams[@]} > 0 )) || break
-    seconds_until_deadline "$deadline" >/dev/null || {
+    routing_seconds_until_deadline "$deadline" >/dev/null || {
       routing_failed=1
       break
     }
@@ -3028,6 +3065,26 @@ forget_action() {
 }
 
 now_seconds() { date +%s; }
+
+routing_now_seconds() {
+  local seconds fraction idle_seconds idle_fraction extra
+  [[ -f $ROUTING_MONOTONIC_CLOCK && ! -L $ROUTING_MONOTONIC_CLOCK ]] || return 1
+  IFS=' .' read -r seconds fraction idle_seconds idle_fraction extra \
+    < "$ROUTING_MONOTONIC_CLOCK" || return 1
+  [[ $seconds =~ ^[0-9]+$ && $fraction =~ ^[0-9]+$ &&
+     $idle_seconds =~ ^[0-9]+$ && $idle_fraction =~ ^[0-9]+$ && -z $extra ]] || return 1
+  printf '%s\n' "$seconds"
+}
+
+routing_seconds_until_deadline() {
+  local deadline=$1 now remaining
+  [[ $deadline =~ ^[0-9]+$ ]] || return 1
+  now=$(routing_now_seconds) || return 1
+  (( deadline > now )) || return 1
+  remaining=$((deadline - now))
+  (( remaining <= ROUTING_TIMEOUT )) || remaining=$ROUTING_TIMEOUT
+  printf '%s\n' "$remaining"
+}
 
 seconds_until_deadline() {
   local deadline=$1 now
