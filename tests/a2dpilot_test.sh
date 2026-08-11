@@ -1302,8 +1302,12 @@ test_player_control_resolves_stateful_media_keys() {
     printf '%s\n' 'esac'
   } > "$mock_bin/curl"
   chmod 0755 "$mock_bin/curl"
-  acquire_media_lock() { printf 'acquire %s\n' "${1:-missing}" >> "$TEST_SCRATCH/media-lock.log"; }
+  acquire_media_lock() { printf 'acquire %s\n' "$1" >> "$TEST_SCRATCH/media-lock.log"; }
   release_media_lock() { printf 'release\n' >> "$TEST_SCRATCH/media-lock.log"; }
+  # Keep this mock's argument contract visible to ShellCheck 0.9; the
+  # player-control calls below verify that the real path supplies the budget.
+  acquire_media_lock 0.500000
+  : > "$TEST_SCRATCH/media-lock.log"
 
   (PATH="$mock_bin:$PATH" CURL_LOG="$TEST_SCRATCH/curl.log" TIMELINE_VOLUME=98 \
     player_control_action KEY_VOLUMEUP)
@@ -1383,7 +1387,7 @@ test_mute_state_rejects_symlinked_parent() {
   user=$(id -un)
   write_default_config "$CONFIG_FILE" "$user"
   parse_config "$CONFIG_FILE"
-  acquire_media_lock
+  acquire_media_lock "$MEDIA_ACTION_TIMEOUT"
   [[ -n $MEDIA_LOCK_FD ]] || fail 'media lock did not retain a descriptor'
   assert_eq 600 "$(stat -c %a "$MEDIA_LOCK_FILE")"
   assert_eq "$(id -u "$MEDIA_RUNTIME_USER")" "$(stat -c %u "$MEDIA_STATE_DIR")"
