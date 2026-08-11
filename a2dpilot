@@ -1886,6 +1886,13 @@ routing_default_is_owned() {
        $current == "$ROUTING_PENDING_DEFAULT_NAME" ) ]]
 }
 
+routing_state_mentions_speaker() {
+  local mac_key=${1//:/_} prefix
+  prefix="bluez_output.${mac_key}."
+  [[ $ROUTING_DEFAULT_NAME == "$prefix"* ||
+     $ROUTING_PENDING_DEFAULT_NAME == "$prefix"* ]]
+}
+
 routing_mutation_signal() {
   ROUTING_MUTATION_SIGNAL_STATUS=$1
 }
@@ -3117,9 +3124,8 @@ forget_action() {
     release_lock
     die "Could not safely read the audio-routing state."
   }
-  routing_user=$ROUTING_STATE_USER
-  if [[ -z $routing_user && $active_speaker == "$mac" ]]; then
-    routing_user=$CFG_AUDIO_USER
+  if [[ $active_speaker == "$mac" ]] || routing_state_mentions_speaker "$mac"; then
+    routing_user=${ROUTING_STATE_USER:-$CFG_AUDIO_USER}
   fi
   if [[ -n $routing_user ]]; then
     clear_owned_routing "$routing_user" || {

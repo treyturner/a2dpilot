@@ -2306,6 +2306,33 @@ test_forget_clears_routing_for_prior_speaker() {
   assert_eq "$active" "$(< "$STATE_DIR/active-speaker")"
 }
 
+test_forget_preserves_unrelated_routing() {
+  local user mac=AA:BB:CC:DD:EE:FF active=10:20:30:40:50:60
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  write_test_config "$CONFIG_FILE" "$user" "$mac" "$active"
+  printf '%s\n' "$active" > "$STATE_DIR/active-speaker"
+  : > "$STATE_FILE"
+  ROUTING_STATE_USER=$user
+  ROUTING_DEFAULT_NAME=bluez_output.10_20_30_40_50_60.1
+  write_routing_state
+  require_root() { :; }
+  acquire_lock() { :; }
+  release_lock() { :; }
+  atomic_install_file() { cp "$1" "$2"; }
+  clear_owned_routing() { fail 'forget cleared routing owned by another speaker'; }
+  disconnect_bluetooth_device() { :; }
+  device_info() { return 1; }
+  systemctl() { :; }
+
+  forget_action "$mac" --yes
+  assert_file_contains "$ROUTING_STATE_FILE" \
+    $'default\tbluez_output.10_20_30_40_50_60.1'
+  assert_eq "$active" "$(< "$STATE_DIR/active-speaker")"
+}
+
 test_forget_retains_active_speaker_after_routing_cleanup_failure() {
   local user mac=AA:BB:CC:DD:EE:FF output rc
   setup_scratch_dir
@@ -4277,6 +4304,7 @@ run_test 'interactive scan selection' test_interactive_scan_selection
 run_test 'forget removes config and provenance' test_forget_removes_config_and_provenance
 run_test 'forget clears routing for a prior speaker' \
   test_forget_clears_routing_for_prior_speaker
+run_test 'forget preserves unrelated routing' test_forget_preserves_unrelated_routing
 run_test 'forget retains active speaker after routing cleanup failure' \
   test_forget_retains_active_speaker_after_routing_cleanup_failure
 run_test 'media-control health modes' test_media_control_health_modes
