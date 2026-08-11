@@ -1459,11 +1459,17 @@ test_mute_state_rejects_symlinked_parent() {
 }
 
 test_media_state_rejects_unprivileged_parent_for_root() {
+  local parent_uid
   setup_scratch_dir
   load_app
   configure_scratch_paths
   rm -rf -- "$MEDIA_STATE_DIR"
-  assert_eq "$(id -u)" "$(stat -c %u "$MEDIA_STATE_ROOT")"
+  parent_uid=$(id -u)
+  if (( parent_uid == 0 )); then
+    parent_uid=$(id -u nobody) || fail 'could not resolve an unprivileged fixture user'
+    chown "$parent_uid" "$MEDIA_STATE_ROOT"
+  fi
+  assert_eq "$parent_uid" "$(stat -c %u "$MEDIA_STATE_ROOT")"
   media_effective_uid() { printf '0\n'; }
 
   if prepare_media_state_directory; then
