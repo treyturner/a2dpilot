@@ -1987,7 +1987,7 @@ write_routing_state() {
   if [[ -z $ROUTING_DEFAULT_NAME && -z $ROUTING_PENDING_DEFAULT_NAME &&
         ${#ROUTING_STREAM_TARGETS[@]} -eq 0 &&
         ${#ROUTING_PENDING_STREAM_TARGETS[@]} -eq 0 ]]; then
-    rm -f -- "$ROUTING_STATE_FILE"
+    rm -f -- "$ROUTING_STATE_FILE" || return 1
     return 0
   fi
   if (( ${#ROUTING_STREAM_TARGETS[@]} + ${#ROUTING_PENDING_STREAM_TARGETS[@]} > 0 )); then

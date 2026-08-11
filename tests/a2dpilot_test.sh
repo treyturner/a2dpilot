@@ -2657,6 +2657,18 @@ test_routing_write_failure_prevents_mutation() {
     fail 'routing metadata changed after its provenance write failed'
   [[ -z $(find "$STATE_DIR" -maxdepth 1 -name '.routing-overrides.*' -print -quit) ]] || \
     fail 'failed routing-state write retained its temporary file'
+
+  printf 'user\t%s\ndefault\tbluez_output.AA_BB_CC_DD_EE_FF.1\n' \
+    "$user" > "$ROUTING_STATE_FILE"
+  ROUTING_DEFAULT_NAME=
+  rm() {
+    if [[ ${*: -1} == "$ROUTING_STATE_FILE" ]]; then return 1; fi
+    command rm "$@"
+  }
+  if write_routing_state; then
+    fail 'routing state reported success after its removal failed'
+  fi
+  [[ -e $ROUTING_STATE_FILE ]] || fail 'routing removal-failure fixture disappeared'
 }
 
 test_routing_cleanup_checkpoints_deadline_progress() {
