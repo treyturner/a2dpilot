@@ -1153,9 +1153,9 @@ EOF
 apply_wireplumber_config() {
   local directory temp
   directory=$(dirname "$WIREPLUMBER_CONF")
-  validate_directory_chain "$directory"
-  install -d -m 0755 "$directory"
-  validate_directory_chain "$directory"
+  ( validate_directory_chain "$directory" ) || return 1
+  install -d -m 0755 "$directory" || return 1
+  ( validate_directory_chain "$directory" ) || return 1
   temp=$(mktemp "$directory/.a2dpilot-wireplumber.XXXXXX") || return 1
   if ! write_wireplumber_config "$temp"; then
     rm -f -- "$temp"
@@ -1170,8 +1170,11 @@ apply_wireplumber_config() {
     rm -f -- "$temp"
     return 1
   }
-  validate_directory_chain "$directory"
-  mv -f -- "$temp" "$WIREPLUMBER_CONF" || return 1
+  if ! ( validate_directory_chain "$directory" ) ||
+     ! mv -f -- "$temp" "$WIREPLUMBER_CONF"; then
+    rm -f -- "$temp"
+    return 1
+  fi
   as_user_systemctl "$CFG_AUDIO_USER" restart wireplumber.service
 }
 

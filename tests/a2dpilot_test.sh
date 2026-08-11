@@ -1363,6 +1363,44 @@ test_onboard_audio_application_rolls_back() {
   assert_eq 2 "$(wc -l < "$TEST_SCRATCH/user-systemctl.log")"
 }
 
+test_onboard_audio_path_failure_rolls_back() {
+  local user before output rc parent real_parent
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  write_test_config "$CONFIG_FILE" "$user" AA:BB:CC:DD:EE:FF
+  before=$TEST_SCRATCH/config-before
+  cp "$CONFIG_FILE" "$before"
+  : > "$STATE_FILE"
+  parent=$(dirname "$WIREPLUMBER_CONF")
+  real_parent=$TEST_SCRATCH/wireplumber-real
+  install -d "$parent"
+  parse_config "$CONFIG_FILE"
+  write_wireplumber_config "$WIREPLUMBER_CONF"
+  mv "$parent" "$real_parent"
+  ln -s "$real_parent" "$parent"
+
+  require_root() { :; }
+  acquire_lock() { printf 'acquire\n' >> "$TEST_SCRATCH/lock.log"; }
+  release_lock() { printf 'release\n' >> "$TEST_SCRATCH/lock.log"; }
+  atomic_install_file() { cp "$1" "$2"; chmod "$3" "$2"; }
+  reconcile_runtime_configuration() { apply_wireplumber_config; }
+  as_user_systemctl() { fail 'unsafe WirePlumber path restarted WirePlumber'; }
+  systemctl() { :; }
+
+  set +e
+  output=$(audio_onboard_action disable analog 2>&1)
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'symlinked WirePlumber parent unexpectedly applied'
+  assert_contains "$output" 'previous configuration was restored'
+  cmp -s "$before" "$CONFIG_FILE" || \
+    fail 'path-validation failure did not restore the previous configuration'
+  assert_file_contains "$TEST_SCRATCH/lock.log" 'release'
+  assert_file_not_contains "$real_parent/51-a2dpilot.conf" 'monitor.alsa.rules'
+}
+
 test_onboard_audio_status_and_matching() {
   local user output
   setup_scratch_dir
@@ -2530,6 +2568,7 @@ run_test 'config editor installs a protected snapshot' test_config_editor_instal
 run_test 'failed config application restores previous config' test_config_application_rolls_back
 run_test 'onboard-audio CLI and live application' test_onboard_audio_cli_and_application
 run_test 'failed onboard-audio application rolls back' test_onboard_audio_application_rolls_back
+run_test 'onboard-audio path failure rolls back' test_onboard_audio_path_failure_rolls_back
 run_test 'onboard-audio status and device matching' test_onboard_audio_status_and_matching
 run_test 'player control resolves configured URLs' test_player_control_resolves_configured_urls
 run_test 'media controls share one deadline' test_media_control_shared_deadline
