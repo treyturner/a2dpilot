@@ -1702,7 +1702,6 @@ inspect_pipewire_node() {
     fi
   done <<< "$output"
   [[ $serial =~ ^[0-9]+$ && -n $name && -n $class ]] || return 1
-  valid_pipewire_name "$name" || return 1
   [[ -z $driver || $driver =~ ^[0-9]+$ ]] || return 1
   PIPEWIRE_NODE_SERIAL=$serial
   PIPEWIRE_NODE_NAME=$name
@@ -1712,13 +1711,14 @@ inspect_pipewire_node() {
 
 enumerate_playback_streams() {
   local user=$1 seconds=$2 output line
-  local id='' serial='' class='' invalid=0
+  local id='' serial='' class='' next_id invalid=0
   local object_pattern='^[[:space:]]*id[[:space:]]+([0-9]+),[[:space:]]+type[[:space:]]+PipeWire:Interface:Node(/3)?[[:space:]]*$'
   local serial_pattern='^[[:space:]]*object\.serial[[:space:]]*=[[:space:]]*"([0-9]+)"[[:space:]]*$'
   local class_pattern='^[[:space:]]*media\.class[[:space:]]*=[[:space:]]*"([^"]+)"[[:space:]]*$'
   output=$(bounded_user_pw_cli "$user" "$seconds" ls Node 2>/dev/null) || return 1
   while IFS= read -r line; do
     if [[ $line =~ $object_pattern ]]; then
+      next_id=${BASH_REMATCH[1]}
       if [[ $class == Stream/Output/Audio ]]; then
         if [[ $id =~ ^[0-9]+$ && $serial =~ ^[0-9]+$ ]]; then
           printf '%s %s\n' "$id" "$serial"
@@ -1726,7 +1726,7 @@ enumerate_playback_streams() {
           invalid=1
         fi
       fi
-      id=${BASH_REMATCH[1]}
+      id=$next_id
       serial=
       class=
     elif [[ $line =~ $serial_pattern ]]; then
@@ -1859,10 +1859,12 @@ clear_owned_routing() {
   if (( ${#ROUTING_STREAM_TARGETS[@]} > 0 )); then
     remaining=$(seconds_until_deadline "$deadline") || return 1
     streams=$(enumerate_playback_streams "$user" "$remaining") || return 1
-    while read -r id serial extra; do
-      [[ -z $extra && $id =~ ^[0-9]+$ && $serial =~ ^[0-9]+$ ]] || return 1
-      stream_ids[$serial]=$id
-    done <<< "$streams"
+    if [[ -n $streams ]]; then
+      while read -r id serial extra; do
+        [[ -z $extra && $id =~ ^[0-9]+$ && $serial =~ ^[0-9]+$ ]] || return 1
+        stream_ids[$serial]=$id
+      done <<< "$streams"
+    fi
     for serial in "${!ROUTING_STREAM_TARGETS[@]}"; do
       id=${stream_ids[$serial]:-}
       if [[ -z $id ]]; then
@@ -1898,7 +1900,8 @@ clear_owned_routing() {
 
 reconcile_speaker_routing() {
   local mac=$1 deadline remaining sink current result streams id serial extra target
-  local -A seen_streams=()
+  local routing_failed=0
+  local -A seen_streams=() pending_streams=()
   deadline=$(( $(now_seconds) + ROUTING_TIMEOUT ))
   load_routing_state || return 1
   if [[ -n $ROUTING_STATE_USER && $ROUTING_STATE_USER != "$CFG_AUDIO_USER" ]]; then
@@ -1913,6 +1916,7 @@ reconcile_speaker_routing() {
   remaining=$(seconds_until_deadline "$deadline") || return 1
   inspect_pipewire_node "$CFG_AUDIO_USER" "$sink" "$remaining" || return 1
   [[ $PIPEWIRE_NODE_CLASS == Audio/Sink && $PIPEWIRE_NODE_NAME == bluez_output.* ]] || return 1
+  valid_pipewire_name "$PIPEWIRE_NODE_NAME" || return 1
   local sink_serial=$PIPEWIRE_NODE_SERIAL sink_name=$PIPEWIRE_NODE_NAME
 
   remaining=$(seconds_until_deadline "$deadline") || return 1
@@ -1945,52 +1949,78 @@ reconcile_speaker_routing() {
 
   remaining=$(seconds_until_deadline "$deadline") || return 1
   streams=$(enumerate_playback_streams "$CFG_AUDIO_USER" "$remaining") || return 1
-  while read -r id serial extra; do
-    [[ -z $extra && $id =~ ^[0-9]+$ && $serial =~ ^[0-9]+$ ]] || return 1
-    seen_streams[$serial]=1
-    remaining=$(seconds_until_deadline "$deadline") || return 1
-    inspect_pipewire_node "$CFG_AUDIO_USER" "$id" "$remaining" || return 1
-    [[ $PIPEWIRE_NODE_CLASS == Stream/Output/Audio && $PIPEWIRE_NODE_SERIAL == "$serial" ]] || return 1
-    if [[ $PIPEWIRE_NODE_DRIVER != "$sink" ]]; then
+  if [[ -n $streams ]]; then
+    while read -r id serial extra; do
+      [[ -z $extra && $id =~ ^[0-9]+$ && $serial =~ ^[0-9]+$ ]] || return 1
+      seen_streams[$serial]=1
       remaining=$(seconds_until_deadline "$deadline") || return 1
-      if target=$(stream_target_serial "$CFG_AUDIO_USER" "$id" "$remaining"); then
-        result=0
-      else
-        result=$?
-        target=
-      fi
-      (( result == 0 || result == 2 )) || return 1
-      if [[ $target != "$sink_serial" ]]; then
+      inspect_pipewire_node "$CFG_AUDIO_USER" "$id" "$remaining" || return 1
+      [[ $PIPEWIRE_NODE_CLASS == Stream/Output/Audio && $PIPEWIRE_NODE_SERIAL == "$serial" ]] || return 1
+      if [[ $PIPEWIRE_NODE_DRIVER != "$sink" ]]; then
         remaining=$(seconds_until_deadline "$deadline") || return 1
-        bounded_user_pw_metadata "$CFG_AUDIO_USER" "$remaining" -n default \
-          "$id" target.object "$sink_serial" Spa:Id >/dev/null 2>&1 || return 1
-        ROUTING_STREAM_TARGETS[$serial]=$sink_serial
-        write_routing_state || return 1
+        if target=$(stream_target_serial "$CFG_AUDIO_USER" "$id" "$remaining"); then
+          result=0
+        else
+          result=$?
+          target=
+        fi
+        (( result == 0 || result == 2 )) || return 1
+        if [[ $target != "$sink_serial" ]]; then
+          remaining=$(seconds_until_deadline "$deadline") || return 1
+          bounded_user_pw_metadata "$CFG_AUDIO_USER" "$remaining" -n default \
+            "$id" target.object "$sink_serial" Spa:Id >/dev/null 2>&1 || return 1
+          ROUTING_STREAM_TARGETS[$serial]=$sink_serial
+          write_routing_state || return 1
+        fi
+        pending_streams[$serial]=$id
+      elif [[ -n ${ROUTING_STREAM_TARGETS[$serial]:-} ]]; then
+        remaining=$(seconds_until_deadline "$deadline") || return 1
+        if target=$(stream_target_serial "$CFG_AUDIO_USER" "$id" "$remaining"); then
+          [[ $target == "${ROUTING_STREAM_TARGETS[$serial]}" ]] || \
+            unset "ROUTING_STREAM_TARGETS[$serial]"
+        else
+          result=$?
+          (( result != 2 )) || unset "ROUTING_STREAM_TARGETS[$serial]"
+        fi
       fi
-      while [[ $PIPEWIRE_NODE_DRIVER != "$sink" ]]; do
-        remaining=$(seconds_until_deadline "$deadline") || {
-          write_routing_state || true
-          return 1
-        }
-        inspect_pipewire_node "$CFG_AUDIO_USER" "$id" "$remaining" || return 1
-        [[ $PIPEWIRE_NODE_SERIAL == "$serial" ]] || return 1
-        [[ $PIPEWIRE_NODE_DRIVER == "$sink" ]] || sleep 0.1
-      done
-    elif [[ -n ${ROUTING_STREAM_TARGETS[$serial]:-} ]]; then
-      remaining=$(seconds_until_deadline "$deadline") || return 1
-      if target=$(stream_target_serial "$CFG_AUDIO_USER" "$id" "$remaining"); then
-        [[ $target == "${ROUTING_STREAM_TARGETS[$serial]}" ]] || \
-          unset "ROUTING_STREAM_TARGETS[$serial]"
-      else
-        result=$?
-        (( result != 2 )) || unset "ROUTING_STREAM_TARGETS[$serial]"
-      fi
-    fi
-  done <<< "$streams"
+    done <<< "$streams"
+  fi
   for serial in "${!ROUTING_STREAM_TARGETS[@]}"; do
     [[ ${seen_streams[$serial]+present} ]] || unset "ROUTING_STREAM_TARGETS[$serial]"
   done
-  write_routing_state
+  write_routing_state || return 1
+
+  # Apply every stream target before waiting for clients to relink. Verify the
+  # pending set collectively so a client that pins its driver cannot starve
+  # otherwise movable streams later in enumeration order.
+  while (( ${#pending_streams[@]} > 0 )); do
+    for serial in "${!pending_streams[@]}"; do
+      id=${pending_streams[$serial]}
+      remaining=$(seconds_until_deadline "$deadline") || {
+        routing_failed=1
+        pending_streams=()
+        break
+      }
+      if ! inspect_pipewire_node "$CFG_AUDIO_USER" "$id" "$remaining" || \
+         [[ $PIPEWIRE_NODE_CLASS != Stream/Output/Audio ||
+            $PIPEWIRE_NODE_SERIAL != "$serial" ]]; then
+        routing_failed=1
+        unset "pending_streams[$serial]"
+      elif [[ $PIPEWIRE_NODE_DRIVER == "$sink" ]]; then
+        unset "pending_streams[$serial]"
+      fi
+    done
+    (( ${#pending_streams[@]} > 0 )) || break
+    seconds_until_deadline "$deadline" >/dev/null || {
+      routing_failed=1
+      break
+    }
+    sleep 0.1
+  done
+  if (( ${#pending_streams[@]} > 0 )); then
+    routing_failed=1
+  fi
+  (( routing_failed == 0 ))
 }
 
 find_a2dp_device_id() {
@@ -3563,17 +3593,19 @@ print_routing_status() {
   note "Configured audio default: $default_name"
   if [[ $active_node =~ ^[0-9]+$ ]]; then
     if streams=$(enumerate_playback_streams "$CFG_AUDIO_USER" "$ROUTING_TIMEOUT"); then
-      while read -r id serial extra; do
-        [[ -z $extra && $id =~ ^[0-9]+$ && $serial =~ ^[0-9]+$ ]] || {
-          inspection_failed=1
-          break
-        }
-        if ! inspect_pipewire_node "$CFG_AUDIO_USER" "$id" "$ROUTING_TIMEOUT"; then
-          inspection_failed=1
-          break
-        fi
-        [[ $PIPEWIRE_NODE_DRIVER == "$active_node" ]] || off_active=$((off_active + 1))
-      done <<< "$streams"
+      if [[ -n $streams ]]; then
+        while read -r id serial extra; do
+          [[ -z $extra && $id =~ ^[0-9]+$ && $serial =~ ^[0-9]+$ ]] || {
+            inspection_failed=1
+            break
+          }
+          if ! inspect_pipewire_node "$CFG_AUDIO_USER" "$id" "$ROUTING_TIMEOUT"; then
+            inspection_failed=1
+            break
+          fi
+          [[ $PIPEWIRE_NODE_DRIVER == "$active_node" ]] || off_active=$((off_active + 1))
+        done <<< "$streams"
+      fi
       if (( inspection_failed == 0 )); then
         note "Playback streams off active sink: $off_active"
       else

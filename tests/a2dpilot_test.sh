@@ -2208,14 +2208,14 @@ test_pipewire_routing_parsers() {
     cat <<'EOF'
 id 95, type PipeWire:Interface:Node
   * object.serial = "138"
-  * node.name = "alsa_playback.test-player"
+  * node.name = "Plexamp Playback / Main"
     node.driver-id = "83"
   * media.class = "Stream/Output/Audio"
 EOF
   }
   inspect_pipewire_node audio 95 3
   assert_eq 138 "$PIPEWIRE_NODE_SERIAL"
-  assert_eq alsa_playback.test-player "$PIPEWIRE_NODE_NAME"
+  assert_eq 'Plexamp Playback / Main' "$PIPEWIRE_NODE_NAME"
   assert_eq Stream/Output/Audio "$PIPEWIRE_NODE_CLASS"
   assert_eq 83 "$PIPEWIRE_NODE_DRIVER"
 
@@ -2325,12 +2325,92 @@ EOF
   assert_eq "$cleanup_log" "$(< "$TEST_SCRATCH/routing.log")"
   [[ ! -e $ROUTING_STATE_FILE ]] || fail 'stale routing provenance was not discarded'
 
+  ROUTING_STATE_USER=$user
+  ROUTING_DEFAULT_NAME=
+  ROUTING_STREAM_TARGETS=([999]=89)
+  write_routing_state
+  bounded_user_pw_cli() { :; }
+  clear_owned_routing "$user"
+  [[ ! -e $ROUTING_STATE_FILE ]] || \
+    fail 'provenance for an exited playback stream remained after cleanup'
+
   printf 'sentinel\n' > "$TEST_SCRATCH/redirected-routing-state"
   ln -s "$TEST_SCRATCH/redirected-routing-state" "$ROUTING_STATE_FILE"
   ROUTING_STATE_USER=$user
   ROUTING_DEFAULT_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
   if write_routing_state; then fail 'routing state followed a symlink'; fi
   assert_eq sentinel "$(< "$TEST_SCRATCH/redirected-routing-state")"
+}
+
+test_unmovable_stream_does_not_starve_routing() {
+  local user mac=AA:BB:CC:DD:EE:FF clock=100
+  local first_driver=35 second_driver=35 first_target='' second_target=''
+  local output rc
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  CFG_AUDIO_USER=$user
+  now_seconds() { printf '%s\n' "$clock"; }
+  sleep() { clock=$((clock + 1)); }
+  find_a2dp_node_id() { printf '83\n'; }
+  configured_default_sink() { printf 'bluez_output.AA_BB_CC_DD_EE_FF.1\n'; }
+  bounded_user_pw_cli() {
+    cat <<'EOF'
+	id 95, type PipeWire:Interface:Node/3
+		object.serial = "138"
+		media.class = "Stream/Output/Audio"
+	id 96, type PipeWire:Interface:Node/3
+		object.serial = "139"
+		media.class = "Stream/Output/Audio"
+EOF
+  }
+  bounded_user_wpctl() {
+    case $4 in
+      83)
+        printf '%s\n' '  * object.serial = "89"' \
+          '  * node.name = "bluez_output.AA_BB_CC_DD_EE_FF.1"' \
+          '  * media.class = "Audio/Sink"'
+        ;;
+      95)
+        printf '%s\n' '  * object.serial = "138"' \
+          '  * node.name = "Pinned Player"' \
+          "    node.driver-id = \"$first_driver\"" \
+          '  * media.class = "Stream/Output/Audio"'
+        ;;
+      96)
+        [[ $second_driver != 83 ]] || : > "$TEST_SCRATCH/second-stream-routed"
+        printf '%s\n' '  * object.serial = "139"' \
+          '  * node.name = "Movable Player"' \
+          "    node.driver-id = \"$second_driver\"" \
+          '  * media.class = "Stream/Output/Audio"'
+        ;;
+    esac
+  }
+  stream_target_serial() {
+    case $2 in
+      95) [[ -n $first_target ]] && printf '%s\n' "$first_target" || return 2 ;;
+      96) [[ -n $second_target ]] && printf '%s\n' "$second_target" || return 2 ;;
+    esac
+  }
+  bounded_user_pw_metadata() {
+    case $5 in
+      95) first_target=89 ;;
+      96) second_target=89; second_driver=83 ;;
+    esac
+    printf 'target %s\n' "$5" >> "$TEST_SCRATCH/routing-targets"
+  }
+
+  set +e
+  output=$(reconcile_speaker_routing "$mac" 2>&1)
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'an unmovable stream reported routing success'
+  assert_eq '' "$output"
+  assert_file_contains "$TEST_SCRATCH/routing-targets" 'target 95'
+  assert_file_contains "$TEST_SCRATCH/routing-targets" 'target 96'
+  [[ -e $TEST_SCRATCH/second-stream-routed ]] || \
+    fail 'movable stream was not verified after the pinned stream'
 }
 
 mock_a2dp_enum_profiles() {
@@ -3226,6 +3306,7 @@ run_test 'optimistic codec reporting' test_codec_reporting_is_optimistic
 run_test 'PipeWire codec property parsing' test_codec_property_parsing
 run_test 'PipeWire routing parsers' test_pipewire_routing_parsers
 run_test 'default routing and owned cleanup' test_default_routing_and_owned_cleanup
+run_test 'unmovable stream does not starve routing' test_unmovable_stream_does_not_starve_routing
 run_test 'PipeWire codec profile discovery' test_pipewire_codec_profile_discovery
 run_test 'per-speaker codec selection' test_per_speaker_codec_selection
 run_test 'non-preemptive failover order' test_daemon_nonpreemption_and_failover_order
