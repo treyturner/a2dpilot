@@ -258,7 +258,7 @@ detect_install_onboard_audio() {
   if [[ -r $cards_path ]]; then
     while IFS= read -r line || [[ -n $line ]]; do
       case $line in
-        *bcm2835*) INSTALL_ONBOARD_ANALOG_AVAILABLE=1 ;;
+        *bcm2835*Headphones*|*bcm2835*headphones*) INSTALL_ONBOARD_ANALOG_AVAILABLE=1 ;;
       esac
       case $line in
         *vc4-hdmi*|*vc4hdmi*) INSTALL_ONBOARD_HDMI_AVAILABLE=1 ;;
@@ -273,7 +273,7 @@ detect_install_onboard_audio() {
       IFS= read -r value < "$card/id" || true
     fi
     case $value in
-      *bcm2835*|*Headphones*) INSTALL_ONBOARD_ANALOG_AVAILABLE=1 ;;
+      *Headphones*|*headphones*) INSTALL_ONBOARD_ANALOG_AVAILABLE=1 ;;
     esac
     case $value in
       *vc4-hdmi*|*vc4hdmi*) INSTALL_ONBOARD_HDMI_AVAILABLE=1 ;;
@@ -282,10 +282,7 @@ detect_install_onboard_audio() {
     if [[ -L $card/device/driver ]]; then
       driver=$(readlink -- "$card/device/driver" 2>/dev/null || true)
     fi
-    case ${driver##*/} in
-      *snd_bcm2835*) INSTALL_ONBOARD_ANALOG_AVAILABLE=1 ;;
-      *vc4_hdmi*) INSTALL_ONBOARD_HDMI_AVAILABLE=1 ;;
-    esac
+    [[ ${driver##*/} != *vc4_hdmi* ]] || INSTALL_ONBOARD_HDMI_AVAILABLE=1
   done
 
   (( INSTALL_ONBOARD_ANALOG_AVAILABLE || INSTALL_ONBOARD_HDMI_AVAILABLE ))
@@ -1359,7 +1356,7 @@ EOF
     matches = [
       {
         device.form-factor = "internal"
-        api.alsa.card.name = "~bcm2835.*"
+        api.alsa.card.name = "~bcm2835.*[Hh]eadphones.*"
       }
     ]
     actions = {
@@ -1876,13 +1873,15 @@ inspect_pipewire_node() {
 
 enumerate_playback_streams() {
   local user=$1 seconds=$2 output line
-  local id='' serial='' class='' next_id invalid=0
+  local id='' serial='' class='' next_id invalid=0 saw_content=0 saw_object=0
   local object_pattern='^[[:space:]]*id[[:space:]]+([0-9]+),[[:space:]]+type[[:space:]]+PipeWire:Interface:Node(/3)?[[:space:]]*$'
   local serial_pattern='^[[:space:]]*object\.serial[[:space:]]*=[[:space:]]*"([0-9]+)"[[:space:]]*$'
   local class_pattern='^[[:space:]]*media\.class[[:space:]]*=[[:space:]]*"([^"]+)"[[:space:]]*$'
   output=$(bounded_user_pw_cli "$user" "$seconds" ls Node 2>/dev/null) || return 1
   while IFS= read -r line; do
+    [[ ! $line =~ [^[:space:]] ]] || saw_content=1
     if [[ $line =~ $object_pattern ]]; then
+      saw_object=1
       next_id=${BASH_REMATCH[1]}
       if [[ $class == Stream/Output/Audio ]]; then
         if [[ $id =~ ^[0-9]+$ && $serial =~ ^[0-9]+$ ]]; then
@@ -1900,6 +1899,8 @@ enumerate_playback_streams() {
     elif [[ $line =~ $class_pattern ]]; then
       [[ -z $class ]] || invalid=1
       class=${BASH_REMATCH[1]}
+    elif [[ $line == *PipeWire:Interface:Node* ]]; then
+      invalid=1
     fi
   done <<< "$output"
   if [[ $class == Stream/Output/Audio ]]; then
@@ -1909,6 +1910,7 @@ enumerate_playback_streams() {
       invalid=1
     fi
   fi
+  (( saw_content == 0 || saw_object == 1 )) || invalid=1
   (( invalid == 0 ))
 }
 
@@ -4490,7 +4492,8 @@ visible_onboard_devices() {
   list_onboard_audio_device_ids || return 1
   for id in "${ONBOARD_DEVICE_IDS[@]}"; do
     inspect_onboard_audio_device "$id" || return 1
-    [[ $ONBOARD_DEVICE_FORM == internal && $ONBOARD_DEVICE_CARD == bcm2835* ]] && \
+    [[ $ONBOARD_DEVICE_FORM == internal && \
+       $ONBOARD_DEVICE_CARD == bcm2835*[Hh]eadphones* ]] && \
       ONBOARD_ANALOG_VISIBLE=$((ONBOARD_ANALOG_VISIBLE + 1))
     [[ $ONBOARD_DEVICE_FORM == internal && $ONBOARD_DEVICE_CARD == vc4-hdmi* ]] && \
       ONBOARD_HDMI_VISIBLE=$((ONBOARD_HDMI_VISIBLE + 1))

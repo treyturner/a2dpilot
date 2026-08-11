@@ -200,7 +200,7 @@ sudo a2dpilot audio onboard enable all
 
 The optional selector is `analog`, `hdmi`, or `all`; omitting it means `all`. A change atomically updates `/etc/a2dpilot.conf`, regenerates the managed WirePlumber fragment, restarts the configured user's WirePlumber session, and lets the daemon reconnect Bluetooth normally. Failed validation or application restores the prior configuration and runtime policy.
 
-Suppression uses [WirePlumber's ALSA device rules](https://pipewire.pages.freedesktop.org/wireplumber/daemon/configuration/alsa.html) and is deliberately narrow. The rules require an internal ALSA card whose reported card name begins with `bcm2835` for analogue audio or `vc4-hdmi` for HDMI audio. USB interfaces and audio HATs are not hidden merely because they are present. The command changes live audio-device visibility only: it does not edit boot firmware, unload drivers, disable HDMI video, or require a reboot. On other hardware the rules normally match nothing, and status reports zero visible matching devices.
+Suppression uses [WirePlumber's ALSA device rules](https://pipewire.pages.freedesktop.org/wireplumber/daemon/configuration/alsa.html) and is deliberately narrow. The rules require an internal ALSA card reported as `bcm2835 Headphones` for analogue audio or with a `vc4-hdmi` name for HDMI audio. USB interfaces, audio HATs, and legacy `bcm2835 HDMI` cards are not hidden by the analogue policy. The command changes live audio-device visibility only: it does not edit boot firmware, unload drivers, disable HDMI video, or require a reboot. On other hardware the rules normally match nothing, and status reports zero visible matching devices.
 
 ### Speaker priority
 
@@ -495,7 +495,7 @@ sudo a2dpilot audio onboard status
 sudo journalctl -b --user-unit=wireplumber.service
 ```
 
-The rule intentionally ignores USB and HAT devices and only matches internal Raspberry Pi cards reported with `bcm2835*` or `vc4-hdmi*` ALSA card names. A zero count may mean that the hardware is absent, already hidden by the configured policy, or reported under a different name. Re-enable both classes with `sudo a2dpilot audio onboard enable`.
+The rule intentionally ignores USB and HAT devices and only matches internal Raspberry Pi cards reported as `bcm2835 Headphones` or with `vc4-hdmi*` ALSA card names. A zero count may mean that the hardware is absent, already hidden by the configured policy, or reported under a different name. Re-enable both classes with `sudo a2dpilot audio onboard enable`.
 
 ### Installation or uninstall failed
 

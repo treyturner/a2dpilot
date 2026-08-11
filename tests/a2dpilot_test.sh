@@ -309,6 +309,13 @@ test_install_onboard_audio_detection() {
   assert_eq 0 "$INSTALL_ONBOARD_HDMI_AVAILABLE"
 
   printf 'Raspberry Pi 4 Model B Rev 1.5\0' > "$model"
+  printf ' 0 [HDMI]: bcm2835_hdmi - bcm2835 HDMI\n' > "$cards"
+  if detect_install_onboard_audio "$model" "$cards" "$sound_class"; then
+    fail 'legacy bcm2835 HDMI card was classified as onboard analogue audio'
+  fi
+  assert_eq 0 "$INSTALL_ONBOARD_ANALOG_AVAILABLE"
+  assert_eq 0 "$INSTALL_ONBOARD_HDMI_AVAILABLE"
+
   printf ' 2 [Headphones]: bcm2835_headpho - bcm2835 Headphones\n' > "$cards"
   detect_install_onboard_audio "$model" "$cards" "$sound_class"
   assert_eq 1 "$INSTALL_ONBOARD_ANALOG_AVAILABLE"
@@ -581,14 +588,16 @@ test_generated_integration_files() {
   write_wireplumber_config "$WIREPLUMBER_CONF"
   assert_file_contains "$WIREPLUMBER_CONF" 'monitor.alsa.rules'
   assert_file_contains "$WIREPLUMBER_CONF" 'device.form-factor = "internal"'
-  assert_file_contains "$WIREPLUMBER_CONF" 'api.alsa.card.name = "~bcm2835.*"'
+  assert_file_contains "$WIREPLUMBER_CONF" \
+    'api.alsa.card.name = "~bcm2835.*[Hh]eadphones.*"'
   assert_file_contains "$WIREPLUMBER_CONF" 'device.disabled = true'
   assert_file_not_contains "$WIREPLUMBER_CONF" 'vc4-hdmi'
   assert_file_not_contains "$WIREPLUMBER_CONF" 'bluez5.codecs'
 
   CFG_ONBOARD_HDMI=disabled
   write_wireplumber_config "$WIREPLUMBER_CONF"
-  assert_file_contains "$WIREPLUMBER_CONF" 'api.alsa.card.name = "~bcm2835.*"'
+  assert_file_contains "$WIREPLUMBER_CONF" \
+    'api.alsa.card.name = "~bcm2835.*[Hh]eadphones.*"'
   assert_file_contains "$WIREPLUMBER_CONF" 'api.alsa.card.name = "~vc4-hdmi.*"'
 
   write_trigger_config "$TRIGGER_CONF" off
@@ -787,7 +796,8 @@ test_interactive_install_configures_onboard_audio_before_pairing() {
   parse_config "$CONFIG_FILE"
   assert_eq disabled "$CFG_ONBOARD_ANALOG"
   assert_eq enabled "$CFG_ONBOARD_HDMI"
-  assert_file_contains "$WIREPLUMBER_CONF" 'api.alsa.card.name = "~bcm2835.*"'
+  assert_file_contains "$WIREPLUMBER_CONF" \
+    'api.alsa.card.name = "~bcm2835.*[Hh]eadphones.*"'
   assert_file_not_contains "$WIREPLUMBER_CONF" 'api.alsa.card.name = "~vc4-hdmi.*"'
 }
 
@@ -1598,7 +1608,8 @@ test_onboard_audio_cli_and_application() {
   assert_eq disabled "$CFG_ONBOARD_ANALOG"
   assert_eq enabled "$CFG_ONBOARD_HDMI"
   assert_eq AA:BB:CC:DD:EE:FF "${CFG_SPEAKERS[0]}"
-  assert_file_contains "$WIREPLUMBER_CONF" 'api.alsa.card.name = "~bcm2835.*"'
+  assert_file_contains "$WIREPLUMBER_CONF" \
+    'api.alsa.card.name = "~bcm2835.*[Hh]eadphones.*"'
   assert_file_not_contains "$WIREPLUMBER_CONF" 'vc4-hdmi'
 
   audio_onboard_action disable
@@ -1729,6 +1740,9 @@ test_onboard_audio_status_and_matching() {
 	id 54, type PipeWire:Interface:Device/3
 		device.api = "alsa"
 		media.class = "Audio/Device"
+	id 55, type PipeWire:Interface:Device/3
+		device.api = "alsa"
+		media.class = "Audio/Device"
 EOF
       return 0
     fi
@@ -1775,6 +1789,15 @@ EOF
 	type: PipeWire:Interface:Device/3
 *		api.alsa.card.name = "bcm2835 USB device without form factor"
 *		device.api = "alsa"
+*		media.class = "Audio/Device"
+EOF
+        ;;
+      55) cat <<'EOF'
+	id: 55
+	type: PipeWire:Interface:Device/3
+*		api.alsa.card.name = "bcm2835 HDMI"
+*		device.api = "alsa"
+*		device.form-factor = "internal"
 *		media.class = "Audio/Device"
 EOF
         ;;
@@ -2838,6 +2861,23 @@ EOF
   if enumerate_playback_streams audio 3 >/dev/null; then
     fail 'playback stream without an object serial was accepted'
   fi
+  bounded_user_pw_cli() {
+    printf '%s\n' $'\tid 95, type PipeWire:Interface:Node/4' \
+      $'\t\tobject.serial = "138"' \
+      $'\t\tmedia.class = "Stream/Output/Audio"'
+  }
+  if enumerate_playback_streams audio 3 >/dev/null; then
+    fail 'unrecognized nonempty playback enumeration output was accepted'
+  fi
+  bounded_user_pw_cli() {
+    mock_pipewire_nodes_for_routing
+    printf '%s\n' $'\tid 96, type PipeWire:Interface:Node/4'
+  }
+  if enumerate_playback_streams audio 3 >/dev/null; then
+    fail 'mixed recognized and unrecognized node records were accepted'
+  fi
+  bounded_user_pw_cli() { :; }
+  assert_eq '' "$(enumerate_playback_streams audio 3)"
   bounded_user_wpctl() {
     printf '%s\n' '  * object.serial = "138"' '  * object.serial = "139"' \
       '  * node.name = "alsa_playback.test"' '  * media.class = "Stream/Output/Audio"'
