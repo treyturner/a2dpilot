@@ -1392,6 +1392,9 @@ test_onboard_audio_status_and_matching() {
 	id 53, type PipeWire:Interface:Device/3
 		device.api = "bluez5"
 		media.class = "Audio/Device"
+	id 54, type PipeWire:Interface:Device/3
+		device.api = "alsa"
+		media.class = "Audio/Device"
 EOF
       return 0
     fi
@@ -1433,6 +1436,14 @@ EOF
 *		media.class = "Audio/Device"
 EOF
         ;;
+      54) cat <<'EOF'
+	id: 54
+	type: PipeWire:Interface:Device/3
+*		api.alsa.card.name = "bcm2835 USB device without form factor"
+*		device.api = "alsa"
+*		media.class = "Audio/Device"
+EOF
+        ;;
     esac
   }
 
@@ -1440,6 +1451,7 @@ EOF
   assert_eq 1 "$ONBOARD_ANALOG_VISIBLE"
   assert_eq 1 "$ONBOARD_HDMI_VISIBLE"
   assert_file_not_contains "$TEST_SCRATCH/onboard-inspections" '53'
+  assert_file_contains "$TEST_SCRATCH/onboard-inspections" '54'
   output=$(print_onboard_audio_status all)
   assert_contains "$output" 'Onboard analog: enabled (1 visible matching devices)'
   assert_contains "$output" 'Onboard HDMI: enabled (1 visible matching devices)'

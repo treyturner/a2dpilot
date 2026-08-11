@@ -2545,7 +2545,7 @@ inspect_onboard_audio_device() {
     fi
   done <<< "$output"
   [[ $id == "$expected_id" && $type == device && $api == alsa &&
-     $class == Audio/Device && -n $card && -n $form ]] || invalid=1
+     $class == Audio/Device && -n $card ]] || invalid=1
   (( invalid == 0 )) || return 1
   ONBOARD_DEVICE_CARD=$card
   ONBOARD_DEVICE_FORM=$form
