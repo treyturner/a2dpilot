@@ -509,7 +509,7 @@ parse_config() {
           config_fail "$path:$lineno: invalid speaker MAC address: $speaker_mac"
           return 1
         }
-        speaker_mac=$(normalize_mac "$speaker_mac")
+        speaker_mac=${speaker_mac^^}
         [[ ! ${speaker_seen[$speaker_mac]+present} ]] || {
           config_fail "$path:$lineno: duplicate speaker: $speaker_mac"
           return 1
