@@ -2767,6 +2767,67 @@ test_invalid_initial_config_clears_recorded_routing() {
     fail 'invalid initial configuration retained recorded routing ownership'
 }
 
+test_daemon_signal_defers_during_routing_mutation() {
+  local user mac=AA:BB:CC:DD:EE:FF default_sink=alsa_output.builtin
+  local sink_name=bluez_output.AA_BB_CC_DD_EE_FF.1
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  CFG_AUDIO_USER=$user
+  DAEMON_STOP_REQUESTED=0
+  now_seconds() { printf '100\n'; }
+  find_a2dp_node_id() { printf '83\n'; }
+  inspect_pipewire_node() {
+    PIPEWIRE_NODE_SERIAL=89
+    PIPEWIRE_NODE_NAME=$sink_name
+    PIPEWIRE_NODE_CLASS=Audio/Sink
+    PIPEWIRE_NODE_DRIVER=
+  }
+  configured_default_sink() { printf '%s\n' "$default_sink"; }
+  bounded_user_wpctl() {
+    [[ $ROUTING_MUTATION_CRITICAL == 1 ]] || \
+      fail 'routing mutation command ran outside its critical section'
+    default_sink=$sink_name
+    daemon_signal
+  }
+
+  if reconcile_speaker_routing "$mac"; then
+    fail 'stop-requested routing reconciliation reported success'
+  fi
+  assert_eq 1 "$DAEMON_STOP_REQUESTED"
+  assert_eq 0 "$ROUTING_MUTATION_CRITICAL"
+  assert_file_contains "$ROUTING_STATE_FILE" $'default\tbluez_output.AA_BB_CC_DD_EE_FF.1'
+  assert_file_not_contains "$ROUTING_STATE_FILE" 'default-pending'
+}
+
+test_runtime_reconciliation_failure_clears_routing() {
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  require_root() { :; }
+  prepare_media_state_directory() { :; }
+  acquire_lock() { :; }
+  release_lock() { : > "$TEST_SCRATCH/daemon-lock-released"; }
+  parse_config() {
+    CFG_RECONNECT_INTERVAL=5
+    return 0
+  }
+  load_daemon_active() { :; }
+  reconcile_runtime_configuration() { return 1; }
+  daemon_log() { :; }
+  clear_daemon_routing() {
+    : > "$TEST_SCRATCH/runtime-failure-routing-cleared"
+    DAEMON_STOP_REQUESTED=1
+  }
+
+  daemon_action
+  [[ -e $TEST_SCRATCH/runtime-failure-routing-cleared ]] || \
+    fail 'runtime reconciliation failure did not attempt routing cleanup'
+  [[ -e $TEST_SCRATCH/daemon-lock-released ]] || \
+    fail 'daemon stop request did not release the global lock'
+}
+
 test_unmovable_stream_does_not_starve_routing() {
   local user mac=AA:BB:CC:DD:EE:FF clock=100
   local first_driver=35 second_driver=35 first_target='' second_target=''
@@ -3899,6 +3960,10 @@ run_test 'interrupted routing transition preserves prior owner' \
 run_test 'routing rotates after a shared deadline' test_routing_rotates_after_deadline
 run_test 'invalid initial config clears recorded routing' \
   test_invalid_initial_config_clears_recorded_routing
+run_test 'daemon signal defers during routing mutation' \
+  test_daemon_signal_defers_during_routing_mutation
+run_test 'runtime reconciliation failure clears routing' \
+  test_runtime_reconciliation_failure_clears_routing
 run_test 'unmovable stream does not starve routing' test_unmovable_stream_does_not_starve_routing
 run_test 'vanished stream does not starve routing' test_vanished_stream_does_not_starve_routing
 run_test 'recycled stream is not targeted' test_recycled_stream_is_not_targeted

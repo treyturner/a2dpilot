@@ -165,6 +165,8 @@ ROUTING_PIPEWIRE_INSTANCE=
 declare -gA ROUTING_STREAM_TARGETS=()
 declare -gA ROUTING_PENDING_STREAM_TARGETS=()
 ROUTING_STREAM_CURSOR=
+ROUTING_MUTATION_CRITICAL=0
+DAEMON_STOP_REQUESTED=0
 DAEMON_NEXT_ROUTE_LOG=0
 
 usage() {
@@ -1873,6 +1875,44 @@ normalize_stream_routing_ownership() {
   fi
 }
 
+apply_owned_stream_target() {
+  local user=$1 id=$2 serial=$3 target=$4 deadline=$5 remaining result=0
+  ROUTING_MUTATION_CRITICAL=1
+  ROUTING_PENDING_STREAM_TARGETS[$serial]=$target
+  if ! write_routing_state; then
+    result=1
+  elif ! remaining=$(seconds_until_deadline "$deadline"); then
+    unset "ROUTING_PENDING_STREAM_TARGETS[$serial]"
+    write_routing_state || true
+    result=1
+  elif ! inspect_pipewire_node "$user" "$id" "$remaining"; then
+    unset "ROUTING_PENDING_STREAM_TARGETS[$serial]"
+    write_routing_state || result=1
+    (( result != 0 )) || result=2
+  elif [[ $PIPEWIRE_NODE_CLASS != Stream/Output/Audio ||
+          $PIPEWIRE_NODE_SERIAL != "$serial" ]]; then
+    unset "ROUTING_STREAM_TARGETS[$serial]"
+    unset "ROUTING_PENDING_STREAM_TARGETS[$serial]"
+    write_routing_state || result=1
+    (( result != 0 )) || result=3
+  elif ! remaining=$(seconds_until_deadline "$deadline"); then
+    unset "ROUTING_PENDING_STREAM_TARGETS[$serial]"
+    write_routing_state || true
+    result=1
+  elif ! bounded_user_pw_metadata "$user" "$remaining" -n default \
+    "$id" target.object "$target" Spa:Id >/dev/null 2>&1; then
+    # The command was attempted and may have changed metadata before failing,
+    # so retain both the previous and pending values for conditional cleanup.
+    result=1
+  else
+    ROUTING_STREAM_TARGETS[$serial]=$target
+    unset "ROUTING_PENDING_STREAM_TARGETS[$serial]"
+    write_routing_state || result=1
+  fi
+  ROUTING_MUTATION_CRITICAL=0
+  return "$result"
+}
+
 load_routing_state() {
   local kind first second extra have_user=0 have_default=0 have_pending_default=0
   local have_instance=0
@@ -2091,7 +2131,7 @@ clear_owned_routing() {
 
 reconcile_speaker_routing() {
   local mac=$1 deadline remaining sink current current_instance result streams id serial extra target
-  local routing_failed=0 count index offset start=0
+  local routing_failed=0 mutation_result=0 count index offset start=0
   local -A seen_streams=() pending_streams=()
   local -a playback_ids=() playback_serials=()
   deadline=$(( $(now_seconds) + ROUTING_TIMEOUT ))
@@ -2135,12 +2175,29 @@ reconcile_speaker_routing() {
     ROUTING_PENDING_DEFAULT_NAME=
   fi
   if [[ $current != "$sink_name" ]]; then
-    # Preserve the previous owner while recording the proposed replacement.
-    # Cleanup can then recognize either side of an interrupted transition.
+    # From the attempted-state write through the final owner write, catchable
+    # daemon termination is deferred so pending intent cannot be abandoned.
+    ROUTING_MUTATION_CRITICAL=1
     ROUTING_PENDING_DEFAULT_NAME=$sink_name
-    write_routing_state || return 1
-    remaining=$(seconds_until_deadline "$deadline") || return 1
-    bounded_user_wpctl "$CFG_AUDIO_USER" "$remaining" set-default "$sink" >/dev/null 2>&1 || return 1
+    if ! write_routing_state; then
+      mutation_result=1
+    elif ! remaining=$(seconds_until_deadline "$deadline"); then
+      ROUTING_PENDING_DEFAULT_NAME=
+      write_routing_state || true
+      mutation_result=1
+    elif ! bounded_user_wpctl "$CFG_AUDIO_USER" "$remaining" \
+      set-default "$sink" >/dev/null 2>&1; then
+      # Retain the pending value because the attempted command may have changed
+      # metadata before returning failure or timing out.
+      mutation_result=1
+    else
+      ROUTING_DEFAULT_NAME=$sink_name
+      ROUTING_PENDING_DEFAULT_NAME=
+      write_routing_state || mutation_result=1
+    fi
+    ROUTING_MUTATION_CRITICAL=0
+    (( mutation_result == 0 )) || return 1
+    (( DAEMON_STOP_REQUESTED == 0 )) || return 1
     while true; do
       remaining=$(seconds_until_deadline "$deadline") || {
         write_routing_state || true
@@ -2152,9 +2209,6 @@ reconcile_speaker_routing() {
       fi
       sleep 0.1
     done
-    ROUTING_DEFAULT_NAME=$sink_name
-    ROUTING_PENDING_DEFAULT_NAME=
-    write_routing_state || return 1
   fi
 
   remaining=$(seconds_until_deadline "$deadline") || return 1
@@ -2215,26 +2269,19 @@ reconcile_speaker_routing() {
         (( result == 0 || result == 2 )) || return 1
         normalize_stream_routing_ownership "$serial" "$target" "$result"
         if [[ $target != "$sink_serial" ]]; then
-          ROUTING_PENDING_STREAM_TARGETS[$serial]=$sink_serial
-          write_routing_state || return 1
-          remaining=$(seconds_until_deadline "$deadline") || return 1
-          if ! inspect_pipewire_node "$CFG_AUDIO_USER" "$id" "$remaining"; then
-            routing_failed=1
+          if apply_owned_stream_target "$CFG_AUDIO_USER" "$id" "$serial" \
+            "$sink_serial" "$deadline"; then
+            :
+          else
+            result=$?
+            case $result in
+              2) routing_failed=1 ;;
+              3) ;;
+              *) return 1 ;;
+            esac
             continue
           fi
-          if [[ $PIPEWIRE_NODE_CLASS != Stream/Output/Audio ||
-                $PIPEWIRE_NODE_SERIAL != "$serial" ]]; then
-            unset "ROUTING_STREAM_TARGETS[$serial]"
-            unset "ROUTING_PENDING_STREAM_TARGETS[$serial]"
-            write_routing_state || return 1
-            continue
-          fi
-          remaining=$(seconds_until_deadline "$deadline") || return 1
-          bounded_user_pw_metadata "$CFG_AUDIO_USER" "$remaining" -n default \
-            "$id" target.object "$sink_serial" Spa:Id >/dev/null 2>&1 || return 1
-          ROUTING_STREAM_TARGETS[$serial]=$sink_serial
-          unset "ROUTING_PENDING_STREAM_TARGETS[$serial]"
-          write_routing_state || return 1
+          (( DAEMON_STOP_REQUESTED == 0 )) || return 1
         fi
         pending_streams[$serial]=$id
       elif [[ -n ${ROUTING_STREAM_TARGETS[$serial]:-} ||
@@ -3255,10 +3302,19 @@ daemon_cycle() {
   clear_daemon_routing || true
 }
 
+daemon_signal() {
+  if (( ROUTING_MUTATION_CRITICAL )); then
+    DAEMON_STOP_REQUESTED=1
+  else
+    exit 0
+  fi
+}
+
 daemon_action() {
   require_root
   prepare_media_state_directory || die "Could not prepare the media-control runtime directory."
-  trap 'exit 0' TERM INT
+  DAEMON_STOP_REQUESTED=0
+  trap daemon_signal TERM INT
   while true; do
     if ! acquire_lock 1; then
       sleep 1
@@ -3270,6 +3326,7 @@ daemon_action() {
       load_daemon_active
       if ! reconcile_runtime_configuration; then
         daemon_log "could not apply runtime configuration"
+        clear_daemon_routing || true
       elif ! power_controller; then
         daemon_log "no usable Bluetooth controller is available"
         clear_daemon_routing || true
@@ -3277,6 +3334,7 @@ daemon_action() {
         daemon_cycle
       fi
       release_lock
+      (( DAEMON_STOP_REQUESTED == 0 )) || return 0
       sleep "$CFG_RECONNECT_INTERVAL"
     else
       if [[ $CONFIG_ERROR != "$DAEMON_LAST_CONFIG_ERROR" ]]; then
@@ -3286,10 +3344,12 @@ daemon_action() {
       if (( DAEMON_HAVE_CONFIG )); then
         daemon_cycle || true
         release_lock
+        (( DAEMON_STOP_REQUESTED == 0 )) || return 0
         sleep "$CFG_RECONNECT_INTERVAL"
       else
         clear_daemon_routing_from_state || true
         release_lock
+        (( DAEMON_STOP_REQUESTED == 0 )) || return 0
         sleep 5
       fi
     fi
