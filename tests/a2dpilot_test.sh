@@ -846,6 +846,8 @@ test_update_source_selection_and_validation() {
     if valid_update_ref "$ref"; then fail "invalid update ref was accepted: $ref"; fi
   done
   valid_a2dpilot_version "$A2DPILOT_VERSION" || fail 'running version is invalid'
+  a2dpilot_version_is_older 0.2.0 "$A2DPILOT_VERSION" || \
+    fail 'pre-cleanup-cursor application version was not detected as older'
   a2dpilot_version_is_older 0.1.0 "$A2DPILOT_VERSION" || \
     fail 'pre-routing-state application version was not detected as older'
   a2dpilot_version_is_older 0.0.9 "$A2DPILOT_VERSION" || \
@@ -2932,6 +2934,78 @@ test_routing_cleanup_checkpoints_deadline_progress() {
   assert_file_contains "$ROUTING_STATE_FILE" $'stream\t'"$remaining_serial"$'\t89'
 }
 
+test_routing_cleanup_rotates_after_deadline() {
+  local user clock=100 first_id second_id
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  routing_now_seconds() { printf '%s\n' "$clock"; }
+  pipewire_instance_id() { printf '01234567-89ab-cdef-0123-456789abcdef:4321:987654\n'; }
+  enumerate_playback_streams() { printf '%s\n' '95 138' '96 139'; }
+  inspect_pipewire_node() {
+    printf '%s\n' "$2" >> "$TEST_SCRATCH/cleanup-streams"
+    clock=$((clock + ROUTING_TIMEOUT))
+    return 1
+  }
+  ROUTING_STATE_USER=$user
+  ROUTING_PIPEWIRE_INSTANCE=01234567-89ab-cdef-0123-456789abcdef:4321:987654
+  ROUTING_STREAM_TARGETS=([138]=89 [139]=89)
+  write_routing_state
+
+  if clear_owned_routing "$user"; then
+    fail 'deadline-exhausted cleanup reported success'
+  fi
+  clock=200
+  if clear_owned_routing "$user"; then
+    fail 'second deadline-exhausted cleanup reported success'
+  fi
+  first_id=$(sed -n '1p' "$TEST_SCRATCH/cleanup-streams")
+  second_id=$(sed -n '2p' "$TEST_SCRATCH/cleanup-streams")
+  [[ -n $first_id && -n $second_id && $first_id != "$second_id" ]] || \
+    fail 'routing cleanup retried the same blocking stream first'
+}
+
+test_pipewire_restart_during_target_cleanup() {
+  local user instance_queries
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  printf '0\n' > "$TEST_SCRATCH/cleanup-instance-queries"
+  routing_now_seconds() { printf '100\n'; }
+  pipewire_instance_id() {
+    instance_queries=$(< "$TEST_SCRATCH/cleanup-instance-queries")
+    instance_queries=$((instance_queries + 1))
+    printf '%s\n' "$instance_queries" > "$TEST_SCRATCH/cleanup-instance-queries"
+    if (( instance_queries == 1 )); then
+      printf '01234567-89ab-cdef-0123-456789abcdef:4321:987654\n'
+    else
+      printf 'fedcba98-7654-3210-fedc-ba9876543210:1234:567890\n'
+    fi
+  }
+  enumerate_playback_streams() { printf '95 138\n'; }
+  inspect_pipewire_node() {
+    PIPEWIRE_NODE_SERIAL=138
+    PIPEWIRE_NODE_NAME='Long-lived Player'
+    PIPEWIRE_NODE_CLASS=Stream/Output/Audio
+    PIPEWIRE_NODE_DRIVER=83
+  }
+  stream_target_serial() { printf '89\n'; }
+  bounded_user_pw_metadata() { : > "$TEST_SCRATCH/restarted-cleanup-deleted"; }
+  ROUTING_STATE_USER=$user
+  ROUTING_PIPEWIRE_INSTANCE=01234567-89ab-cdef-0123-456789abcdef:4321:987654
+  ROUTING_STREAM_TARGETS=([138]=89)
+  write_routing_state
+
+  clear_owned_routing "$user"
+  [[ ! -e $TEST_SCRATCH/restarted-cleanup-deleted ]] || \
+    fail 'cleanup deleted a target after PipeWire restarted'
+  assert_eq 2 "$(< "$TEST_SCRATCH/cleanup-instance-queries")"
+  [[ ! -e $ROUTING_STATE_FILE ]] || \
+    fail 'cleanup retained stream provenance from the prior PipeWire instance'
+}
+
 test_reconciliation_checkpoints_retired_stream() {
   local user mac=AA:BB:CC:DD:EE:FF
   setup_scratch_dir
@@ -4797,6 +4871,9 @@ run_test 'unchanged routing state is not replaced' \
   test_unchanged_routing_state_is_not_replaced
 run_test 'routing cleanup checkpoints deadline progress' \
   test_routing_cleanup_checkpoints_deadline_progress
+run_test 'routing cleanup rotates after deadline' test_routing_cleanup_rotates_after_deadline
+run_test 'PipeWire restart during target cleanup' \
+  test_pipewire_restart_during_target_cleanup
 run_test 'reconciliation checkpoints retired stream' \
   test_reconciliation_checkpoints_retired_stream
 run_test 'default cleanup revalidates and retires missing user' \

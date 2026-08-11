@@ -17,7 +17,7 @@ fi
 
 set -Eeuo pipefail
 
-A2DPILOT_VERSION=0.2.0
+A2DPILOT_VERSION=0.3.0
 SCRIPT_PATH=$(readlink -f -- "${BASH_SOURCE[0]}")
 INSTALLED_CLI=/usr/local/sbin/a2dpilot
 CONFIG_FILE=/etc/a2dpilot.conf
@@ -167,6 +167,7 @@ ROUTING_PENDING_DEFAULT_NAME=
 ROUTING_PIPEWIRE_INSTANCE=
 declare -gA ROUTING_STREAM_TARGETS=()
 declare -gA ROUTING_PENDING_STREAM_TARGETS=()
+ROUTING_CLEANUP_CURSOR=
 ROUTING_STREAM_CURSOR=
 ROUTING_MUTATION_CRITICAL=0
 ROUTING_MUTATION_SIGNAL_STATUS=0
@@ -2020,6 +2021,7 @@ apply_owned_stream_target() {
     ROUTING_PIPEWIRE_INSTANCE=
     ROUTING_STREAM_TARGETS=()
     ROUTING_PENDING_STREAM_TARGETS=()
+    ROUTING_CLEANUP_CURSOR=
     write_routing_state || result=1
     (( result != 0 )) || result=4
   elif ! remaining=$(routing_seconds_until_deadline "$deadline"); then
@@ -2042,7 +2044,7 @@ apply_owned_stream_target() {
 
 load_routing_state() {
   local kind first second extra have_user=0 have_default=0 have_pending_default=0
-  local have_instance=0 mac
+  local have_instance=0 have_cleanup_cursor=0 mac
   ROUTING_STATE_USER=
   ROUTING_STATE_SPEAKERS=()
   ROUTING_DEFAULT_NAME=
@@ -2050,6 +2052,7 @@ load_routing_state() {
   ROUTING_PIPEWIRE_INSTANCE=
   ROUTING_STREAM_TARGETS=()
   ROUTING_PENDING_STREAM_TARGETS=()
+  ROUTING_CLEANUP_CURSOR=
   [[ -e $ROUTING_STATE_FILE || -L $ROUTING_STATE_FILE ]] || return 0
   [[ -f $ROUTING_STATE_FILE && ! -L $ROUTING_STATE_FILE ]] || return 1
   while IFS=$'\t' read -r kind first second extra; do
@@ -2085,6 +2088,11 @@ load_routing_state() {
         ROUTING_PIPEWIRE_INSTANCE=${first,,}
         have_instance=1
         ;;
+      cleanup-cursor)
+        (( have_cleanup_cursor == 0 )) && [[ $first =~ ^[0-9]+$ && -z $second ]] || return 1
+        ROUTING_CLEANUP_CURSOR=$first
+        have_cleanup_cursor=1
+        ;;
       stream)
         [[ $first =~ ^[0-9]+$ && $second =~ ^[0-9]+$ && \
            ! ${ROUTING_STREAM_TARGETS[$first]+present} ]] || return 1
@@ -2105,13 +2113,16 @@ load_routing_state() {
   if (( ${#ROUTING_STREAM_TARGETS[@]} + ${#ROUTING_PENDING_STREAM_TARGETS[@]} > 0 )); then
     (( have_instance == 1 ))
   else
-    (( have_instance == 0 ))
+    (( have_instance == 0 && have_cleanup_cursor == 0 ))
   fi
 }
 
 write_routing_state() {
   local mac serial temp line content existing mode write_failed=0
   [[ -n $ROUTING_STATE_USER ]] || return 1
+  if (( ${#ROUTING_STREAM_TARGETS[@]} + ${#ROUTING_PENDING_STREAM_TARGETS[@]} == 0 )); then
+    ROUTING_CLEANUP_CURSOR=
+  fi
   if [[ -z $ROUTING_DEFAULT_NAME && -z $ROUTING_PENDING_DEFAULT_NAME &&
         ${#ROUTING_STREAM_TARGETS[@]} -eq 0 &&
         ${#ROUTING_PENDING_STREAM_TARGETS[@]} -eq 0 ]]; then
@@ -2125,6 +2136,7 @@ write_routing_state() {
   if (( ${#ROUTING_STREAM_TARGETS[@]} + ${#ROUTING_PENDING_STREAM_TARGETS[@]} > 0 )); then
     valid_pipewire_instance_id "$ROUTING_PIPEWIRE_INSTANCE" || return 1
   fi
+  [[ -z $ROUTING_CLEANUP_CURSOR || $ROUTING_CLEANUP_CURSOR =~ ^[0-9]+$ ]] || return 1
   [[ ! -e $ROUTING_STATE_FILE || -f $ROUTING_STATE_FILE && ! -L $ROUTING_STATE_FILE ]] || return 1
   printf -v content 'user\t%s' "$ROUTING_STATE_USER"
   for mac in "${!ROUTING_STATE_SPEAKERS[@]}"; do
@@ -2141,6 +2153,10 @@ write_routing_state() {
   fi
   if (( ${#ROUTING_STREAM_TARGETS[@]} + ${#ROUTING_PENDING_STREAM_TARGETS[@]} > 0 )); then
     printf -v line '\ninstance\t%s' "$ROUTING_PIPEWIRE_INSTANCE"
+    content+=$line
+  fi
+  if [[ -n $ROUTING_CLEANUP_CURSOR ]]; then
+    printf -v line '\ncleanup-cursor\t%s' "$ROUTING_CLEANUP_CURSOR"
     content+=$line
   fi
   if (( ${#ROUTING_STREAM_TARGETS[@]} > 0 )); then
@@ -2190,9 +2206,10 @@ routing_cleanup_seconds_until_deadline() {
 }
 
 clear_owned_routing_impl() {
-  local user=$1 deadline started remaining current current_instance result streams id serial extra
-  local owned pending failed=0
+  local user=$1 deadline started remaining current current_instance latest_instance
+  local result streams id serial extra owned pending failed=0 count index offset start=0
   local -A stream_ids=() owned_streams=()
+  local -a owned_serials=()
   load_routing_state || return 1
   [[ -n $ROUTING_STATE_USER ]] || return 0
   [[ $ROUTING_STATE_USER == "$user" ]] || return 1
@@ -2203,6 +2220,7 @@ clear_owned_routing_impl() {
     ROUTING_STATE_SPEAKERS=()
     ROUTING_STREAM_TARGETS=()
     ROUTING_PENDING_STREAM_TARGETS=()
+    ROUTING_CLEANUP_CURSOR=
     write_routing_state || return 1
     return 0
   fi
@@ -2267,6 +2285,7 @@ clear_owned_routing_impl() {
       ROUTING_STREAM_TARGETS=()
       ROUTING_PENDING_STREAM_TARGETS=()
       ROUTING_PIPEWIRE_INSTANCE=
+      ROUTING_CLEANUP_CURSOR=
     else
       remaining=$(routing_cleanup_seconds_until_deadline "$deadline") || return 1
       streams=$(enumerate_playback_streams "$user" "$remaining") || {
@@ -2284,7 +2303,17 @@ clear_owned_routing_impl() {
       fi
       for serial in "${!ROUTING_STREAM_TARGETS[@]}"; do owned_streams[$serial]=1; done
       for serial in "${!ROUTING_PENDING_STREAM_TARGETS[@]}"; do owned_streams[$serial]=1; done
-      for serial in "${!owned_streams[@]}"; do
+      for serial in "${!owned_streams[@]}"; do owned_serials+=("$serial"); done
+      count=${#owned_serials[@]}
+      for ((index = 0; index < count; index++)); do
+        if [[ ${owned_serials[$index]} == "$ROUTING_CLEANUP_CURSOR" ]]; then
+          start=$(((index + 1) % count))
+          break
+        fi
+      done
+      for ((offset = 0; offset < count; offset++)); do
+        index=$(((start + offset) % count))
+        serial=${owned_serials[$index]}
         id=${stream_ids[$serial]:-}
         if [[ -z $id ]]; then
           unset "ROUTING_STREAM_TARGETS[$serial]"
@@ -2292,6 +2321,8 @@ clear_owned_routing_impl() {
           continue
         fi
         remaining=$(routing_cleanup_seconds_until_deadline "$deadline") || return 1
+        ROUTING_CLEANUP_CURSOR=$serial
+        write_routing_state || return 1
         if ! inspect_pipewire_node "$user" "$id" "$remaining"; then
           failed=1
           continue
@@ -2336,6 +2367,19 @@ clear_owned_routing_impl() {
                 failed=1
               fi
               continue
+            fi
+            remaining=$(routing_cleanup_seconds_until_deadline "$deadline") || return 1
+            if ! latest_instance=$(pipewire_instance_id "$user" "$remaining"); then
+              failed=1
+              break
+            fi
+            if [[ $latest_instance != "$ROUTING_PIPEWIRE_INSTANCE" ]]; then
+              ROUTING_PIPEWIRE_INSTANCE=
+              ROUTING_STREAM_TARGETS=()
+              ROUTING_PENDING_STREAM_TARGETS=()
+              ROUTING_CLEANUP_CURSOR=
+              write_routing_state || failed=1
+              break
             fi
             remaining=$(routing_cleanup_seconds_until_deadline "$deadline") || return 1
             if bounded_user_pw_metadata "$user" "$remaining" \
@@ -2500,6 +2544,7 @@ reconcile_speaker_routing_impl() {
           $ROUTING_PIPEWIRE_INSTANCE != "$current_instance" ]]; then
       ROUTING_STREAM_TARGETS=()
       ROUTING_PENDING_STREAM_TARGETS=()
+      ROUTING_CLEANUP_CURSOR=
     fi
     ROUTING_PIPEWIRE_INSTANCE=$current_instance
   fi
