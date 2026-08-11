@@ -2481,7 +2481,7 @@ EOF
         ;;
       set-default)
         assert_file_contains "$ROUTING_STATE_FILE" \
-          $'default\tbluez_output.AA_BB_CC_DD_EE_FF.1'
+          $'default-pending\tbluez_output.AA_BB_CC_DD_EE_FF.1' || return 1
         default_sink=bluez_output.AA_BB_CC_DD_EE_FF.1
         printf 'set-default %s\n' "$4" >> "$TEST_SCRATCH/routing.log"
         ;;
@@ -2499,7 +2499,7 @@ EOF
       stream_target=
       printf 'clear-target 95\n' >> "$TEST_SCRATCH/routing.log"
     elif [[ $* == *'95 target.object 89 Spa:Id'* ]]; then
-      assert_file_contains "$ROUTING_STATE_FILE" $'stream\t138\t89'
+      assert_file_contains "$ROUTING_STATE_FILE" $'stream-pending\t138\t89' || return 1
       stream_target=89
       stream_driver=83
       printf 'set-target 95 89\n' >> "$TEST_SCRATCH/routing.log"
@@ -2624,6 +2624,89 @@ test_routing_write_failure_prevents_mutation() {
     fail 'routing metadata changed after its provenance write failed'
   [[ -z $(find "$STATE_DIR" -maxdepth 1 -name '.routing-overrides.*' -print -quit) ]] || \
     fail 'failed routing-state write retained its temporary file'
+}
+
+test_interrupted_routing_transition_preserves_prior_owner() {
+  local user mac=AA:BB:CC:DD:EE:FF sink_name=bluez_output.AA_BB_CC_DD_EE_FF.1
+  local default_sink=bluez_output.OLD_SPEAKER.1 stream_target=77 stream_driver=35
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  CFG_AUDIO_USER=$user
+  now_seconds() { printf '100\n'; }
+  find_a2dp_node_id() { printf '83\n'; }
+  pipewire_instance_id() { printf '01234567-89ab-cdef-0123-456789abcdef:4321:987654\n'; }
+  configured_default_sink() {
+    [[ -n $default_sink ]] || return 2
+    printf '%s\n' "$default_sink"
+  }
+  inspect_pipewire_node() {
+    case $2 in
+      83)
+        PIPEWIRE_NODE_SERIAL=89
+        PIPEWIRE_NODE_NAME=$sink_name
+        PIPEWIRE_NODE_CLASS=Audio/Sink
+        PIPEWIRE_NODE_DRIVER=
+        ;;
+      95)
+        PIPEWIRE_NODE_SERIAL=138
+        PIPEWIRE_NODE_NAME='Long-lived Player'
+        PIPEWIRE_NODE_CLASS=Stream/Output/Audio
+        PIPEWIRE_NODE_DRIVER=$stream_driver
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  bounded_user_wpctl() {
+    case $3 in
+      set-default) return 1 ;;
+      clear-default) default_sink= ;;
+    esac
+  }
+  enumerate_playback_streams() { printf '95 138\n'; }
+  stream_target_serial() {
+    [[ -n $stream_target ]] || return 2
+    printf '%s\n' "$stream_target"
+  }
+  bounded_user_pw_metadata() {
+    if [[ $* == *'-d -n default 95 target.object'* ]]; then
+      stream_target=
+    else
+      return 1
+    fi
+  }
+
+  ROUTING_STATE_USER=$user
+  ROUTING_DEFAULT_NAME=$default_sink
+  write_routing_state
+  if reconcile_speaker_routing "$mac"; then
+    fail 'failed default transition reported routing success'
+  fi
+  assert_file_contains "$ROUTING_STATE_FILE" $'default\tbluez_output.OLD_SPEAKER.1'
+  assert_file_contains "$ROUTING_STATE_FILE" \
+    $'default-pending\tbluez_output.AA_BB_CC_DD_EE_FF.1'
+  clear_owned_routing "$user"
+  [[ -z $default_sink && ! -e $ROUTING_STATE_FILE ]] || \
+    fail 'cleanup lost the prior default owner after an interrupted transition'
+
+  default_sink=$sink_name
+  stream_target=77
+  ROUTING_STATE_USER=$user
+  ROUTING_DEFAULT_NAME=$sink_name
+  ROUTING_PENDING_DEFAULT_NAME=
+  ROUTING_PIPEWIRE_INSTANCE=01234567-89ab-cdef-0123-456789abcdef:4321:987654
+  ROUTING_STREAM_TARGETS=([138]=77)
+  ROUTING_PENDING_STREAM_TARGETS=()
+  write_routing_state
+  if reconcile_speaker_routing "$mac"; then
+    fail 'failed stream transition reported routing success'
+  fi
+  assert_file_contains "$ROUTING_STATE_FILE" $'stream\t138\t77'
+  assert_file_contains "$ROUTING_STATE_FILE" $'stream-pending\t138\t89'
+  clear_owned_routing "$user"
+  [[ -z $default_sink && -z $stream_target && ! -e $ROUTING_STATE_FILE ]] || \
+    fail 'cleanup lost the prior stream owner after an interrupted transition'
 }
 
 test_unmovable_stream_does_not_starve_routing() {
@@ -3753,6 +3836,8 @@ run_test 'PipeWire codec property parsing' test_codec_property_parsing
 run_test 'PipeWire routing parsers' test_pipewire_routing_parsers
 run_test 'default routing and owned cleanup' test_default_routing_and_owned_cleanup
 run_test 'routing write failure prevents mutation' test_routing_write_failure_prevents_mutation
+run_test 'interrupted routing transition preserves prior owner' \
+  test_interrupted_routing_transition_preserves_prior_owner
 run_test 'unmovable stream does not starve routing' test_unmovable_stream_does_not_starve_routing
 run_test 'vanished stream does not starve routing' test_vanished_stream_does_not_starve_routing
 run_test 'recycled stream is not targeted' test_recycled_stream_is_not_targeted
