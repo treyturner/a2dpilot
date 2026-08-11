@@ -321,12 +321,18 @@ The regression suite requires no root access, packages, Bluetooth hardware, or s
 Run the same checks as CI:
 
 ```sh
-bash -n a2dpilot tests/a2dpilot_test.sh
-shellcheck -x a2dpilot tests/a2dpilot_test.sh
+bash -n a2dpilot tests/a2dpilot_test.sh tests/run_shellcheck.sh
+./tests/run_shellcheck.sh
 ./tests/a2dpilot_test.sh
 ```
 
-GitHub Actions runs these checks for pull requests and pushes to `main`.
+ShellCheck is pinned in `.shellcheck-version`. The wrapper rejects a missing or
+different local version so developer checks use the same analyzer as CI. Exact
+release binaries are available from the
+[ShellCheck releases](https://github.com/koalaman/shellcheck/releases).
+
+GitHub Actions downloads and checksum-verifies the pinned upstream release,
+then runs these checks for pull requests and pushes to `main`.
 
 ## Troubleshooting
 
