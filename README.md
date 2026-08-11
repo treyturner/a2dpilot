@@ -13,6 +13,7 @@ The project is delivered as one Bash program. The same `a2dpilot` file installs 
 - BlueZ, PipeWire A2DP, and optional AVRCP health checks.
 - Automatic codec negotiation through PipeWire, including SBC, SBC-XQ, aptX, aptX HD, and LDAC when supported by the speaker.
 - Responsive media-key routing with broad Linux transport-key coverage, relative volume control, configurable HTTP(S) URLs, and one bounded action deadline.
+- Reversible live suppression of Raspberry Pi onboard analogue and HDMI audio devices without disabling HDMI video.
 - Safe configuration editing and validation through the CLI.
 - Atomic executable-only updates from `main`, a branch, a tag, or an exact commit.
 - Headless PipeWire/WirePlumber operation using systemd linger.
@@ -43,7 +44,7 @@ Managed files are:
 | `/usr/local/sbin/a2dpilot`                             | Installed CLI, daemon, and player-control implementation                          |
 | `/etc/a2dpilot.conf`                                   | All user-facing A2DPilot configuration                                            |
 | `/etc/systemd/system/a2dpilot.service`                 | Connection-maintenance daemon                                                     |
-| `/etc/wireplumber/wireplumber.conf.d/51-a2dpilot.conf` | Disables seat monitoring for a dedicated headless audio session                   |
+| `/etc/wireplumber/wireplumber.conf.d/51-a2dpilot.conf` | Headless Bluetooth policy and optional Raspberry Pi onboard-audio suppression     |
 | `/etc/triggerhappy/triggers.d/a2dpilot.conf`           | Media-key mappings, or an inert file when controls are disabled                   |
 | `/var/lib/a2dpilot/`                                   | Root-only backups, rollback metadata, user snapshots, and created-bond provenance |
 
@@ -134,6 +135,8 @@ audio-user = pi
 controller = auto
 reconnect-interval = 5
 media-controls = auto
+onboard-analog = enabled
+onboard-hdmi = enabled
 base-url = http://127.0.0.1:32500
 
 media-key = KEY_PLAYPAUSE player/playback/playPause?type=music&commandID={command-id}
@@ -168,7 +171,7 @@ Open it safely with:
 sudo a2dpilot config
 ```
 
-A2DPilot opens a temporary copy using `SUDO_EDITOR`, `VISUAL`, `EDITOR`, or the system `editor`. The editor runs as the invoking user rather than root. When it closes, A2DPilot validates the candidate, installs it atomically, applies audio-user and media-control changes, and restarts the affected services. An invalid edit never replaces the working file.
+A2DPilot opens a temporary copy using `SUDO_EDITOR`, `VISUAL`, `EDITOR`, or the system `editor`. The editor runs as the invoking user rather than root. When it closes, A2DPilot validates the candidate, installs it atomically, applies audio-user, media-control, and onboard-audio changes, and restarts the affected services. An invalid edit never replaces the working file.
 
 Validate without editing:
 
@@ -177,6 +180,23 @@ sudo a2dpilot config --check
 ```
 
 The format supports blank lines, full-line `#` comments, whitespace around `=`, repeated `speaker` and `media-key` entries, and no shell evaluation. Unknown settings, duplicated scalar settings, duplicated speakers, and duplicated media keys are rejected.
+
+### Raspberry Pi onboard audio
+
+The optional `onboard-analog` and `onboard-hdmi` settings accept `enabled` or `disabled`. If either setting is omitted, it defaults to `enabled`, so existing configurations and non-Raspberry Pi systems retain their normal audio devices.
+
+The same policies can be inspected or changed without opening an editor:
+
+```sh
+sudo a2dpilot audio onboard status
+sudo a2dpilot audio onboard disable analog
+sudo a2dpilot audio onboard disable hdmi
+sudo a2dpilot audio onboard enable all
+```
+
+The optional selector is `analog`, `hdmi`, or `all`; omitting it means `all`. A change atomically updates `/etc/a2dpilot.conf`, regenerates the managed WirePlumber fragment, restarts the configured user's WirePlumber session, and lets the daemon reconnect Bluetooth normally. Failed validation or application restores the prior configuration and runtime policy.
+
+Suppression uses [WirePlumber's ALSA device rules](https://pipewire.pages.freedesktop.org/wireplumber/daemon/configuration/alsa.html) and is deliberately narrow. The rules require an internal ALSA card whose reported card name begins with `bcm2835` for analogue audio or `vc4-hdmi` for HDMI audio. USB interfaces and audio HATs are not hidden merely because they are present. The command changes live audio-device visibility only: it does not edit boot firmware, unload drivers, disable HDMI video, or require a reboot. On other hardware the rules normally match nothing, and status reports zero visible matching devices.
 
 ### Speaker priority
 
@@ -232,9 +252,10 @@ The default volume mappings use `{volume-up}`, `{volume-down}`, and `{mute-toggl
 ```sh
 sudo a2dpilot devices
 sudo a2dpilot status
+sudo a2dpilot audio onboard status
 ```
 
-`devices` prints priority, pairing, trust, BlueZ connection, A2DP, AVRCP, negotiated codec, and device name for every configured speaker. `status` adds installation, controller, rfkill, base URL, media-key count, system-service, and audio-user service diagnostics.
+`devices` prints priority, pairing, trust, BlueZ connection, A2DP, AVRCP, negotiated codec, and device name for every configured speaker. `status` adds installation, controller, rfkill, base URL, media-key count, onboard-audio policy and visibility, system-service, and audio-user service diagnostics.
 
 ### Add or repair speakers
 
@@ -312,7 +333,7 @@ aptX Adaptive is not currently exposed by this PipeWire stack. Although the LC3 
 - Install records its managed-state rollback snapshot before APT and service mutations. A failed or interrupted installation invokes uninstall automatically; APT-managed packages are retained, and a failed rollback keeps the snapshot for recovery.
 - Update preserves that snapshot and replaces only the installed executable; an active daemon is restarted, while an inactive daemon remains stopped.
 - Pairing happens after installation commits, so a speaker being unavailable does not erase a valid system setup.
-- The system-wide WirePlumber fragment only disables seat monitoring. It deliberately does not override `bluez5.codecs`.
+- The system-wide WirePlumber fragment disables seat monitoring and, when requested, hides narrowly matched Raspberry Pi onboard ALSA devices. It deliberately does not override `bluez5.codecs`.
 
 ## Tests
 
@@ -422,7 +443,18 @@ Run:
 sudo a2dpilot config --check
 ```
 
-The error includes the file and line when possible. Use one instance of every required scalar key, a valid local `audio-user`, `auto` or a controller MAC, a positive interval, `auto|required|off`, unique speaker MAC addresses, and unique `KEY_*` media mappings. A relative mapping needs `base-url`; an absolute mapping must use HTTP(S). The accepted URL placeholders are `{command-id}`, `{volume-up}`, `{volume-down}`, `{mute-toggle}`, `{shuffle-toggle}`, and `{repeat-cycle}`; stateful placeholders require `base-url` and cannot be mixed in one mapping.
+The error includes the file and line when possible. Use one instance of every required scalar key, a valid local `audio-user`, `auto` or a controller MAC, a positive interval, `auto|required|off`, optional `enabled|disabled` onboard-audio policies, unique speaker MAC addresses, and unique `KEY_*` media mappings. A relative mapping needs `base-url`; an absolute mapping must use HTTP(S). The accepted URL placeholders are `{command-id}`, `{volume-up}`, `{volume-down}`, `{mute-toggle}`, `{shuffle-toggle}`, and `{repeat-cycle}`; stateful placeholders require `base-url` and cannot be mixed in one mapping.
+
+### An onboard audio device did not disappear
+
+Check the configured policy and the currently visible matches:
+
+```sh
+sudo a2dpilot audio onboard status
+sudo journalctl -b --user-unit=wireplumber.service
+```
+
+The rule intentionally ignores USB and HAT devices and only matches internal Raspberry Pi cards reported with `bcm2835*` or `vc4-hdmi*` ALSA card names. A zero count may mean that the hardware is absent, already hidden by the configured policy, or reported under a different name. Re-enable both classes with `sudo a2dpilot audio onboard enable`.
 
 ### Installation or uninstall failed
 
