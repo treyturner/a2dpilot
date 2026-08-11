@@ -2008,11 +2008,17 @@ test_status_reports_media_url_configuration() {
   systemctl() { :; }
   as_user_systemctl() { :; }
   bounded_user_pw_cli() { :; }
+  configured_default_sink() { return 1; }
   output=$(status_action)
   assert_contains "$output" 'Base URL: http://127.0.0.1:32500'
   assert_contains "$output" 'Media key mappings: 4'
   assert_contains "$output" 'Onboard analog: enabled (0 visible matching devices)'
   assert_contains "$output" 'Onboard HDMI: enabled (0 visible matching devices)'
+  assert_contains "$output" 'Configured audio default: unknown'
+
+  configured_default_sink() { return 2; }
+  output=$(print_routing_status)
+  assert_contains "$output" 'Configured audio default: none'
 }
 
 test_pairing_provenance_and_existing_bond() {
@@ -2500,6 +2506,12 @@ EOF
     printf '%s\n' "update: id:95 key:'target.object' value:'89' type:'Spa:Id'"
   }
   assert_eq 89 "$(stream_target_serial audio 95 3)"
+  bounded_user_pw_metadata() { printf 'malformed metadata output\n'; }
+  if configured_default_sink audio 3; then
+    fail 'malformed configured-default metadata was accepted as absent'
+  else
+    assert_eq 1 "$?"
+  fi
 
   bounded_user_pw_cli() {
     printf '%s\n' $'\tid 95, type PipeWire:Interface:Node/3' \
@@ -3147,11 +3159,12 @@ test_cli_signal_defers_during_routing_cleanup() {
   fi
   assert_eq 143 "$result"
   assert_eq 0 "$ROUTING_MUTATION_CRITICAL"
-  [[ -z $(trap -p INT) && -z $(trap -p TERM) ]] || \
+  [[ -z $(trap -p HUP) && -z $(trap -p INT) && -z $(trap -p TERM) ]] || \
     fail 'CLI cleanup retained its temporary signal traps'
   [[ ! -e $ROUTING_STATE_FILE ]] || \
     fail 'signaled CLI default cleanup retained stale provenance'
 
+  DAEMON_STOP_REQUESTED=0
   ROUTING_STATE_USER=$user
   ROUTING_PIPEWIRE_INSTANCE=01234567-89ab-cdef-0123-456789abcdef:4321:987654
   ROUTING_STREAM_TARGETS=([138]=89)
@@ -3178,10 +3191,33 @@ test_cli_signal_defers_during_routing_cleanup() {
   fi
   assert_eq 130 "$result"
   assert_eq 0 "$ROUTING_MUTATION_CRITICAL"
-  [[ -z $(trap -p INT) && -z $(trap -p TERM) ]] || \
+  [[ -z $(trap -p HUP) && -z $(trap -p INT) && -z $(trap -p TERM) ]] || \
     fail 'CLI cleanup retained its temporary signal traps'
   [[ ! -e $ROUTING_STATE_FILE ]] || \
     fail 'signaled CLI stream cleanup retained stale provenance'
+
+  DAEMON_STOP_REQUESTED=0
+  ROUTING_STATE_USER=$user
+  ROUTING_DEFAULT_NAME=alsa_output.builtin
+  ROUTING_PIPEWIRE_INSTANCE=
+  ROUTING_STREAM_TARGETS=()
+  write_routing_state
+  default_sink=alsa_output.builtin
+  configured_default_sink() { printf '%s\n' "$default_sink"; }
+  bounded_user_wpctl() {
+    default_sink=
+    kill -HUP "$BASHPID"
+  }
+  if clear_owned_routing "$user"; then
+    fail 'HUP-signaled CLI cleanup reported success'
+  else
+    result=$?
+  fi
+  assert_eq 129 "$result"
+  [[ -z $(trap -p HUP) && -z $(trap -p INT) && -z $(trap -p TERM) ]] || \
+    fail 'HUP-signaled cleanup retained its temporary signal traps'
+  [[ ! -e $ROUTING_STATE_FILE ]] || \
+    fail 'HUP-signaled cleanup retained stale provenance'
 }
 
 test_runtime_reconciliation_failure_clears_routing() {
@@ -3272,6 +3308,10 @@ EOF
     printf 'target %s\n' "$5" >> "$TEST_SCRATCH/routing-targets"
   }
 
+  ROUTING_STATE_USER=$user
+  ROUTING_STATE_SPEAKERS=([11:22:33:44:55:66]=1)
+  ROUTING_DEFAULT_NAME=bluez_output.11_22_33_44_55_66.1
+  write_routing_state
   set +e
   output=$(reconcile_speaker_routing "$mac" 2>&1)
   rc=$?
@@ -3282,6 +3322,8 @@ EOF
   assert_file_contains "$TEST_SCRATCH/routing-targets" 'target 96'
   [[ -e $TEST_SCRATCH/second-stream-routed ]] || \
     fail 'movable stream was not verified after the pinned stream'
+  assert_file_contains "$ROUTING_STATE_FILE" $'speaker\tAA:BB:CC:DD:EE:FF'
+  assert_file_not_contains "$ROUTING_STATE_FILE" $'speaker\t11:22:33:44:55:66'
 }
 
 test_vanished_stream_does_not_starve_routing() {

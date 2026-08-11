@@ -169,6 +169,7 @@ declare -gA ROUTING_PENDING_STREAM_TARGETS=()
 ROUTING_STREAM_CURSOR=
 ROUTING_MUTATION_CRITICAL=0
 ROUTING_MUTATION_SIGNAL_STATUS=0
+ROUTING_MUTATION_OWNS_HUP_TRAP=0
 ROUTING_MUTATION_OWNS_INT_TRAP=0
 ROUTING_MUTATION_OWNS_TERM_TRAP=0
 DAEMON_STOP_REQUESTED=0
@@ -1848,7 +1849,8 @@ configured_default_sink() {
     printf '%s\n' "$name"
     return 0
   done <<< "$output"
-  return 2
+  [[ -z $output ]] && return 2
+  return 1
 }
 
 stream_target_serial() {
@@ -1894,12 +1896,18 @@ routing_state_mentions_speaker() {
 
 routing_mutation_signal() {
   ROUTING_MUTATION_SIGNAL_STATUS=$1
+  DAEMON_STOP_REQUESTED=1
 }
 
 begin_routing_cleanup() {
   ROUTING_MUTATION_SIGNAL_STATUS=0
+  ROUTING_MUTATION_OWNS_HUP_TRAP=0
   ROUTING_MUTATION_OWNS_INT_TRAP=0
   ROUTING_MUTATION_OWNS_TERM_TRAP=0
+  if [[ -z $(trap -p HUP) ]]; then
+    trap 'routing_mutation_signal 129' HUP
+    ROUTING_MUTATION_OWNS_HUP_TRAP=1
+  fi
   if [[ -z $(trap -p INT) ]]; then
     trap 'routing_mutation_signal 130' INT
     ROUTING_MUTATION_OWNS_INT_TRAP=1
@@ -1913,11 +1921,13 @@ begin_routing_cleanup() {
 
 end_routing_cleanup() {
   local signal_status
+  (( ROUTING_MUTATION_OWNS_HUP_TRAP == 0 )) || trap - HUP
   (( ROUTING_MUTATION_OWNS_INT_TRAP == 0 )) || trap - INT
   (( ROUTING_MUTATION_OWNS_TERM_TRAP == 0 )) || trap - TERM
   ROUTING_MUTATION_CRITICAL=0
   signal_status=$ROUTING_MUTATION_SIGNAL_STATUS
   ROUTING_MUTATION_SIGNAL_STATUS=0
+  ROUTING_MUTATION_OWNS_HUP_TRAP=0
   ROUTING_MUTATION_OWNS_INT_TRAP=0
   ROUTING_MUTATION_OWNS_TERM_TRAP=0
   (( signal_status == 0 )) || return "$signal_status"
@@ -2445,6 +2455,11 @@ reconcile_speaker_routing() {
     [[ ${seen_streams[$serial]+present} ]] || \
       unset "ROUTING_PENDING_STREAM_TARGETS[$serial]"
   done
+  if (( routing_failed == 0 )); then
+    # Ownership has moved even if a client has not relinked to its new target.
+    ROUTING_STATE_SPEAKERS=()
+    ROUTING_STATE_SPEAKERS[$mac]=1
+  fi
   write_routing_state || return 1
 
   # Apply every stream target before waiting for clients to relink. Verify the
@@ -2476,11 +2491,6 @@ reconcile_speaker_routing() {
   done
   if (( ${#pending_streams[@]} > 0 )); then
     routing_failed=1
-  fi
-  if (( routing_failed == 0 )); then
-    ROUTING_STATE_SPEAKERS=()
-    ROUTING_STATE_SPEAKERS[$mac]=1
-    write_routing_state || return 1
   fi
   (( routing_failed == 0 ))
 }
@@ -3153,7 +3163,7 @@ forget_action() {
     clear_owned_routing "$routing_user" || {
       result=$?
       release_lock
-      (( result != 130 && result != 143 )) || return "$result"
+      (( result != 129 && result != 130 && result != 143 )) || return "$result"
       die "Could not clear audio routing for $mac; device configuration was left unchanged."
     }
   fi
@@ -4131,7 +4141,7 @@ devices_action() {
 
 print_routing_status() {
   local active_mac='' active_node='' active_name=none default_name=none
-  local streams id serial extra off_active=0 inspection_failed=0
+  local streams id serial extra result off_active=0 inspection_failed=0
   if [[ -f $STATE_DIR/active-speaker && ! -L $STATE_DIR/active-speaker ]]; then
     IFS= read -r active_mac < "$STATE_DIR/active-speaker" || active_mac=
     valid_mac "$active_mac" || active_mac=
@@ -4143,7 +4153,13 @@ print_routing_status() {
       active_name=$PIPEWIRE_NODE_NAME
     fi
   fi
-  default_name=$(configured_default_sink "$CFG_AUDIO_USER" "$ROUTING_TIMEOUT" 2>/dev/null || printf none)
+  if default_name=$(configured_default_sink \
+    "$CFG_AUDIO_USER" "$ROUTING_TIMEOUT" 2>/dev/null); then
+    :
+  else
+    result=$?
+    if (( result == 2 )); then default_name=none; else default_name=unknown; fi
+  fi
   note "Active managed sink: $active_name"
   note "Configured audio default: $default_name"
   if [[ $active_node =~ ^[0-9]+$ ]]; then
@@ -4637,7 +4653,7 @@ uninstall_action() {
         warn "Could not fully clear A2DPilot-owned audio routing overrides."
         write_state_file failed || warn "Could not mark the retained installation snapshot as failed."
         release_lock
-        (( result != 130 && result != 143 )) || return "$result"
+        (( result != 129 && result != 130 && result != 143 )) || return "$result"
         die "Rollback was incomplete; recovery state remains at $STATE_DIR."
       }
     fi
