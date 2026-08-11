@@ -1965,11 +1965,12 @@ end_routing_cleanup() {
 
 apply_owned_stream_target() {
   local user=$1 id=$2 serial=$3 sink=$4 target=$5 sink_name=$6 deadline=$7
-  local remaining result=0
+  local remaining current_instance result=0
   local previous_critical=$ROUTING_MUTATION_CRITICAL
   [[ $id =~ ^[0-9]+$ && $serial =~ ^[0-9]+$ && $sink =~ ^[0-9]+$ &&
      $target =~ ^[0-9]+$ ]] || return 1
   valid_pipewire_name "$sink_name" || return 1
+  valid_pipewire_instance_id "$ROUTING_PIPEWIRE_INSTANCE" || return 1
   ROUTING_MUTATION_CRITICAL=1
   ROUTING_PENDING_STREAM_TARGETS[$serial]=$target
   if ! write_routing_state; then
@@ -2000,6 +2001,23 @@ apply_owned_stream_target() {
           $PIPEWIRE_NODE_SERIAL != "$target" ||
           $PIPEWIRE_NODE_NAME != "$sink_name" ]]; then
     unset "ROUTING_PENDING_STREAM_TARGETS[$serial]"
+    write_routing_state || result=1
+    (( result != 0 )) || result=4
+  elif ! remaining=$(routing_seconds_until_deadline "$deadline"); then
+    unset "ROUTING_PENDING_STREAM_TARGETS[$serial]"
+    write_routing_state || true
+    result=1
+  elif ! current_instance=$(pipewire_instance_id "$user" "$remaining"); then
+    unset "ROUTING_PENDING_STREAM_TARGETS[$serial]"
+    write_routing_state || true
+    result=1
+  elif [[ $current_instance != "$ROUTING_PIPEWIRE_INSTANCE" ]]; then
+    ROUTING_DEFAULT_NAME=
+    ROUTING_PENDING_DEFAULT_NAME=
+    ROUTING_PIPEWIRE_INSTANCE=
+    ROUTING_STATE_SPEAKERS=()
+    ROUTING_STREAM_TARGETS=()
+    ROUTING_PENDING_STREAM_TARGETS=()
     write_routing_state || result=1
     (( result != 0 )) || result=4
   elif ! remaining=$(routing_seconds_until_deadline "$deadline"); then
