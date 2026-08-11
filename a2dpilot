@@ -2998,7 +2998,7 @@ pair_action() {
 forget_action() {
   require_root
   [[ -f $STATE_FILE ]] || die "A2DPilot is not installed."
-  local mac='' assume_yes=0 answer active_speaker='' result
+  local mac='' assume_yes=0 answer active_speaker='' routing_user='' result
   while [[ $# -gt 0 ]]; do
     case $1 in
       --yes) assume_yes=1; shift ;;
@@ -3033,12 +3033,22 @@ forget_action() {
       release_lock
       die "Could not safely read the active-speaker state."
     fi
+    load_routing_state || {
+      release_lock
+      die "Could not safely read the audio-routing state."
+    }
+    routing_user=$ROUTING_STATE_USER
   fi
   if [[ $active_speaker == "$mac" ]]; then
-    clear_owned_routing "$CFG_AUDIO_USER" || {
+    routing_user=$CFG_AUDIO_USER
+  fi
+  if [[ -n $routing_user ]]; then
+    clear_owned_routing "$routing_user" || {
       release_lock
       die "Could not clear audio routing for $mac; device configuration was left unchanged."
     }
+  fi
+  if [[ $active_speaker == "$mac" ]]; then
     remember_daemon_active '' || {
       release_lock
       die "Could not clear active-speaker state for $mac; device configuration was left unchanged."

@@ -2275,6 +2275,35 @@ test_forget_removes_config_and_provenance() {
     fail 'forgotten active speaker retained daemon state'
 }
 
+test_forget_clears_routing_without_active_state() {
+  local user mac=AA:BB:CC:DD:EE:FF
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  write_test_config "$CONFIG_FILE" "$user" "$mac"
+  : > "$STATE_FILE"
+  ROUTING_STATE_USER=$user
+  ROUTING_DEFAULT_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
+  write_routing_state
+  require_root() { :; }
+  acquire_lock() { :; }
+  release_lock() { :; }
+  atomic_install_file() { cp "$1" "$2"; }
+  clear_owned_routing() {
+    printf '%s\n' "$1" > "$TEST_SCRATCH/forget-routing-user"
+    rm -f -- "$ROUTING_STATE_FILE"
+  }
+  disconnect_bluetooth_device() { :; }
+  device_info() { return 1; }
+  systemctl() { :; }
+
+  forget_action "$mac" --yes
+  assert_eq "$user" "$(< "$TEST_SCRATCH/forget-routing-user")"
+  [[ ! -e $ROUTING_STATE_FILE ]] || \
+    fail 'forget retained routing provenance when active-speaker state was absent'
+}
+
 test_forget_retains_active_speaker_after_routing_cleanup_failure() {
   local user mac=AA:BB:CC:DD:EE:FF output rc
   setup_scratch_dir
@@ -4026,6 +4055,8 @@ run_test 'pairing session terminates after bonding' test_pairing_session_termina
 run_test 'pair --all attempts every configured speaker' test_pair_all_attempts_every_configured_speaker
 run_test 'interactive scan selection' test_interactive_scan_selection
 run_test 'forget removes config and provenance' test_forget_removes_config_and_provenance
+run_test 'forget clears routing without active state' \
+  test_forget_clears_routing_without_active_state
 run_test 'forget retains active speaker after routing cleanup failure' \
   test_forget_retains_active_speaker_after_routing_cleanup_failure
 run_test 'media-control health modes' test_media_control_health_modes
