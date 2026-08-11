@@ -887,10 +887,14 @@ as_user_systemctl() {
     DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus" systemctl --user "$@"
 }
 
+valid_timeout_duration() {
+  [[ $1 =~ ^[0-9]+([.][0-9]+)?$ && ! $1 =~ ^0+([.]0+)?$ ]]
+}
+
 bounded_user_pipewire_command() {
   local user=$1 seconds=$2 command=$3 uid runtime home
   shift 3
-  [[ $seconds =~ ^[1-9][0-9]*$ ]] || return 1
+  valid_timeout_duration "$seconds" || return 1
   case $command in
     pw-cli|pw-metadata|wpctl) ;;
     *) return 1 ;;
@@ -924,7 +928,7 @@ bounded_user_pw_metadata() {
 bounded_user_systemctl() {
   local user=$1 seconds=$2 uid runtime home
   shift 2
-  [[ $seconds =~ ^[1-9][0-9]*$ ]] || return 1
+  valid_timeout_duration "$seconds" || return 1
   uid=$(id -u "$user")
   runtime=/run/user/$uid
   home=$(user_home "$user")
@@ -1710,7 +1714,7 @@ device_name_on_controller() {
 
 find_a2dp_node_id() {
   local mac=$1 seconds=${2:-$CONNECT_TIMEOUT} mac_key line node
-  [[ $seconds =~ ^[1-9][0-9]*$ ]] || return 1
+  valid_timeout_duration "$seconds" || return 1
   mac_key=${mac//:/_}
   line=$(bounded_user_wpctl "$CFG_AUDIO_USER" "$seconds" status --name 2>/dev/null | \
     grep -Fm1 "bluez_output.${mac_key}." || true)
@@ -1752,7 +1756,7 @@ valid_pipewire_instance_id() {
 
 pipewire_instance_id() {
   local user=$1 seconds=$2 pid boot_id stat_line stat_fields start_time
-  [[ $seconds =~ ^[1-9][0-9]*$ ]] || return 1
+  valid_timeout_duration "$seconds" || return 1
   pid=$(bounded_user_systemctl "$user" "$seconds" show pipewire.service \
     --property=MainPID --value 2>/dev/null) || return 1
   [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
@@ -2205,8 +2209,8 @@ clear_owned_routing_impl() {
     write_routing_state || return 1
     return 0
   fi
-  started=$(routing_now_seconds) || return 1
-  deadline=$((started + ROUTING_TIMEOUT))
+  started=$(routing_now_milliseconds) || return 1
+  deadline=$((started + ROUTING_TIMEOUT * 1000))
 
   if [[ -n $ROUTING_DEFAULT_NAME || -n $ROUTING_PENDING_DEFAULT_NAME ]]; then
     remaining=$(routing_cleanup_seconds_until_deadline "$deadline") || return 1
@@ -2377,16 +2381,16 @@ clear_owned_routing() {
 }
 
 reconcile_speaker_routing_impl() {
-  local mac=$1 deadline default_deadline started remaining sink current current_instance
+  local mac=$1 deadline default_deadline default_started stream_cutoff
+  local started remaining sink current current_instance
   local result streams id serial extra target
   local mac_key=${mac//:/_}
   local routing_failed=0 default_ready=1 mutation_result=0 mutation_was_critical=0
   local count index offset start=0
   local -A seen_streams=() pending_streams=()
   local -a playback_ids=() playback_serials=()
-  started=$(routing_now_seconds) || return 1
-  deadline=$((started + ROUTING_TIMEOUT))
-  default_deadline=$((started + ROUTING_DEFAULT_TIMEOUT))
+  started=$(routing_now_milliseconds) || return 1
+  deadline=$((started + ROUTING_TIMEOUT * 1000))
   load_routing_state || return 1
   if [[ -n $ROUTING_STATE_USER && $ROUTING_STATE_USER != "$CFG_AUDIO_USER" ]]; then
     clear_owned_routing "$ROUTING_STATE_USER" || return 1
@@ -2404,6 +2408,11 @@ reconcile_speaker_routing_impl() {
   valid_pipewire_name "$PIPEWIRE_NODE_NAME" || return 1
   local sink_serial=$PIPEWIRE_NODE_SERIAL sink_name=$PIPEWIRE_NODE_NAME
   ROUTING_STATE_SPEAKERS[$mac]=1
+
+  default_started=$(routing_now_milliseconds) || return 1
+  default_deadline=$((default_started + ROUTING_DEFAULT_TIMEOUT * 1000))
+  stream_cutoff=$((deadline - 1000))
+  (( default_deadline <= stream_cutoff )) || default_deadline=$stream_cutoff
 
   if remaining=$(routing_seconds_until_deadline "$default_deadline"); then
     if current=$(configured_default_sink "$CFG_AUDIO_USER" "$remaining"); then
@@ -3356,17 +3365,36 @@ routing_now_seconds() {
     < "$ROUTING_MONOTONIC_CLOCK" || return 1
   [[ $seconds =~ ^[0-9]+$ && $fraction =~ ^[0-9]+$ &&
      $idle_seconds =~ ^[0-9]+$ && $idle_fraction =~ ^[0-9]+$ && -z $extra ]] || return 1
-  printf '%s\n' "$seconds"
+  printf '%s.%s\n' "$seconds" "$fraction"
+}
+
+routing_now_milliseconds() {
+  local now seconds fraction
+  now=$(routing_now_seconds) || return 1
+  if [[ $now =~ ^([0-9]+)([.]([0-9]+))?$ ]]; then
+    seconds=${BASH_REMATCH[1]}
+    fraction=${BASH_REMATCH[3]:-0}000
+    fraction=${fraction:0:3}
+    printf '%s\n' "$((10#$seconds * 1000 + 10#$fraction))"
+  else
+    return 1
+  fi
 }
 
 routing_seconds_until_deadline() {
-  local deadline=$1 now remaining
+  local deadline=$1 now remaining milliseconds
   [[ $deadline =~ ^[0-9]+$ ]] || return 1
-  now=$(routing_now_seconds) || return 1
+  now=$(routing_now_milliseconds) || return 1
   (( deadline > now )) || return 1
-  remaining=$((deadline - now))
-  (( remaining <= ROUTING_TIMEOUT )) || remaining=$ROUTING_TIMEOUT
-  printf '%s\n' "$remaining"
+  milliseconds=$((deadline - now))
+  (( milliseconds <= ROUTING_TIMEOUT * 1000 )) || \
+    milliseconds=$((ROUTING_TIMEOUT * 1000))
+  remaining=$((milliseconds / 1000))
+  if (( milliseconds % 1000 == 0 )); then
+    printf '%s\n' "$remaining"
+  else
+    printf '%s.%03d\n' "$remaining" "$((milliseconds % 1000))"
+  fi
 }
 
 seconds_until_deadline() {
@@ -4295,7 +4323,8 @@ devices_action() {
 
 print_routing_status() {
   local active_mac='' active_node='' active_name=none default_name=none
-  local streams id serial extra result off_active=0 inspection_failed=0
+  local streams id serial extra result stream_started stream_deadline remaining
+  local off_active=0 inspection_failed=0
   if [[ -f $STATE_DIR/active-speaker && ! -L $STATE_DIR/active-speaker ]]; then
     IFS= read -r active_mac < "$STATE_DIR/active-speaker" || active_mac=
     valid_mac "$active_mac" || active_mac=
@@ -4317,14 +4346,22 @@ print_routing_status() {
   note "Active managed sink: $active_name"
   note "Configured audio default: $default_name"
   if [[ $active_node =~ ^[0-9]+$ ]]; then
-    if streams=$(enumerate_playback_streams "$CFG_AUDIO_USER" "$ROUTING_TIMEOUT"); then
+    if stream_started=$(routing_now_milliseconds); then
+      stream_deadline=$((stream_started + ROUTING_TIMEOUT * 1000))
+    else
+      inspection_failed=1
+    fi
+    if (( inspection_failed == 0 )) && \
+       remaining=$(routing_seconds_until_deadline "$stream_deadline") && \
+       streams=$(enumerate_playback_streams "$CFG_AUDIO_USER" "$remaining"); then
       if [[ -n $streams ]]; then
         while read -r id serial extra; do
           [[ -z $extra && $id =~ ^[0-9]+$ && $serial =~ ^[0-9]+$ ]] || {
             inspection_failed=1
             break
           }
-          if ! inspect_pipewire_node "$CFG_AUDIO_USER" "$id" "$ROUTING_TIMEOUT"; then
+          if ! remaining=$(routing_seconds_until_deadline "$stream_deadline") || \
+             ! inspect_pipewire_node "$CFG_AUDIO_USER" "$id" "$remaining"; then
             inspection_failed=1
             break
           fi

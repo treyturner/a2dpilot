@@ -2026,6 +2026,43 @@ test_status_reports_media_url_configuration() {
   assert_contains "$output" 'Configured audio default: none'
 }
 
+test_status_stream_inspection_shared_deadline() {
+  local user output clock=100
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  CFG_AUDIO_USER=$user
+  printf 'AA:BB:CC:DD:EE:FF\n' > "$STATE_DIR/active-speaker"
+  routing_now_seconds() { printf '%s\n' "$clock"; }
+  find_a2dp_node_id() { printf '83\n'; }
+  configured_default_sink() { return 2; }
+  enumerate_playback_streams() {
+    assert_eq 3 "$2" || return 1
+    printf '%s\n' '95 138' '96 139' '97 140'
+  }
+  inspect_pipewire_node() {
+    if [[ $2 == 83 ]]; then
+      PIPEWIRE_NODE_SERIAL=89
+      PIPEWIRE_NODE_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
+      PIPEWIRE_NODE_CLASS=Audio/Sink
+      PIPEWIRE_NODE_DRIVER=
+      return 0
+    fi
+    printf '%s %s\n' "$2" "$3" >> "$TEST_SCRATCH/status-inspections"
+    PIPEWIRE_NODE_SERIAL=$((43 + $2))
+    PIPEWIRE_NODE_NAME='Status Player'
+    PIPEWIRE_NODE_CLASS=Stream/Output/Audio
+    PIPEWIRE_NODE_DRIVER=35
+    if [[ $2 == 95 ]]; then clock=102; else clock=103; fi
+  }
+
+  output=$(print_routing_status)
+  assert_contains "$output" 'Playback streams off active sink: unknown'
+  assert_eq $'95 3\n96 1' "$(< "$TEST_SCRATCH/status-inspections")"
+  assert_file_not_contains "$TEST_SCRATCH/status-inspections" '97 '
+}
+
 test_pairing_provenance_and_existing_bond() {
   local user mac=AA:BB:CC:DD:EE:FF paired=0 paired_file trusted_file
   setup_scratch_dir
@@ -2480,8 +2517,13 @@ test_pipewire_routing_parsers() {
   fi
   ROUTING_MONOTONIC_CLOCK=$TEST_SCRATCH/uptime
   printf '123.45 67.89\n' > "$ROUTING_MONOTONIC_CLOCK"
-  assert_eq 123 "$(routing_now_seconds)"
-  assert_eq "$ROUTING_TIMEOUT" "$(routing_seconds_until_deadline 999)"
+  assert_eq 123.45 "$(routing_now_seconds)"
+  assert_eq 123450 "$(routing_now_milliseconds)"
+  assert_eq "$ROUTING_TIMEOUT" "$(routing_seconds_until_deadline 999000)"
+  printf '123.95 67.89\n' > "$ROUTING_MONOTONIC_CLOCK"
+  assert_eq 0.500 "$(routing_seconds_until_deadline 124450)"
+  valid_timeout_duration 0.500 || fail 'fractional timeout duration was rejected'
+  if valid_timeout_duration 0.000; then fail 'zero timeout duration was accepted'; fi
 
   bounded_user_pw_cli() { mock_pipewire_nodes_for_routing; }
   output=$(enumerate_playback_streams audio 3)
@@ -4695,6 +4737,8 @@ run_test 'media state rejects unprivileged parent for root' \
   test_media_state_rejects_unprivileged_parent_for_root
 run_test 'media state rejects the wrong identity' test_media_state_rejects_wrong_identity
 run_test 'status reports media URL configuration' test_status_reports_media_url_configuration
+run_test 'status stream inspection shares one deadline' \
+  test_status_stream_inspection_shared_deadline
 run_test 'pairing provenance and existing bonds' test_pairing_provenance_and_existing_bond
 run_test 'pairing session terminates after bonding' test_pairing_session_terminates_after_bonding
 run_test 'pair --all attempts every configured speaker' test_pair_all_attempts_every_configured_speaker
