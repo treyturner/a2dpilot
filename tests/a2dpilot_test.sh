@@ -1458,6 +1458,21 @@ test_mute_state_rejects_symlinked_parent() {
     fail 'mute state was written through its symlinked parent'
 }
 
+test_media_state_rejects_unprivileged_parent_for_root() {
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  rm -rf -- "$MEDIA_STATE_DIR"
+  assert_eq "$(id -u)" "$(stat -c %u "$MEDIA_STATE_ROOT")"
+  media_effective_uid() { printf '0\n'; }
+
+  if prepare_media_state_directory; then
+    fail 'root accepted an unprivileged-owned media-state parent'
+  fi
+  [[ ! -e $MEDIA_STATE_DIR ]] || \
+    fail 'root mutated an unprivileged-owned media-state parent'
+}
+
 test_media_state_rejects_wrong_identity() {
   local user foreign_user=nobody
   setup_scratch_dir
@@ -2237,6 +2252,8 @@ run_test 'media controls share one deadline' test_media_control_shared_deadline
 run_test 'media controls use a monotonic outer bound' test_media_control_monotonic_outer_bound
 run_test 'player control resolves stateful media keys' test_player_control_resolves_stateful_media_keys
 run_test 'mute state rejects symlinked parent' test_mute_state_rejects_symlinked_parent
+run_test 'media state rejects unprivileged parent for root' \
+  test_media_state_rejects_unprivileged_parent_for_root
 run_test 'media state rejects the wrong identity' test_media_state_rejects_wrong_identity
 run_test 'status reports media URL configuration' test_status_reports_media_url_configuration
 run_test 'pairing provenance and existing bonds' test_pairing_provenance_and_existing_bond

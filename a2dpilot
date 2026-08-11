@@ -2113,21 +2113,29 @@ media_state_access_allowed() {
   [[ ${EUID:-$(id -u)} -eq "$runtime_uid" ]]
 }
 
+media_effective_uid() {
+  printf '%s\n' "${EUID:-$(id -u)}"
+}
+
 prepare_media_state_directory() {
-  local owner parent parent_owner runtime_uid media_group
+  local owner parent parent_owner runtime_uid media_group effective_uid
   runtime_uid=$(id -u "$MEDIA_RUNTIME_USER") || return 1
   media_group=$(id -gn "$MEDIA_RUNTIME_USER") || return 1
+  effective_uid=$(media_effective_uid) || return 1
+  [[ $effective_uid =~ ^[0-9]+$ ]] || return 1
   parent=$(dirname "$MEDIA_STATE_DIR")
   validate_directory_chain "$parent"
   [[ -d $parent && ! -L $parent ]] || return 1
   parent_owner=$(stat -c %u "$parent") || return 1
-  [[ $parent_owner == 0 || $parent_owner == "$runtime_uid" ]] || return 1
-  if [[ ${EUID:-$(id -u)} -eq 0 && $parent_owner == 0 ]]; then
+  if (( 10#$effective_uid == 0 )); then
+    [[ $parent_owner == 0 ]] || return 1
     chmod 0755 "$parent" || return 1
+  else
+    [[ $parent_owner == 0 || $parent_owner == "$runtime_uid" ]] || return 1
   fi
   validate_directory_chain "$MEDIA_STATE_DIR"
   if [[ ! -e $MEDIA_STATE_DIR ]]; then
-    if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    if (( 10#$effective_uid == 0 )); then
       install -d -o "$MEDIA_RUNTIME_USER" -g "$media_group" -m 0700 "$MEDIA_STATE_DIR" || return 1
     else
       install -d -m 0700 "$MEDIA_STATE_DIR" || return 1
