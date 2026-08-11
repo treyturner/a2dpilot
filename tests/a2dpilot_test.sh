@@ -2434,7 +2434,7 @@ EOF
 
 test_default_routing_and_owned_cleanup() {
   local user mac=AA:BB:CC:DD:EE:FF default_sink=alsa_output.builtin
-  local stream_driver=35 stream_target='' cleanup_log
+  local stream_driver=35 stream_serial=138 stream_target='' cleanup_log inspect_stream_fails=0
   setup_scratch_dir
   load_app
   configure_scratch_paths
@@ -2453,7 +2453,8 @@ test_default_routing_and_owned_cleanup() {
   * media.class = "Audio/Sink"
 EOF
         else
-          printf '%s\n' '  * object.serial = "138"' \
+          (( inspect_stream_fails == 0 )) || return 1
+          printf '%s\n' "  * object.serial = \"$stream_serial\"" \
             '  * node.name = "alsa_playback.test-player"' \
             "    node.driver-id = \"$stream_driver\"" \
             '  * media.class = "Stream/Output/Audio"'
@@ -2514,6 +2515,36 @@ EOF
   assert_eq 77 "$stream_target"
   assert_eq "$cleanup_log" "$(< "$TEST_SCRATCH/routing.log")"
   [[ ! -e $ROUTING_STATE_FILE ]] || fail 'stale routing provenance was not discarded'
+
+  stream_serial=999
+  stream_target=89
+  ROUTING_STATE_USER=$user
+  ROUTING_DEFAULT_NAME=
+  ROUTING_STREAM_TARGETS=([138]=89)
+  write_routing_state
+  bounded_user_pw_cli() { mock_pipewire_nodes_for_routing; }
+  clear_owned_routing "$user"
+  assert_eq 89 "$stream_target"
+  assert_eq "$cleanup_log" "$(< "$TEST_SCRATCH/routing.log")"
+  [[ ! -e $ROUTING_STATE_FILE ]] || \
+    fail 'recycled stream ID retained stale routing provenance'
+  stream_serial=138
+
+  stream_target=89
+  ROUTING_STATE_USER=$user
+  ROUTING_DEFAULT_NAME=
+  ROUTING_STREAM_TARGETS=([138]=89)
+  write_routing_state
+  inspect_stream_fails=1
+  if clear_owned_routing "$user"; then
+    fail 'stream inspection failure reported complete routing cleanup'
+  fi
+  assert_eq 89 "$stream_target"
+  assert_file_contains "$ROUTING_STATE_FILE" $'stream\t138\t89'
+  inspect_stream_fails=0
+  clear_owned_routing "$user"
+  [[ -z $stream_target && ! -e $ROUTING_STATE_FILE ]] || \
+    fail 'routing cleanup retry did not clear retained stream provenance'
 
   ROUTING_STATE_USER=$user
   ROUTING_DEFAULT_NAME=
@@ -2635,7 +2666,8 @@ EOF
 }
 
 test_vanished_stream_does_not_starve_routing() {
-  local user mac=AA:BB:CC:DD:EE:FF second_driver=35 output rc
+  local user mac=AA:BB:CC:DD:EE:FF second_driver=35 second_target='' include_vanished=1
+  local output rc
   setup_scratch_dir
   load_app
   configure_scratch_paths
@@ -2649,10 +2681,12 @@ test_vanished_stream_does_not_starve_routing() {
   ROUTING_STREAM_TARGETS=([138]=89)
   write_routing_state
   bounded_user_pw_cli() {
+    if (( include_vanished )); then
+      printf '%s\n' $'\tid 95, type PipeWire:Interface:Node/3' \
+        $'\t\tobject.serial = "138"' \
+        $'\t\tmedia.class = "Stream/Output/Audio"'
+    fi
     cat <<'EOF'
-	id 95, type PipeWire:Interface:Node/3
-		object.serial = "138"
-		media.class = "Stream/Output/Audio"
 	id 96, type PipeWire:Interface:Node/3
 		object.serial = "139"
 		media.class = "Stream/Output/Audio"
@@ -2674,9 +2708,13 @@ EOF
         ;;
     esac
   }
-  stream_target_serial() { return 2; }
+  stream_target_serial() {
+    [[ $2 == 96 && -n $second_target ]] || return 2
+    printf '%s\n' "$second_target"
+  }
   bounded_user_pw_metadata() {
     second_driver=83
+    second_target=89
     printf 'target %s\n' "$5" >> "$TEST_SCRATCH/routing-targets"
   }
 
@@ -2687,6 +2725,11 @@ EOF
   (( rc != 0 )) || fail 'vanished stream inspection reported complete routing success'
   assert_eq '' "$output"
   assert_file_contains "$TEST_SCRATCH/routing-targets" 'target 96'
+  assert_file_contains "$ROUTING_STATE_FILE" $'stream\t138\t89'
+  assert_file_contains "$ROUTING_STATE_FILE" $'stream\t139\t89'
+
+  include_vanished=0
+  reconcile_speaker_routing "$mac"
   assert_file_not_contains "$ROUTING_STATE_FILE" $'stream\t138\t89'
   assert_file_contains "$ROUTING_STATE_FILE" $'stream\t139\t89'
 }

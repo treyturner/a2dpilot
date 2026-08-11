@@ -1914,6 +1914,16 @@ clear_owned_routing() {
         continue
       fi
       remaining=$(seconds_until_deadline "$deadline") || return 1
+      if ! inspect_pipewire_node "$user" "$id" "$remaining"; then
+        failed=1
+        continue
+      fi
+      if [[ $PIPEWIRE_NODE_CLASS != Stream/Output/Audio ||
+            $PIPEWIRE_NODE_SERIAL != "$serial" ]]; then
+        unset "ROUTING_STREAM_TARGETS[$serial]"
+        continue
+      fi
+      remaining=$(seconds_until_deadline "$deadline") || return 1
       if current=$(stream_target_serial "$user" "$id" "$remaining"); then
         if [[ $current == "${ROUTING_STREAM_TARGETS[$serial]}" ]]; then
           remaining=$(seconds_until_deadline "$deadline") || return 1
@@ -1997,10 +2007,10 @@ reconcile_speaker_routing() {
   if [[ -n $streams ]]; then
     while read -r id serial extra; do
       [[ -z $extra && $id =~ ^[0-9]+$ && $serial =~ ^[0-9]+$ ]] || return 1
+      seen_streams[$serial]=1
       remaining=$(seconds_until_deadline "$deadline") || return 1
       if ! inspect_pipewire_node "$CFG_AUDIO_USER" "$id" "$remaining"; then
         routing_failed=1
-        unset "ROUTING_STREAM_TARGETS[$serial]"
         continue
       fi
       if [[ $PIPEWIRE_NODE_CLASS != Stream/Output/Audio ||
@@ -2008,7 +2018,6 @@ reconcile_speaker_routing() {
         unset "ROUTING_STREAM_TARGETS[$serial]"
         continue
       fi
-      seen_streams[$serial]=1
       if [[ $PIPEWIRE_NODE_DRIVER != "$sink" ]]; then
         remaining=$(seconds_until_deadline "$deadline") || return 1
         if target=$(stream_target_serial "$CFG_AUDIO_USER" "$id" "$remaining"); then
