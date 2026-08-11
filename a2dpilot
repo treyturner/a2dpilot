@@ -2419,7 +2419,7 @@ record_daemon_failure() {
 }
 
 daemon_cycle() {
-  local mac now next deadline failure_message
+  local mac now next deadline failure_message policy
   now=$(now_seconds)
 
   if [[ -n $DAEMON_ACTIVE ]]; then
@@ -2448,9 +2448,13 @@ daemon_cycle() {
   # On restart, keep any already-healthy configured speaker instead of
   # preempting it with a higher-priority device.
   for mac in "${CFG_SPEAKERS[@]}"; do
-    next=${DAEMON_NEXT_ATTEMPT[$mac]:-0}
-    (( now >= next )) || continue
     if device_healthy "$mac"; then
+      policy=$(speaker_codec_policy "$mac") || continue
+      next=${DAEMON_NEXT_ATTEMPT[$mac]:-0}
+      # An automatic speaker needs no active policy work, so adopt a healthy
+      # self-reconnection even while an earlier connection retry is cooling
+      # down. Strict codec policy retries remain bounded by that cooldown.
+      [[ -z $policy ]] || (( now >= next )) || continue
       deadline=$(( $(now_seconds) + CONNECT_TIMEOUT ))
       if apply_speaker_codec_policy "$mac" "$deadline"; then
         DAEMON_FAILURES[$mac]=0

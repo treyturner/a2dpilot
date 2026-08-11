@@ -2517,6 +2517,15 @@ test_daemon_cooldown_and_backoff() {
   daemon_cycle >/dev/null
   daemon_cycle >/dev/null
   assert_eq 1 "$(wc -l < "$TEST_SCRATCH/attempts")"
+
+  device_healthy() { return 0; }
+  apply_speaker_codec_policy() { return 0; }
+  disconnect_other_speakers() { :; }
+  daemon_cycle >/dev/null
+  assert_eq "$mac" "$DAEMON_ACTIVE"
+  assert_eq 0 "${DAEMON_NEXT_ATTEMPT[$mac]}"
+  assert_eq 1 "$(wc -l < "$TEST_SCRATCH/attempts")"
+
   assert_eq 5 "$(connection_backoff 1 5)"
   assert_eq 10 "$(connection_backoff 2 5)"
   assert_eq 60 "$(connection_backoff 9 5)"
