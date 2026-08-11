@@ -160,6 +160,7 @@ PIPEWIRE_NODE_NAME=
 PIPEWIRE_NODE_CLASS=
 PIPEWIRE_NODE_DRIVER=
 ROUTING_STATE_USER=
+declare -gA ROUTING_STATE_SPEAKERS=()
 ROUTING_DEFAULT_NAME=
 ROUTING_PENDING_DEFAULT_NAME=
 ROUTING_PIPEWIRE_INSTANCE=
@@ -1887,10 +1888,8 @@ routing_default_is_owned() {
 }
 
 routing_state_mentions_speaker() {
-  local mac_key=${1//:/_} prefix
-  prefix="bluez_output.${mac_key}."
-  [[ $ROUTING_DEFAULT_NAME == "$prefix"* ||
-     $ROUTING_PENDING_DEFAULT_NAME == "$prefix"* ]]
+  local mac=${1^^}
+  [[ ${ROUTING_STATE_SPEAKERS[$mac]+present} ]]
 }
 
 routing_mutation_signal() {
@@ -1964,8 +1963,9 @@ apply_owned_stream_target() {
 
 load_routing_state() {
   local kind first second extra have_user=0 have_default=0 have_pending_default=0
-  local have_instance=0
+  local have_instance=0 mac
   ROUTING_STATE_USER=
+  ROUTING_STATE_SPEAKERS=()
   ROUTING_DEFAULT_NAME=
   ROUTING_PENDING_DEFAULT_NAME=
   ROUTING_PIPEWIRE_INSTANCE=
@@ -1980,6 +1980,13 @@ load_routing_state() {
         (( have_user == 0 )) && [[ -n $first && -z $second ]] || return 1
         ROUTING_STATE_USER=$first
         have_user=1
+        ;;
+      speaker)
+        [[ -n $first && -z $second ]] || return 1
+        valid_mac "$first" || return 1
+        mac=$(normalize_mac "$first")
+        [[ ! ${ROUTING_STATE_SPEAKERS[$mac]+present} ]] || return 1
+        ROUTING_STATE_SPEAKERS[$mac]=1
         ;;
       default)
         (( have_default == 0 )) && [[ -n $first && -z $second ]] || return 1
@@ -2013,8 +2020,9 @@ load_routing_state() {
     esac
   done < "$ROUTING_STATE_FILE"
   (( have_user == 1 )) || return 1
-  # Server-scoped routing ownership debuts with this state format. A missing
-  # instance is malformed state, not a supported transitional snapshot.
+  (( ${#ROUTING_STATE_SPEAKERS[@]} > 0 )) || return 1
+  # Speaker identity and server-scoped routing ownership debut with this state
+  # format. Missing provenance is malformed, not a supported transition state.
   if (( ${#ROUTING_STREAM_TARGETS[@]} + ${#ROUTING_PENDING_STREAM_TARGETS[@]} > 0 )); then
     (( have_instance == 1 ))
   else
@@ -2023,7 +2031,7 @@ load_routing_state() {
 }
 
 write_routing_state() {
-  local serial temp write_failed=0
+  local mac serial temp write_failed=0
   [[ -n $ROUTING_STATE_USER ]] || return 1
   if [[ -z $ROUTING_DEFAULT_NAME && -z $ROUTING_PENDING_DEFAULT_NAME &&
         ${#ROUTING_STREAM_TARGETS[@]} -eq 0 &&
@@ -2031,6 +2039,10 @@ write_routing_state() {
     rm -f -- "$ROUTING_STATE_FILE" || return 1
     return 0
   fi
+  (( ${#ROUTING_STATE_SPEAKERS[@]} > 0 )) || return 1
+  for mac in "${!ROUTING_STATE_SPEAKERS[@]}"; do
+    valid_mac "$mac" || return 1
+  done
   if (( ${#ROUTING_STREAM_TARGETS[@]} + ${#ROUTING_PENDING_STREAM_TARGETS[@]} > 0 )); then
     valid_pipewire_instance_id "$ROUTING_PIPEWIRE_INSTANCE" || return 1
   fi
@@ -2038,6 +2050,9 @@ write_routing_state() {
   temp=$(mktemp "$STATE_DIR/.routing-overrides.XXXXXX") || return 1
   {
     printf 'user\t%s\n' "$ROUTING_STATE_USER" || write_failed=1
+    for mac in "${!ROUTING_STATE_SPEAKERS[@]}"; do
+      printf 'speaker\t%s\n' "$mac" || write_failed=1
+    done
     if [[ -n $ROUTING_DEFAULT_NAME ]]; then
       printf 'default\t%s\n' "$ROUTING_DEFAULT_NAME" || write_failed=1
     fi
@@ -2090,9 +2105,10 @@ clear_owned_routing_impl() {
     ROUTING_DEFAULT_NAME=
     ROUTING_PENDING_DEFAULT_NAME=
     ROUTING_PIPEWIRE_INSTANCE=
+    ROUTING_STATE_SPEAKERS=()
     ROUTING_STREAM_TARGETS=()
     ROUTING_PENDING_STREAM_TARGETS=()
-    write_routing_state
+    write_routing_state || return 1
     return 0
   fi
   started=$(routing_now_seconds) || return 1
@@ -2260,6 +2276,7 @@ reconcile_speaker_routing() {
      $PIPEWIRE_NODE_NAME == "bluez_output.${mac_key}."* ]] || return 1
   valid_pipewire_name "$PIPEWIRE_NODE_NAME" || return 1
   local sink_serial=$PIPEWIRE_NODE_SERIAL sink_name=$PIPEWIRE_NODE_NAME
+  ROUTING_STATE_SPEAKERS[$mac]=1
 
   remaining=$(routing_seconds_until_deadline "$deadline") || return 1
   if current=$(configured_default_sink "$CFG_AUDIO_USER" "$remaining"); then
@@ -2459,6 +2476,11 @@ reconcile_speaker_routing() {
   done
   if (( ${#pending_streams[@]} > 0 )); then
     routing_failed=1
+  fi
+  if (( routing_failed == 0 )); then
+    ROUTING_STATE_SPEAKERS=()
+    ROUTING_STATE_SPEAKERS[$mac]=1
+    write_routing_state || return 1
   fi
   (( routing_failed == 0 ))
 }

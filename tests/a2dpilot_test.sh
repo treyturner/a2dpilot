@@ -94,6 +94,7 @@ configure_scratch_paths() {
   MEDIA_STATE_DIR=$MEDIA_STATE_ROOT/media
   MEDIA_LOCK_FILE=$MEDIA_STATE_DIR/media.lock
   ROUTING_STATE_FILE=$STATE_DIR/routing-overrides
+  ROUTING_STATE_SPEAKERS=([AA:BB:CC:DD:EE:FF]=1)
   MEDIA_RUNTIME_USER=$(id -un)
   install -d "$(dirname "$CONFIG_FILE")" "$(dirname "$LOCK_FILE")" \
     "$STATE_DIR" "$BACKUP_DIR" "$MEDIA_STATE_ROOT"
@@ -2285,7 +2286,9 @@ test_forget_clears_routing_for_prior_speaker() {
   printf '%s\n' "$active" > "$STATE_DIR/active-speaker"
   : > "$STATE_FILE"
   ROUTING_STATE_USER=$user
-  ROUTING_DEFAULT_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
+  ROUTING_DEFAULT_NAME=
+  ROUTING_PIPEWIRE_INSTANCE=01234567-89ab-cdef-0123-456789abcdef:4321:987654
+  ROUTING_STREAM_TARGETS=([138]=89)
   write_routing_state
   require_root() { :; }
   acquire_lock() { :; }
@@ -2316,6 +2319,8 @@ test_forget_preserves_unrelated_routing() {
   printf '%s\n' "$active" > "$STATE_DIR/active-speaker"
   : > "$STATE_FILE"
   ROUTING_STATE_USER=$user
+  ROUTING_STATE_SPEAKERS=()
+  ROUTING_STATE_SPEAKERS["$active"]=1
   ROUTING_DEFAULT_NAME=bluez_output.10_20_30_40_50_60.1
   write_routing_state
   require_root() { :; }
@@ -2571,10 +2576,16 @@ EOF
     fi
   }
 
+  ROUTING_STATE_USER=$user
+  ROUTING_STATE_SPEAKERS=([11:22:33:44:55:66]=1)
+  ROUTING_DEFAULT_NAME=bluez_output.11_22_33_44_55_66.1
+  write_routing_state
   reconcile_speaker_routing "$mac"
   assert_eq bluez_output.AA_BB_CC_DD_EE_FF.1 "$default_sink"
   assert_eq 83 "$stream_driver"
   assert_eq 89 "$stream_target"
+  assert_file_contains "$ROUTING_STATE_FILE" $'speaker\tAA:BB:CC:DD:EE:FF'
+  assert_file_not_contains "$ROUTING_STATE_FILE" $'speaker\t11:22:33:44:55:66'
   assert_file_contains "$ROUTING_STATE_FILE" $'default\tbluez_output.AA_BB_CC_DD_EE_FF.1'
   assert_file_contains "$ROUTING_STATE_FILE" \
     $'instance\t01234567-89ab-cdef-0123-456789abcdef:4321:987654'
@@ -2842,6 +2853,18 @@ test_default_cleanup_revalidates_and_retires_missing_user() {
   clear_owned_routing "$missing_user"
   [[ ! -e $ROUTING_STATE_FILE ]] || \
     fail 'missing audio user retained unusable routing provenance'
+
+  ROUTING_STATE_USER=$missing_user
+  ROUTING_STATE_SPEAKERS=([AA:BB:CC:DD:EE:FF]=1)
+  ROUTING_DEFAULT_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
+  write_routing_state
+  rm() {
+    if [[ ${*: -1} == "$ROUTING_STATE_FILE" ]]; then return 1; fi
+    command rm "$@"
+  }
+  if clear_owned_routing "$missing_user"; then
+    fail 'missing-user cleanup masked routing-state removal failure'
+  fi
 }
 
 test_recycled_sink_is_not_defaulted() {
@@ -2878,7 +2901,8 @@ test_recycled_sink_is_not_defaulted() {
 
 test_interrupted_routing_transition_preserves_prior_owner() {
   local user mac=AA:BB:CC:DD:EE:FF sink_name=bluez_output.AA_BB_CC_DD_EE_FF.1
-  local default_sink=bluez_output.OLD_SPEAKER.1 stream_target=77 stream_driver=35
+  local prior_mac=11:22:33:44:55:66
+  local default_sink=bluez_output.11_22_33_44_55_66.1 stream_target=77 stream_driver=35
   setup_scratch_dir
   load_app
   configure_scratch_paths
@@ -2928,12 +2952,16 @@ test_interrupted_routing_transition_preserves_prior_owner() {
   }
 
   ROUTING_STATE_USER=$user
+  ROUTING_STATE_SPEAKERS=()
+  ROUTING_STATE_SPEAKERS["$prior_mac"]=1
   ROUTING_DEFAULT_NAME=$default_sink
   write_routing_state
   if reconcile_speaker_routing "$mac"; then
     fail 'failed default transition reported routing success'
   fi
-  assert_file_contains "$ROUTING_STATE_FILE" $'default\tbluez_output.OLD_SPEAKER.1'
+  assert_file_contains "$ROUTING_STATE_FILE" $'speaker\t11:22:33:44:55:66'
+  assert_file_contains "$ROUTING_STATE_FILE" $'speaker\tAA:BB:CC:DD:EE:FF'
+  assert_file_contains "$ROUTING_STATE_FILE" $'default\tbluez_output.11_22_33_44_55_66.1'
   assert_file_contains "$ROUTING_STATE_FILE" \
     $'default-pending\tbluez_output.AA_BB_CC_DD_EE_FF.1'
   clear_owned_routing "$user"
@@ -2943,6 +2971,7 @@ test_interrupted_routing_transition_preserves_prior_owner() {
   default_sink=$sink_name
   stream_target=77
   ROUTING_STATE_USER=$user
+  ROUTING_STATE_SPEAKERS=([AA:BB:CC:DD:EE:FF]=1)
   ROUTING_DEFAULT_NAME=$sink_name
   ROUTING_PENDING_DEFAULT_NAME=
   ROUTING_PIPEWIRE_INSTANCE=01234567-89ab-cdef-0123-456789abcdef:4321:987654
@@ -3404,9 +3433,10 @@ test_pipewire_restart_discards_stream_provenance() {
      ! -e $TEST_SCRATCH/stale-target-cleared ]] || \
     fail 'stale PipeWire stream provenance touched the new server instance'
 
-  printf 'user\t%s\nstream\t138\t89\n' "$user" > "$ROUTING_STATE_FILE"
+  printf 'user\t%s\ninstance\t%s\nstream\t138\t89\n' "$user" \
+    '01234567-89ab-cdef-0123-456789abcdef:4321:987654' > "$ROUTING_STATE_FILE"
   if load_routing_state; then
-    fail 'stream provenance without a PipeWire instance was accepted'
+    fail 'routing provenance without a speaker identity was accepted'
   fi
 }
 
