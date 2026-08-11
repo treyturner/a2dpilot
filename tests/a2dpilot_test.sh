@@ -119,14 +119,20 @@ write_test_config() {
   } > "$path"
 }
 
+write_update_payload_version() {
+  local path=$1 version=$2
+  shift 2
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'A2DPILOT_VERSION=%s\n' "$version"
+    printf '%s\n' "$@"
+  } > "$path"
+}
+
 write_update_payload() {
   local path=$1
   shift
-  {
-    printf '#!/usr/bin/env bash\n'
-    printf 'A2DPILOT_VERSION=%s\n' "$A2DPILOT_VERSION"
-    printf '%s\n' "$@"
-  } > "$path"
+  write_update_payload_version "$path" "$A2DPILOT_VERSION" "$@"
 }
 
 run_test() {
@@ -875,7 +881,7 @@ test_update_executable_only_transaction() {
   printf 'replaced files sentinel\n' > "$STATE_DIR/replaced-files"
   printf 'created bonds sentinel\n' > "$STATE_DIR/created-bonds"
   printf 'runtime user sentinel\n' > "$STATE_DIR/runtime-user"
-  printf '#!/usr/bin/env bash\n# old executable\n' > "$INSTALLED_CLI"
+  write_update_payload "$INSTALLED_CLI" '# old executable'
   chmod 0755 "$INSTALLED_CLI"
   printf 'config sentinel\n' > "$CONFIG_FILE"
   printf 'unit sentinel\n' > "$SYSTEMD_UNIT"
@@ -992,6 +998,60 @@ test_update_executable_only_transaction() {
   [[ ! -e $UPDATE_EXECUTION_LOG ]] || fail 'update directly executed an installed candidate'
 }
 
+test_update_rechecks_installed_version_under_lock() {
+  local payload output rc major minor patch candidate_version concurrent_version
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  install -d "$(dirname "$INSTALLED_CLI")"
+  render_state_file "$STATE_FILE" installed
+  write_update_payload "$INSTALLED_CLI" '# original executable'
+  chmod 0755 "$INSTALLED_CLI"
+  IFS=. read -r major minor patch <<< "$A2DPILOT_VERSION"
+  candidate_version=$major.$minor.$((patch + 1))
+  concurrent_version=$major.$minor.$((patch + 2))
+  payload=$TEST_SCRATCH/update-payload
+  write_update_payload_version "$payload" "$candidate_version" '# downloaded candidate'
+
+  require_root() { :; }
+  acquire_lock() {
+    write_update_payload_version "$INSTALLED_CLI" "$concurrent_version" \
+      '# concurrent update winner'
+    chmod 0755 "$INSTALLED_CLI"
+    printf 'acquire\n' >> "$TEST_SCRATCH/lock.log"
+  }
+  release_lock() { printf 'release\n' >> "$TEST_SCRATCH/lock.log"; }
+  stat() {
+    if [[ ${1:-} == -c && ${2:-} == %u && ${4:-} == "$INSTALLED_CLI" ]]; then
+      printf '0\n'
+    else
+      /usr/bin/stat "$@"
+    fi
+  }
+  curl() {
+    local output_path=''
+    while [[ $# -gt 0 ]]; do
+      if [[ $1 == --output ]]; then output_path=$2; shift 2; else shift; fi
+    done
+    cp "$payload" "$output_path"
+  }
+  atomic_install_file() { : > "$TEST_SCRATCH/unexpected-replacement"; return 1; }
+  systemctl() { fail 'concurrent downgrade queried or changed the service'; }
+
+  set +e
+  output=$(update_action 2>&1)
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'concurrent update installed an older candidate'
+  assert_contains "$output" \
+    "Refusing to downgrade A2DPilot from $concurrent_version to $candidate_version"
+  assert_file_contains "$INSTALLED_CLI" "A2DPILOT_VERSION=$concurrent_version"
+  assert_file_contains "$INSTALLED_CLI" '# concurrent update winner'
+  [[ ! -e $TEST_SCRATCH/unexpected-replacement ]] || \
+    fail 'concurrent downgrade reached executable replacement'
+  assert_eq $'acquire\nrelease' "$(< "$TEST_SCRATCH/lock.log")"
+}
+
 test_update_rejects_bad_candidates_and_targets() {
   local mode output rc candidate target_owner=0 parent redirected
   setup_scratch_dir
@@ -999,7 +1059,7 @@ test_update_rejects_bad_candidates_and_targets() {
   configure_scratch_paths
   install -d "$(dirname "$INSTALLED_CLI")"
   render_state_file "$STATE_FILE" installed
-  printf '#!/usr/bin/env bash\n# old executable\n' > "$INSTALLED_CLI"
+  write_update_payload "$INSTALLED_CLI" '# old executable'
   chmod 0755 "$INSTALLED_CLI"
 
   require_root() { :; }
@@ -1091,7 +1151,7 @@ test_update_activation_rollback_and_interruption() {
   configure_scratch_paths
   install -d "$(dirname "$INSTALLED_CLI")"
   render_state_file "$STATE_FILE" installed
-  printf '#!/usr/bin/env bash\n# old executable\n' > "$INSTALLED_CLI"
+  write_update_payload "$INSTALLED_CLI" '# old executable'
   chmod 0755 "$INSTALLED_CLI"
   payload=$TEST_SCRATCH/update-payload
   write_update_payload "$payload" '# new executable'
@@ -1156,7 +1216,7 @@ test_update_activation_rollback_and_interruption() {
   [[ -z $(find "$TEST_SCRATCH" -maxdepth 1 -name 'a2dpilot-update.*' -o \
     -name 'a2dpilot-previous.*') ]] || fail 'successful rollback retained temporary files'
 
-  printf '#!/usr/bin/env bash\n# old executable\n' > "$INSTALLED_CLI"
+  write_update_payload "$INSTALLED_CLI" '# old executable'
   printf '0\n' > "$restart_count"
   printf '0\n' > "$atomic_count"
   atomic_install_file() {
@@ -1183,7 +1243,7 @@ test_update_activation_rollback_and_interruption() {
   assert_file_contains "$INSTALLED_CLI" '# new executable'
   rm -f -- "$retained_previous"
 
-  printf '#!/usr/bin/env bash\n# old executable before signal\n' > "$INSTALLED_CLI"
+  write_update_payload "$INSTALLED_CLI" '# old executable before signal'
   printf '0\n' > "$atomic_count"
   : > "$TEST_SCRATCH/replacement-state.log"
   systemctl() {
@@ -1219,7 +1279,7 @@ test_update_activation_rollback_and_interruption() {
     -name 'a2dpilot-previous.*') ]] || fail 'interrupted replacement retained temporary files'
 
   test_signal=HUP
-  printf '#!/usr/bin/env bash\n# old executable before hangup\n' > "$INSTALLED_CLI"
+  write_update_payload "$INSTALLED_CLI" '# old executable before hangup'
   printf '0\n' > "$atomic_count"
   : > "$TEST_SCRATCH/replacement-state.log"
   set +e
@@ -1238,7 +1298,7 @@ test_update_activation_rollback_and_interruption() {
   UPDATE_CANDIDATE=$TEST_SCRATCH/interrupted-candidate
   printf '#!/usr/bin/env bash\n# interrupted old\n' > "$UPDATE_PREVIOUS"
   printf '#!/usr/bin/env bash\n# interrupted candidate\n' > "$UPDATE_CANDIDATE"
-  printf '#!/usr/bin/env bash\n# interrupted new\n' > "$INSTALLED_CLI"
+  write_update_payload "$INSTALLED_CLI" '# interrupted new'
   UPDATE_REPLACED=1
   UPDATE_WAS_ACTIVE=0
   atomic_install_file() { cp "$1" "$2"; chmod "$3" "$2"; }
@@ -1252,7 +1312,7 @@ test_update_activation_rollback_and_interruption() {
   [[ ! -e $UPDATE_PREVIOUS && ! -e $UPDATE_CANDIDATE ]] || \
     fail 'interrupted update retained temporary files'
 
-  printf '#!/usr/bin/env bash\n# old executable before query failure\n' > "$INSTALLED_CLI"
+  write_update_payload "$INSTALLED_CLI" '# old executable before query failure'
   write_update_payload "$payload" '# candidate before query failure'
   rm -f -- "$TEST_SCRATCH/unexpected-replacement"
   systemctl() {
@@ -3404,6 +3464,8 @@ run_test 'failed install rollback retains packages' test_failed_install_rollback
 run_test 'install recovery needs no package snapshot' test_install_recovery_needs_no_package_snapshot
 run_test 'update source selection and validation' test_update_source_selection_and_validation
 run_test 'executable-only update transaction' test_update_executable_only_transaction
+run_test 'update rechecks installed version under lock' \
+  test_update_rechecks_installed_version_under_lock
 run_test 'update rejects bad candidates and targets' test_update_rejects_bad_candidates_and_targets
 run_test 'update activation rollback and interruption' test_update_activation_rollback_and_interruption
 run_test 'safe config editor success and validation failure' test_config_editor_success_and_validation_failure

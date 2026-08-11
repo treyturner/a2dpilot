@@ -3758,7 +3758,8 @@ rollback_failed_update() {
 
 update_action() {
   require_root
-  local selector=branch ref=main selector_set=0 url phase previous_umask candidate_version
+  local selector=branch ref=main selector_set=0 url phase previous_umask
+  local candidate_version installed_version
   while [[ $# -gt 0 ]]; do
     case $1 in
       --tag|--branch|--sha)
@@ -3831,6 +3832,13 @@ update_action() {
     rollback_failed_update 1 "A2DPilot installation state changed to '$phase' during the update."
   validate_update_target || \
     rollback_failed_update 1 "The installed executable became unsafe during the update."
+  read_a2dpilot_version "$INSTALLED_CLI" installed_version || \
+    rollback_failed_update 1 \
+      "The installed A2DPilot executable does not declare exactly one valid A2DPILOT_VERSION."
+  if a2dpilot_version_is_older "$candidate_version" "$installed_version"; then
+    rollback_failed_update 1 \
+      "Refusing to downgrade A2DPilot from $installed_version to $candidate_version. Back up $CONFIG_FILE, run 'sudo a2dpilot uninstall --keep-bonds', then install the older revision explicitly."
+  fi
 
   if cmp -s -- "$UPDATE_CANDIDATE" "$INSTALLED_CLI" && update_target_metadata_current; then
     trap '' HUP INT TERM
