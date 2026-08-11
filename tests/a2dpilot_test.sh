@@ -90,10 +90,12 @@ configure_scratch_paths() {
   WIREPLUMBER_CONF=$TEST_SCRATCH/etc/wireplumber/wireplumber.conf.d/51-a2dpilot.conf
   TRIGGER_CONF=$TEST_SCRATCH/etc/triggerhappy/triggers.d/a2dpilot.conf
   LOCK_FILE=$TEST_SCRATCH/run/lock/a2dpilot/lock
-  MEDIA_STATE_DIR=$TEST_SCRATCH/run/a2dpilot
+  MEDIA_STATE_ROOT=$TEST_SCRATCH/run/a2dpilot
+  MEDIA_STATE_DIR=$MEDIA_STATE_ROOT/media
   MEDIA_LOCK_FILE=$MEDIA_STATE_DIR/media.lock
   MEDIA_RUNTIME_USER=$(id -un)
-  install -d "$(dirname "$CONFIG_FILE")" "$(dirname "$LOCK_FILE")" "$STATE_DIR" "$BACKUP_DIR"
+  install -d "$(dirname "$CONFIG_FILE")" "$(dirname "$LOCK_FILE")" \
+    "$STATE_DIR" "$BACKUP_DIR" "$MEDIA_STATE_ROOT"
 }
 
 write_test_config() {
@@ -291,6 +293,25 @@ test_invalid_reload_retains_last_valid_configuration() {
   assert_eq AA:BB:CC:DD:EE:FF "${CFG_SPEAKERS[0]}"
 }
 
+test_config_parser_avoids_legacy_subshell_helpers() {
+  local user
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  write_test_config "$CONFIG_FILE" "$user" aa:bb:cc:dd:ee:ff
+  trim() { fail 'parse_config invoked the legacy trim output helper'; }
+  normalize_mac() { fail 'parse_config invoked the legacy MAC output helper'; }
+  normalize_base_url() { fail 'parse_config invoked the legacy base URL output helper'; }
+  normalize_media_url_template() { fail 'parse_config invoked the legacy media URL output helper'; }
+
+  parse_config "$CONFIG_FILE"
+  assert_eq AA:BB:CC:DD:EE:FF "${CFG_SPEAKERS[0]}"
+  assert_eq http://127.0.0.1:32500 "$CFG_BASE_URL"
+  assert_eq '/player/playback/skipNext?type=music&commandID={command-id}' \
+    "${CFG_MEDIA_URLS[2]}"
+}
+
 test_media_url_configuration_validation() {
   local user
   setup_scratch_dir
@@ -422,8 +443,10 @@ test_generated_integration_files() {
   assert_file_contains "$SYSTEMD_UNIT" 'ExecStart='
   assert_file_contains "$SYSTEMD_UNIT" 'a2dpilot daemon'
   assert_file_contains "$SYSTEMD_UNIT" 'RuntimeDirectory=a2dpilot'
+  assert_file_contains "$SYSTEMD_UNIT" 'RuntimeDirectoryMode=0755'
   assert_file_contains "$SYSTEMD_UNIT" 'RuntimeDirectoryPreserve=restart'
   assert_file_contains "$SYSTEMD_UNIT" "ExecStartPre=/usr/bin/install -d -o $MEDIA_RUNTIME_USER"
+  assert_file_contains "$SYSTEMD_UNIT" "-m 0700 $MEDIA_STATE_DIR"
   assert_file_contains "$SYSTEMD_UNIT" 'Before=triggerhappy.service'
 
   write_trigger_config "$TRIGGER_CONF" off
@@ -1201,6 +1224,8 @@ test_player_control_resolves_configured_urls() {
   assert_file_contains "$TEST_SCRATCH/curl.log" \
     'http://player.example:1234/api/player/playback/skipNext?type=music&commandID='
   assert_file_not_contains "$TEST_SCRATCH/curl.log" '{command-id}'
+  assert_file_contains "$TEST_SCRATCH/curl.log" '--connect-timeout'
+  assert_file_contains "$TEST_SCRATCH/curl.log" '--max-time'
 
   (PATH="$mock_bin:$PATH" CURL_LOG="$TEST_SCRATCH/curl.log" player_control_action KEY_CUSTOM)
   assert_file_contains "$TEST_SCRATCH/curl.log" 'https://other.example/action?literal=yes'
@@ -1222,6 +1247,89 @@ test_player_control_resolves_configured_urls() {
   (( rc != 0 )) || fail 'unmapped media key unexpectedly succeeded'
   assert_contains "$output" 'No valid media URL is configured for KEY_MISSING'
   [[ ! -e $TEST_SCRATCH/curl.log ]] || fail 'curl ran for an unmapped media key'
+}
+
+test_media_control_shared_deadline() {
+  local clock_call=0
+  load_app
+  MEDIA_DEADLINE_US=4000000
+  media_now_us() {
+    local target_name=$1 value
+    clock_call=$((clock_call + 1))
+    case $clock_call in
+      1) value=2500000 ;;
+      2) value=3500000 ;;
+      *) value=4000000 ;;
+    esac
+    printf -v "$target_name" '%s' "$value"
+  }
+  curl() { printf '%s\n' "$*" >> "$TEST_SCRATCH/media-curl.log"; }
+  setup_scratch_dir
+
+  media_curl https://player.example/first
+  media_curl https://player.example/second
+  assert_contains "$(sed -n '1p' "$TEST_SCRATCH/media-curl.log")" \
+    '--connect-timeout 1 --max-time 1.500000'
+  assert_contains "$(sed -n '2p' "$TEST_SCRATCH/media-curl.log")" \
+    '--connect-timeout 0.500000 --max-time 0.500000'
+  if media_curl https://player.example/expired; then
+    fail 'expired media-control deadline still invoked curl'
+  fi
+  assert_eq 2 "$(wc -l < "$TEST_SCRATCH/media-curl.log")"
+}
+
+test_media_control_monotonic_outer_bound() {
+  local clock mock_bin now command_id output rc
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  clock=$TEST_SCRATCH/uptime
+  printf '12.345678 99.000000\n' > "$clock"
+  MEDIA_MONOTONIC_CLOCK=$clock
+
+  media_now_us now
+  assert_eq 12345678 "$now"
+  start_media_deadline
+  assert_eq 14345678 "$MEDIA_DEADLINE_US"
+  A2DPILOT_MEDIA_DEADLINE_US=$MEDIA_DEADLINE_US import_media_deadline
+  assert_eq 1 "$MEDIA_DEADLINE_INHERITED"
+  MEDIA_DEADLINE_INHERITED=0
+  if A2DPILOT_MEDIA_DEADLINE_US=14345679 import_media_deadline; then
+    fail 'worker accepted an inherited deadline longer than the media budget'
+  fi
+  media_command_id command_id
+  [[ $command_id =~ ^[0-9]+$ ]] || fail 'media command ID is not epoch milliseconds'
+
+  mock_bin=$TEST_SCRATCH/bin
+  install -d "$mock_bin"
+  {
+    printf '%s\n' '#!/bin/sh'
+    printf '%s\n' 'printf "%s\n" "$*" > "$TIMEOUT_LOG"'
+    printf '%s\n' 'exit "${TIMEOUT_RESULT:-0}"'
+  } > "$mock_bin/timeout"
+  chmod 0755 "$mock_bin/timeout"
+  MEDIA_RUNTIME_USER=nobody
+  SCRIPT_PATH=/usr/local/sbin/a2dpilot
+  media_invoking_as_root() { return 0; }
+  set +e
+  output=$(PATH="$mock_bin:$PATH" TIMEOUT_LOG="$TEST_SCRATCH/timeout.log" \
+    TIMEOUT_RESULT=124 bounded_player_control_action KEY_PLAYCD 2>&1)
+  rc=$?
+  set -e
+  assert_eq 124 "$rc"
+  assert_contains "$output" 'media-control request timed out'
+  assert_file_contains "$TEST_SCRATCH/timeout.log" '--signal=TERM --kill-after=0.1 2.000000'
+  assert_file_contains "$TEST_SCRATCH/timeout.log" \
+    'runuser -u nobody -- env A2DPILOT_MEDIA_DEADLINE_US=14345678'
+  assert_file_contains "$TEST_SCRATCH/timeout.log" \
+    '/usr/local/sbin/a2dpilot __player-control KEY_PLAYCD'
+
+  media_invoking_as_root() { return 1; }
+  PATH="$mock_bin:$PATH" TIMEOUT_LOG="$TEST_SCRATCH/timeout.log" \
+    bounded_player_control_action KEY_NEXTSONG
+  assert_file_not_contains "$TEST_SCRATCH/timeout.log" 'runuser'
+  assert_file_contains "$TEST_SCRATCH/timeout.log" \
+    '/usr/local/sbin/a2dpilot __player-control KEY_NEXTSONG'
 }
 
 test_player_control_resolves_stateful_media_keys() {
@@ -1248,8 +1356,12 @@ test_player_control_resolves_stateful_media_keys() {
     printf '%s\n' 'esac'
   } > "$mock_bin/curl"
   chmod 0755 "$mock_bin/curl"
-  acquire_media_lock() { printf 'acquire\n' >> "$TEST_SCRATCH/media-lock.log"; }
+  acquire_media_lock() { printf 'acquire %s\n' "$1" >> "$TEST_SCRATCH/media-lock.log"; }
   release_media_lock() { printf 'release\n' >> "$TEST_SCRATCH/media-lock.log"; }
+  # Keep this mock's argument contract visible to ShellCheck 0.9; the
+  # player-control calls below verify that the real path supplies the budget.
+  acquire_media_lock 0.500000
+  : > "$TEST_SCRATCH/media-lock.log"
 
   (PATH="$mock_bin:$PATH" CURL_LOG="$TEST_SCRATCH/curl.log" TIMELINE_VOLUME=98 \
     player_control_action KEY_VOLUMEUP)
@@ -1317,6 +1429,8 @@ test_player_control_resolves_stateful_media_keys() {
   assert_contains "$output" 'No valid media URL is configured for KEY_VOLUMEUP'
   assert_file_contains "$TEST_SCRATCH/media-lock.log" 'acquire'
   assert_file_contains "$TEST_SCRATCH/media-lock.log" 'release'
+  grep -Eq '^acquire [01]\.[0-9]{6}$' "$TEST_SCRATCH/media-lock.log" || \
+    fail 'stateful media lock did not receive the shared deadline remainder'
 }
 
 test_mute_state_rejects_symlinked_parent() {
@@ -1327,9 +1441,10 @@ test_mute_state_rejects_symlinked_parent() {
   user=$(id -un)
   write_default_config "$CONFIG_FILE" "$user"
   parse_config "$CONFIG_FILE"
-  acquire_media_lock
+  acquire_media_lock "$MEDIA_ACTION_TIMEOUT"
   [[ -n $MEDIA_LOCK_FD ]] || fail 'media lock did not retain a descriptor'
   assert_eq 600 "$(stat -c %a "$MEDIA_LOCK_FILE")"
+  assert_eq "$(id -u "$MEDIA_RUNTIME_USER")" "$(stat -c %u "$MEDIA_STATE_DIR")"
   release_media_lock
   [[ -z $MEDIA_LOCK_FD ]] || fail 'media lock descriptor was not released'
   rm -f -- "$MEDIA_LOCK_FILE"
@@ -1341,6 +1456,51 @@ test_mute_state_rejects_symlinked_parent() {
   expect_failure_contains 'Refusing to traverse symlinked directory' write_media_mute_volume 70
   [[ -z $(find "$redirected" -mindepth 1 -print -quit) ]] || \
     fail 'mute state was written through its symlinked parent'
+}
+
+test_media_state_rejects_unprivileged_parent_for_root() {
+  local parent_uid
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  rm -rf -- "$MEDIA_STATE_DIR"
+  parent_uid=$(id -u)
+  if (( parent_uid == 0 )); then
+    parent_uid=$(id -u nobody) || fail 'could not resolve an unprivileged fixture user'
+    chown "$parent_uid" "$MEDIA_STATE_ROOT"
+  fi
+  assert_eq "$parent_uid" "$(stat -c %u "$MEDIA_STATE_ROOT")"
+  media_effective_uid() { printf '0\n'; }
+
+  if prepare_media_state_directory; then
+    fail 'root accepted an unprivileged-owned media-state parent'
+  fi
+  [[ ! -e $MEDIA_STATE_DIR ]] || \
+    fail 'root mutated an unprivileged-owned media-state parent'
+}
+
+test_media_state_rejects_wrong_identity() {
+  local user foreign_user=nobody
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  [[ $(id -u "$foreign_user") != "$(id -u)" ]] || foreign_user=root
+  write_default_config "$CONFIG_FILE" "$user"
+  parse_config "$CONFIG_FILE"
+  MEDIA_RUNTIME_USER=$foreign_user
+
+  if acquire_media_lock 0.1; then
+    fail 'non-runtime identity acquired the media-state lock'
+  fi
+  if write_media_mute_volume 70; then
+    fail 'non-runtime identity wrote media state'
+  fi
+  if clear_media_mute_volume; then
+    fail 'non-runtime identity cleared media state'
+  fi
+  [[ ! -e $MEDIA_LOCK_FILE ]] || fail 'identity rejection created a lock file'
+  [[ ! -e $MEDIA_STATE_DIR ]] || fail 'identity rejection created the media directory'
 }
 
 test_status_reports_media_url_configuration() {
@@ -2078,6 +2238,7 @@ run_test 'configuration parsing and normalization' test_config_parser_and_normal
 run_test 'default media-key mappings' test_default_media_key_mappings
 run_test 'configuration rejection and non-evaluation' test_config_parser_rejections_and_no_eval
 run_test 'invalid reload retains last valid configuration' test_invalid_reload_retains_last_valid_configuration
+run_test 'config parser avoids legacy subshell helpers' test_config_parser_avoids_legacy_subshell_helpers
 run_test 'media URL configuration validation' test_media_url_configuration_validation
 run_test 'generated system integration files' test_generated_integration_files
 run_test 'Triggerhappy config rejects symlinked parent' test_trigger_config_rejects_symlinked_parent
@@ -2093,8 +2254,13 @@ run_test 'safe config editor success and validation failure' test_config_editor_
 run_test 'config editor installs a protected snapshot' test_config_editor_installs_protected_snapshot
 run_test 'failed config application restores previous config' test_config_application_rolls_back
 run_test 'player control resolves configured URLs' test_player_control_resolves_configured_urls
+run_test 'media controls share one deadline' test_media_control_shared_deadline
+run_test 'media controls use a monotonic outer bound' test_media_control_monotonic_outer_bound
 run_test 'player control resolves stateful media keys' test_player_control_resolves_stateful_media_keys
 run_test 'mute state rejects symlinked parent' test_mute_state_rejects_symlinked_parent
+run_test 'media state rejects unprivileged parent for root' \
+  test_media_state_rejects_unprivileged_parent_for_root
+run_test 'media state rejects the wrong identity' test_media_state_rejects_wrong_identity
 run_test 'status reports media URL configuration' test_status_reports_media_url_configuration
 run_test 'pairing provenance and existing bonds' test_pairing_provenance_and_existing_bond
 run_test 'pair --all attempts every configured speaker' test_pair_all_attempts_every_configured_speaker

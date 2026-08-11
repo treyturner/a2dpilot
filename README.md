@@ -12,7 +12,7 @@ The project is delivered as one Bash program. The same `a2dpilot` file installs 
 - Automatic controller soft-unblock and power-on at boot and after adapter loss.
 - BlueZ, PipeWire A2DP, and optional AVRCP health checks.
 - Automatic codec negotiation through PipeWire, including SBC, SBC-XQ, aptX, aptX HD, and LDAC when supported by the speaker.
-- Configurable media-key routing with broad Linux transport-key coverage, relative volume control, and relative or absolute HTTP(S) player URLs.
+- Responsive media-key routing with broad Linux transport-key coverage, relative volume control, configurable HTTP(S) URLs, and one bounded action deadline.
 - Safe configuration editing and validation through the CLI.
 - Atomic executable-only updates from `main`, a branch, a tag, or an exact commit.
 - Headless PipeWire/WirePlumber operation using systemd linger.
@@ -213,7 +213,7 @@ media-key = KEY_NEXTSONG player/playback/skipNext?type=music&commandID={command-
 
 `base-url` is optional. It must be an HTTP(S) origin or path prefix without a query or fragment. A relative mapping is resolved against it, so the usual single-player configuration does not repeat the host. An absolute HTTP(S) mapping overrides the base and may target another host:
 
-Requests are HTTP GETs and fail after three seconds rather than blocking Triggerhappy indefinitely. The generated Triggerhappy command contains only the validated key name; configured URLs are looked up by A2DPilot and passed to `curl` as data, never evaluated as shell code.
+Requests are HTTP GETs. Each media action receives one monotonic two-second budget enforced around the complete worker process and shared by configuration parsing, state locking, timeline polling, connection establishment, and the final request, so individually bounded steps cannot accumulate into a long apparent freeze. The generated Triggerhappy command contains only the validated key name; configured URLs are looked up by A2DPilot and passed to `curl` as data, never evaluated as shell code.
 
 ```ini
 media-key = KEY_CUSTOM https://automation.example/hooks/skip
@@ -305,9 +305,9 @@ aptX Adaptive is not currently exposed by this PipeWire stack. Although the LC3 
 
 - The daemon reloads the central configuration while running. If a direct manual edit becomes invalid, it retains the last valid configuration and logs the error once per distinct failure.
 - Connection health requires BlueZ `Connected: yes` and a matching PipeWire `bluez_output` node. `media-controls = required` additionally checks BlueZ's `MediaControl1` AVRCP state.
-- Mutating commands and daemon connection cycles serialize through the root-owned `/run/lock/a2dpilot/lock`. Stateful media controls use a separate short-lived lock so a configuration editor cannot block button handling.
+- Mutating commands and daemon connection cycles serialize through the root-owned `/run/lock/a2dpilot/lock`. Stateful media controls use a separate short-lived lock beneath `/run/a2dpilot/media`, within the same two-second action deadline, so a configuration editor cannot block button handling.
 - Root-managed configuration is parsed as data and never sourced as shell code.
-- Triggerhappy receives only validated key names; URL resolution and placeholder expansion happen inside `player-control` immediately before `curl` runs. Stateful volume, mute, shuffle, and repeat mappings first poll the player's music timeline. Systemd recreates `/run/a2dpilot` for Debian's unprivileged Triggerhappy handler; per-player pre-mute volumes stored there expire on reboot.
+- Triggerhappy receives only validated key names; URL resolution and placeholder expansion happen inside `player-control` immediately before `curl` runs. Stateful volume, mute, shuffle, and repeat mappings first poll the player's music timeline. Systemd owns `/run/a2dpilot` and creates its mode-`0700` `media` child for Debian's unprivileged Triggerhappy handler; root CLI requests drop to that handler identity before opening its lock or state files, and per-player pre-mute volumes stored there expire on reboot.
 - A2DPilot runs Triggerhappy through its direct service and disables the competing socket-activation unit while installed. Uninstall restores the original state of both units.
 - Install records its managed-state rollback snapshot before APT and service mutations. A failed or interrupted installation invokes uninstall automatically; APT-managed packages are retained, and a failed rollback keeps the snapshot for recovery.
 - Update preserves that snapshot and replaces only the installed executable; an active daemon is restarted, while an inactive daemon remains stopped.
@@ -321,12 +321,18 @@ The regression suite requires no root access, packages, Bluetooth hardware, or s
 Run the same checks as CI:
 
 ```sh
-bash -n a2dpilot tests/a2dpilot_test.sh
-shellcheck -x a2dpilot tests/a2dpilot_test.sh
+bash -n a2dpilot tests/a2dpilot_test.sh tests/run_shellcheck.sh
+./tests/run_shellcheck.sh
 ./tests/a2dpilot_test.sh
 ```
 
-GitHub Actions runs these checks for pull requests and pushes to `main`.
+ShellCheck is pinned in `.shellcheck-version`. The wrapper rejects a missing or
+different local version so developer checks use the same analyzer as CI. Exact
+release binaries are available from the
+[ShellCheck releases](https://github.com/koalaman/shellcheck/releases).
+
+GitHub Actions downloads and checksum-verifies the pinned upstream release,
+then runs these checks for pull requests and pushes to `main`.
 
 ## Troubleshooting
 
@@ -405,6 +411,8 @@ sudo /usr/local/sbin/a2dpilot player-control KEY_PLAYCD
 ```
 
 If the direct command reports that no URL is configured, check the exact `KEY_*` name in the `media-key` entry. If it produces a curl error, verify the resolved `base-url` and mapping URL and confirm that the destination service is running. Volume, mute, shuffle, and repeat also require the player to answer `/player/timeline/poll` with a music timeline containing the corresponding state. A speaker may support A2DP without useful AVRCP controls; use `auto` so this does not trigger reconnects, or `off` to disable the mappings.
+
+Every action fails within approximately two seconds when the player or its timeline API is unavailable. If healthy requests still approach that limit, compare a direct `player-control` invocation with the underlying URL; persistent delay in both points to the player API rather than Triggerhappy.
 
 ### A configuration edit was rejected
 
