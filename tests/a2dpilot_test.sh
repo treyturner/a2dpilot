@@ -3016,6 +3016,128 @@ test_recycled_sink_is_not_targeted() {
     fail 'recycled sink retained pending stream ownership'
 }
 
+test_stale_owned_target_is_rewritten_after_relink() {
+  local user mac=AA:BB:CC:DD:EE:FF stream_target=77
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  CFG_AUDIO_USER=$user
+  routing_now_seconds() { printf '100\n'; }
+  find_a2dp_node_id() { printf '83\n'; }
+  configured_default_sink() { printf 'bluez_output.AA_BB_CC_DD_EE_FF.1\n'; }
+  pipewire_instance_id() { printf '01234567-89ab-cdef-0123-456789abcdef:4321:987654\n'; }
+  enumerate_playback_streams() { printf '95 138\n'; }
+  inspect_pipewire_node() {
+    if [[ $2 == 83 ]]; then
+      PIPEWIRE_NODE_SERIAL=89
+      PIPEWIRE_NODE_NAME=bluez_output.AA_BB_CC_DD_EE_FF.1
+      PIPEWIRE_NODE_CLASS=Audio/Sink
+      PIPEWIRE_NODE_DRIVER=
+    else
+      PIPEWIRE_NODE_SERIAL=138
+      PIPEWIRE_NODE_NAME='Long-lived Player'
+      PIPEWIRE_NODE_CLASS=Stream/Output/Audio
+      PIPEWIRE_NODE_DRIVER=83
+    fi
+  }
+  stream_target_serial() { printf '%s\n' "$stream_target"; }
+  bounded_user_pw_metadata() {
+    [[ $* == *'95 target.object 89 Spa:Id'* ]] || return 1
+    stream_target=89
+  }
+  ROUTING_STATE_USER=$user
+  ROUTING_STATE_SPEAKERS=([11:22:33:44:55:66]=1)
+  ROUTING_PIPEWIRE_INSTANCE=01234567-89ab-cdef-0123-456789abcdef:4321:987654
+  ROUTING_STREAM_TARGETS=([138]=77)
+  write_routing_state
+
+  reconcile_speaker_routing "$mac"
+  assert_eq 89 "$stream_target"
+  assert_file_contains "$ROUTING_STATE_FILE" $'stream\t138\t89'
+  assert_file_not_contains "$ROUTING_STATE_FILE" $'stream\t138\t77'
+}
+
+test_recycled_stream_is_not_cleared() {
+  local user inspections target_queries
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  printf '0\n' > "$TEST_SCRATCH/stream-inspections"
+  printf '0\n' > "$TEST_SCRATCH/target-queries"
+  routing_now_seconds() { printf '100\n'; }
+  configured_default_sink() { return 2; }
+  pipewire_instance_id() { printf '01234567-89ab-cdef-0123-456789abcdef:4321:987654\n'; }
+  enumerate_playback_streams() { printf '95 138\n'; }
+  inspect_pipewire_node() {
+    inspections=$(< "$TEST_SCRATCH/stream-inspections")
+    inspections=$((inspections + 1))
+    printf '%s\n' "$inspections" > "$TEST_SCRATCH/stream-inspections"
+    PIPEWIRE_NODE_CLASS=Stream/Output/Audio
+    PIPEWIRE_NODE_SERIAL=$((137 + inspections))
+    PIPEWIRE_NODE_NAME='Reused Player ID'
+    PIPEWIRE_NODE_DRIVER=83
+  }
+  stream_target_serial() {
+    target_queries=$(< "$TEST_SCRATCH/target-queries")
+    target_queries=$((target_queries + 1))
+    printf '%s\n' "$target_queries" > "$TEST_SCRATCH/target-queries"
+    printf '89\n'
+  }
+  bounded_user_pw_metadata() { : > "$TEST_SCRATCH/recycled-stream-cleared"; }
+  ROUTING_STATE_USER=$user
+  ROUTING_PIPEWIRE_INSTANCE=01234567-89ab-cdef-0123-456789abcdef:4321:987654
+  ROUTING_STREAM_TARGETS=([138]=89)
+  write_routing_state
+
+  clear_owned_routing "$user"
+  [[ ! -e $TEST_SCRATCH/recycled-stream-cleared ]] || \
+    fail 'a recycled PipeWire stream ID had its target cleared'
+  target_queries=$(< "$TEST_SCRATCH/target-queries")
+  assert_eq 1 "$target_queries"
+  [[ ! -e $ROUTING_STATE_FILE ]] || \
+    fail 'recycled stream retained stale routing provenance'
+}
+
+test_changed_stream_target_is_not_cleared() {
+  local user target_queries
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  printf '0\n' > "$TEST_SCRATCH/target-queries"
+  routing_now_seconds() { printf '100\n'; }
+  configured_default_sink() { return 2; }
+  pipewire_instance_id() { printf '01234567-89ab-cdef-0123-456789abcdef:4321:987654\n'; }
+  enumerate_playback_streams() { printf '95 138\n'; }
+  inspect_pipewire_node() {
+    PIPEWIRE_NODE_CLASS=Stream/Output/Audio
+    PIPEWIRE_NODE_SERIAL=138
+    PIPEWIRE_NODE_NAME='Long-lived Player'
+    PIPEWIRE_NODE_DRIVER=83
+  }
+  stream_target_serial() {
+    target_queries=$(< "$TEST_SCRATCH/target-queries")
+    target_queries=$((target_queries + 1))
+    printf '%s\n' "$target_queries" > "$TEST_SCRATCH/target-queries"
+    if (( target_queries == 1 )); then printf '89\n'; else printf '77\n'; fi
+  }
+  bounded_user_pw_metadata() { : > "$TEST_SCRATCH/changed-target-cleared"; }
+  ROUTING_STATE_USER=$user
+  ROUTING_PIPEWIRE_INSTANCE=01234567-89ab-cdef-0123-456789abcdef:4321:987654
+  ROUTING_STREAM_TARGETS=([138]=89)
+  write_routing_state
+
+  clear_owned_routing "$user"
+  [[ ! -e $TEST_SCRATCH/changed-target-cleared ]] || \
+    fail 'an independently changed stream target was cleared'
+  target_queries=$(< "$TEST_SCRATCH/target-queries")
+  assert_eq 2 "$target_queries"
+  [[ ! -e $ROUTING_STATE_FILE ]] || \
+    fail 'independently changed stream retained stale routing provenance'
+}
+
 test_interrupted_routing_transition_preserves_prior_owner() {
   local user mac=AA:BB:CC:DD:EE:FF sink_name=bluez_output.AA_BB_CC_DD_EE_FF.1
   local prior_mac=11:22:33:44:55:66
@@ -4499,6 +4621,10 @@ run_test 'default cleanup revalidates and retires missing user' \
   test_default_cleanup_revalidates_and_retires_missing_user
 run_test 'recycled sink is not defaulted' test_recycled_sink_is_not_defaulted
 run_test 'recycled sink is not targeted' test_recycled_sink_is_not_targeted
+run_test 'stale owned target is rewritten after relink' \
+  test_stale_owned_target_is_rewritten_after_relink
+run_test 'recycled stream is not cleared' test_recycled_stream_is_not_cleared
+run_test 'changed stream target is not cleared' test_changed_stream_target_is_not_cleared
 run_test 'interrupted routing transition preserves prior owner' \
   test_interrupted_routing_transition_preserves_prior_owner
 run_test 'routing rotates after a shared deadline' test_routing_rotates_after_deadline
