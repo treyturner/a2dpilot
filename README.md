@@ -11,9 +11,11 @@ The project is delivered as one Bash program. The same `a2dpilot` file installs 
 - Non-preemptive failover: a working fallback is not interrupted merely because a preferred speaker reappears.
 - Automatic controller soft-unblock and power-on at boot and after adapter loss.
 - BlueZ, PipeWire A2DP, and optional AVRCP health checks.
+- Best-effort selection of the healthy managed Bluetooth sink as PipeWire's default.
 - Automatic PipeWire codec negotiation by default, with optional ordered codec preferences for each speaker.
 - Responsive media-key routing with broad Linux transport-key coverage, relative volume control, configurable HTTP(S) URLs, and one bounded action deadline.
 - Reversible live suppression of Raspberry Pi onboard analogue and HDMI audio devices without disabling HDMI video.
+- Optional post-pairing restart of safely detected Caldera Music and Plexamp user services.
 - Safe configuration editing and validation through the CLI.
 - Atomic executable-only updates from `main`, a branch, a tag, or an exact commit.
 - Headless PipeWire/WirePlumber operation using systemd linger.
@@ -46,7 +48,7 @@ Managed files are:
 | `/etc/systemd/system/a2dpilot.service`                 | Connection-maintenance daemon                                                     |
 | `/etc/wireplumber/wireplumber.conf.d/51-a2dpilot.conf` | Headless Bluetooth policy and optional Raspberry Pi onboard-audio suppression     |
 | `/etc/triggerhappy/triggers.d/a2dpilot.conf`           | Media-key mappings, or an inert file when controls are disabled                   |
-| `/var/lib/a2dpilot/`                                   | Root-only backups, rollback metadata, user snapshots, and created-bond provenance |
+| `/var/lib/a2dpilot/`                                   | Root-only backups, rollback metadata, user snapshots, created-bond provenance, and current default-sink ownership |
 
 ## Environment expectations
 
@@ -97,6 +99,16 @@ When creating a new configuration, an interactive install makes a best-effort ch
 
 After package and service setup, an interactive install scans for Bluetooth Classic devices. Put the desired speaker into pairing mode, select it by number, and repeat to add additional fallbacks. The selection order becomes speaker priority. Enter `r` to rescan or press Enter without a selection to finish.
 
+After pairing finishes, A2DPilot waits up to ten seconds for a configured speaker to become a healthy A2DP sink and makes it PipeWire's effective default. It then looks for exact `caldera-music`, `Plexamp`, or `plexamp` processes owned by the configured audio user. If a process can be mapped safely to an active user service, such as `caldera-music.service`, `plexamp.service`, or `plexamp-headless.service`, the installer offers to restart that service. The prompt defaults to no and each detected service is handled separately:
+
+```text
+Caldera Music is running as caldera-music.service.
+Restart it now so it reopens audio through PipeWire?
+Playback may resume paused. [y/N]:
+```
+
+Restarting lets the player reopen audio after onboard devices and the PipeWire default have changed. A2DPilot does not capture playback state or resume playback, so manually press play if the application comes back paused. It also does not kill or relaunch processes directly. A recognized process that cannot be tied safely to the audio user's active `.service` is reported for manual restart.
+
 For unattended installation:
 
 ```sh
@@ -104,7 +116,7 @@ curl -fsSL https://raw.githubusercontent.com/treyturner/a2dpilot/main/a2dpilot \
   | sudo bash -s -- install --user pi --non-interactive
 ```
 
-An unattended installation with no speakers is valid and remains idle until `a2dpilot pair` or `a2dpilot config` is used.
+An unattended installation with no speakers is valid and remains idle until `a2dpilot pair` or `a2dpilot config` is used. Non-interactive installation never restarts a player; it prints an actionable warning for each recognized running instance.
 
 ## Updating A2DPilot
 
@@ -273,7 +285,7 @@ sudo a2dpilot status
 sudo a2dpilot audio onboard status
 ```
 
-`devices` prints priority, pairing, trust, BlueZ connection, A2DP, AVRCP, negotiated codec, configured codec policy, and device name for every speaker. A policy appears as `auto` or an ordered value such as `aptx_hd>aptx>sbc`. `status` adds installation, controller, rfkill, base URL, media-key count, onboard-audio policy and visibility, system-service, and audio-user service diagnostics.
+`devices` prints priority, pairing, trust, BlueZ connection, A2DP, AVRCP, negotiated codec, configured codec policy, and device name for every speaker. A policy appears as `auto` or an ordered value such as `aptx_hd>aptx>sbc`. `status` adds installation, controller, rfkill, base URL, media-key count, onboard-audio policy and visibility, the active managed sink, PipeWire's effective default, recognized player services, best-effort player backend classification (`PipeWire`, `direct ALSA`, or `unknown`), system-service, and audio-user service diagnostics.
 
 ### Add or repair speakers
 
@@ -354,6 +366,8 @@ aptX Adaptive is not currently exposed by this PipeWire stack. Although the LC3 
 - Install records its managed-state rollback snapshot before APT and service mutations. A failed or interrupted installation invokes uninstall automatically; APT-managed packages are retained, and a failed rollback keeps the snapshot for recovery.
 - Update preserves that snapshot and replaces only the installed executable; an active daemon is restarted, while an inactive daemon remains stopped.
 - Pairing happens after installation commits, so a speaker being unavailable does not erase a valid system setup.
+- Default selection uses bounded `wpctl` and `pw-metadata` calls and records only the last selection A2DPilot successfully verified. Forgetting that speaker, changing the audio user, or uninstalling clears the configured default only if it still matches the recorded sink; a later user change is preserved.
+- A2DPilot does not enumerate or retarget existing playback streams. During interactive installation it can instead restart an exact Caldera Music or Plexamp user service after validating its process owner, cgroup, active service, and process identity. The restart is bounded to ten seconds and never invokes a player API or sends a process signal directly.
 - The system-wide WirePlumber fragment disables seat monitoring and, when requested, hides narrowly matched Raspberry Pi onboard ALSA devices. It deliberately does not override `bluez5.codecs`; per-speaker selection uses advertised PipeWire profile indices with `save: false`.
 
 ## Tests
@@ -431,6 +445,17 @@ Look for `bluez_output.` followed by the speaker MAC with underscores. Check the
 sudo loginctl show-user pi -p Linger
 sudo systemctl status "user@$(id -u pi).service"
 ```
+
+`sudo a2dpilot status` reports both the active managed sink and PipeWire's effective default. The daemon retries default selection while the speaker remains healthy, but it deliberately does not seize or migrate a stream that a player opened earlier. If Caldera Music or Plexamp was already running when audio policy changed, restart its user service so it opens a fresh output:
+
+```sh
+sudo -u pi env \
+  XDG_RUNTIME_DIR="/run/user/$(id -u pi)" \
+  DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u pi)/bus" \
+  systemctl --user restart caldera-music.service
+```
+
+Use the service name shown by `a2dpilot status`. A `direct ALSA` backend can retain a hardware PCM and bypass PipeWire; a safely detected service is why interactive installation offers the same restart after pairing. Restarting may leave playback paused, and A2DPilot does not issue a resume command. If status shows `no safe user service`, restart the player through its own documented supervisor rather than killing the reported PID.
 
 ### A preferred codec was not selected
 
