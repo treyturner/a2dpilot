@@ -289,6 +289,53 @@ test_onboard_audio_configuration() {
   assert_file_contains "$CONFIG_FILE" 'onboard-hdmi = enabled'
 }
 
+test_install_onboard_audio_detection() {
+  local model cards sound_class
+  setup_scratch_dir
+  load_app
+  model=$TEST_SCRATCH/model
+  cards=$TEST_SCRATCH/cards
+  sound_class=$TEST_SCRATCH/sound
+  mkdir -p "$sound_class"
+
+  printf 'Generic ARM host\n' > "$model"
+  printf 'bcm2835 Headphones\nvc4-hdmi-0\n' > "$cards"
+  if detect_install_onboard_audio "$model" "$cards" "$sound_class"; then
+    fail 'non-Raspberry Pi host was offered onboard-audio suppression'
+  fi
+  assert_eq 0 "$INSTALL_ONBOARD_ANALOG_AVAILABLE"
+  assert_eq 0 "$INSTALL_ONBOARD_HDMI_AVAILABLE"
+
+  printf 'Raspberry Pi 4 Model B Rev 1.5\0' > "$model"
+  printf ' 0 [HDMI]: bcm2835_hdmi - bcm2835 HDMI\n' > "$cards"
+  if detect_install_onboard_audio "$model" "$cards" "$sound_class"; then
+    fail 'legacy bcm2835 HDMI card was classified as onboard analogue audio'
+  fi
+  assert_eq 0 "$INSTALL_ONBOARD_ANALOG_AVAILABLE"
+  assert_eq 0 "$INSTALL_ONBOARD_HDMI_AVAILABLE"
+
+  printf ' 2 [Headphones]: bcm2835_headpho - bcm2835 Headphones\n' > "$cards"
+  detect_install_onboard_audio "$model" "$cards" "$sound_class"
+  assert_eq 1 "$INSTALL_ONBOARD_ANALOG_AVAILABLE"
+  assert_eq 0 "$INSTALL_ONBOARD_HDMI_AVAILABLE"
+
+  : > "$cards"
+  mkdir -p "$sound_class/card0/device"
+  printf 'vc4hdmi0\n' > "$sound_class/card0/id"
+  ln -s /drivers/vc4_hdmi "$sound_class/card0/device/driver"
+  detect_install_onboard_audio "$model" "$cards" "$sound_class"
+  assert_eq 0 "$INSTALL_ONBOARD_ANALOG_AVAILABLE"
+  assert_eq 1 "$INSTALL_ONBOARD_HDMI_AVAILABLE"
+
+  : > "$cards"
+  rm -f -- "$sound_class/card0/device/driver" "$sound_class/card0/id"
+  if detect_install_onboard_audio "$model" "$cards" "$sound_class"; then
+    fail 'Raspberry Pi without matching sound devices was offered suppression'
+  fi
+  assert_eq 0 "$INSTALL_ONBOARD_ANALOG_AVAILABLE"
+  assert_eq 0 "$INSTALL_ONBOARD_HDMI_AVAILABLE"
+}
+
 test_default_media_key_mappings() {
   local user index
   local -a expected_keys=(
@@ -539,14 +586,16 @@ test_generated_integration_files() {
   write_wireplumber_config "$WIREPLUMBER_CONF"
   assert_file_contains "$WIREPLUMBER_CONF" 'monitor.alsa.rules'
   assert_file_contains "$WIREPLUMBER_CONF" 'device.form-factor = "internal"'
-  assert_file_contains "$WIREPLUMBER_CONF" 'api.alsa.card.name = "~bcm2835.*"'
+  assert_file_contains "$WIREPLUMBER_CONF" \
+    'api.alsa.card.name = "~bcm2835.*[Hh]eadphones.*"'
   assert_file_contains "$WIREPLUMBER_CONF" 'device.disabled = true'
   assert_file_not_contains "$WIREPLUMBER_CONF" 'vc4-hdmi'
   assert_file_not_contains "$WIREPLUMBER_CONF" 'bluez5.codecs'
 
   CFG_ONBOARD_HDMI=disabled
   write_wireplumber_config "$WIREPLUMBER_CONF"
-  assert_file_contains "$WIREPLUMBER_CONF" 'api.alsa.card.name = "~bcm2835.*"'
+  assert_file_contains "$WIREPLUMBER_CONF" \
+    'api.alsa.card.name = "~bcm2835.*[Hh]eadphones.*"'
   assert_file_contains "$WIREPLUMBER_CONF" 'api.alsa.card.name = "~vc4-hdmi.*"'
 
   write_trigger_config "$TRIGGER_CONF" off
@@ -655,6 +704,8 @@ test_noninteractive_install_and_uninstall_fixture() {
   assert_eq "$user" "$CFG_AUDIO_USER"
   assert_eq 0 "${#CFG_SPEAKERS[@]}"
   assert_eq http://127.0.0.1:32500 "$CFG_BASE_URL"
+  assert_eq enabled "$CFG_ONBOARD_ANALOG"
+  assert_eq enabled "$CFG_ONBOARD_HDMI"
   assert_eq 20 "${#CFG_MEDIA_KEYS[@]}"
   assert_file_contains "$SYSTEMD_UNIT" "$INSTALLED_CLI daemon"
   assert_file_contains "$TRIGGER_CONF" 'player-control KEY_PLAYCD'
@@ -685,6 +736,67 @@ test_noninteractive_install_and_uninstall_fixture() {
   [[ ! -e $CONFIG_FILE ]] || fail 'created configuration survived uninstall'
   [[ ! -e $STATE_DIR ]] || fail 'rollback state survived successful uninstall'
   assert_file_not_contains "$apt_log" 'remove -y'
+}
+
+test_interactive_install_configures_onboard_audio_before_pairing() {
+  local user output tty_checks=0 tty_answer_index=0
+  local -a tty_answers=(maybe yes no)
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+
+  require_root() { :; }
+  acquire_lock() { :; }
+  release_lock() { :; }
+  has_tty() {
+    tty_checks=$((tty_checks + 1))
+    (( tty_checks == 1 ))
+  }
+  tty_print() { printf '%s\n' "$*" >> "$TEST_SCRATCH/tty.log"; }
+  tty_read() {
+    local variable=$1
+    (( tty_answer_index < ${#tty_answers[@]} )) || return 1
+    printf -v "$variable" '%s' "${tty_answers[$tty_answer_index]}"
+    tty_answer_index=$((tty_answer_index + 1))
+  }
+  install() {
+    local -a forwarded=()
+    while [[ $# -gt 0 ]]; do
+      case $1 in
+        -o|-g) shift 2 ;;
+        *) forwarded+=("$1"); shift ;;
+      esac
+    done
+    /usr/bin/install "${forwarded[@]}"
+  }
+  chown() { :; }
+  record_system_service_states() { : > "$STATE_DIR/system-service-states"; }
+  record_user_state() { :; }
+  record_rfkill_state() { : > "$STATE_DIR/rfkill-state"; }
+  record_controller_state() { : > "$STATE_DIR/controller-state"; }
+  detect_install_onboard_audio() {
+    INSTALL_ONBOARD_ANALOG_AVAILABLE=1
+    INSTALL_ONBOARD_HDMI_AVAILABLE=1
+  }
+  apt-get() { :; }
+  systemctl() { :; }
+  ensure_audio_user() { :; }
+  power_controller() { :; }
+
+  output=$(install_action --user "$user")
+  assert_contains "$output" 'installed successfully'
+  assert_file_contains "$TEST_SCRATCH/tty.log" \
+    'You may optionally disable one or more onboard audio interfaces before Bluetooth pairing.'
+  assert_file_contains "$TEST_SCRATCH/tty.log" 'Disable Raspberry Pi onboard analogue audio?'
+  assert_file_contains "$TEST_SCRATCH/tty.log" 'Disable Raspberry Pi onboard HDMI audio?'
+  assert_file_contains "$TEST_SCRATCH/tty.log" 'Please answer y or n.'
+  parse_config "$CONFIG_FILE"
+  assert_eq disabled "$CFG_ONBOARD_ANALOG"
+  assert_eq enabled "$CFG_ONBOARD_HDMI"
+  assert_file_contains "$WIREPLUMBER_CONF" \
+    'api.alsa.card.name = "~bcm2835.*[Hh]eadphones.*"'
+  assert_file_not_contains "$WIREPLUMBER_CONF" 'api.alsa.card.name = "~vc4-hdmi.*"'
 }
 
 test_uninstall_keeps_packages_and_reports_empty_bond_policy() {
@@ -1432,7 +1544,8 @@ test_onboard_audio_cli_and_application() {
   assert_eq disabled "$CFG_ONBOARD_ANALOG"
   assert_eq enabled "$CFG_ONBOARD_HDMI"
   assert_eq AA:BB:CC:DD:EE:FF "${CFG_SPEAKERS[0]}"
-  assert_file_contains "$WIREPLUMBER_CONF" 'api.alsa.card.name = "~bcm2835.*"'
+  assert_file_contains "$WIREPLUMBER_CONF" \
+    'api.alsa.card.name = "~bcm2835.*[Hh]eadphones.*"'
   assert_file_not_contains "$WIREPLUMBER_CONF" 'vc4-hdmi'
 
   audio_onboard_action disable
@@ -1563,6 +1676,9 @@ test_onboard_audio_status_and_matching() {
 	id 54, type PipeWire:Interface:Device/3
 		device.api = "alsa"
 		media.class = "Audio/Device"
+	id 55, type PipeWire:Interface:Device/3
+		device.api = "alsa"
+		media.class = "Audio/Device"
 EOF
       return 0
     fi
@@ -1609,6 +1725,15 @@ EOF
 	type: PipeWire:Interface:Device/3
 *		api.alsa.card.name = "bcm2835 USB device without form factor"
 *		device.api = "alsa"
+*		media.class = "Audio/Device"
+EOF
+        ;;
+      55) cat <<'EOF'
+	id: 55
+	type: PipeWire:Interface:Device/3
+*		api.alsa.card.name = "bcm2835 HDMI"
+*		device.api = "alsa"
+*		device.form-factor = "internal"
 *		media.class = "Audio/Device"
 EOF
         ;;
@@ -3102,6 +3227,7 @@ run_test 'syntax, help, and streamed bootstrap' test_syntax_help_and_stream_boot
 run_test 'managed dependency list' test_managed_package_list
 run_test 'configuration parsing and normalization' test_config_parser_and_normalization
 run_test 'onboard-audio configuration and defaults' test_onboard_audio_configuration
+run_test 'install detects suppressible onboard audio' test_install_onboard_audio_detection
 run_test 'per-speaker codec configuration' test_speaker_codec_configuration
 run_test 'default media-key mappings' test_default_media_key_mappings
 run_test 'configuration rejection and non-evaluation' test_config_parser_rejections_and_no_eval
@@ -3112,6 +3238,8 @@ run_test 'generated system integration files' test_generated_integration_files
 run_test 'WirePlumber config path safety' test_wireplumber_config_path_safety
 run_test 'Triggerhappy config rejects symlinked parent' test_trigger_config_rejects_symlinked_parent
 run_test 'non-interactive install and uninstall fixture' test_noninteractive_install_and_uninstall_fixture
+run_test 'interactive install configures onboard audio before pairing' \
+  test_interactive_install_configures_onboard_audio_before_pairing
 run_test 'uninstall keeps packages and reports empty bond policy' test_uninstall_keeps_packages_and_reports_empty_bond_policy
 run_test 'failed install rollback retains packages' test_failed_install_rollback_retains_packages
 run_test 'install recovery needs no package snapshot' test_install_recovery_needs_no_package_snapshot

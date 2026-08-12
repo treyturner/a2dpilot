@@ -93,6 +93,8 @@ curl -fsSL https://raw.githubusercontent.com/treyturner/a2dpilot/main/a2dpilot \
   | sudo bash -s -- install --user pi
 ```
 
+When creating a new configuration, an interactive install makes a best-effort check for Raspberry Pi onboard analogue and HDMI audio and asks separately whether to suppress each detected class. Undetected devices remain enabled and can be changed later with `a2dpilot audio onboard`. These choices are written before WirePlumber is provisioned and before Bluetooth pairing, avoiding an unnecessary interruption to a newly paired speaker.
+
 After package and service setup, an interactive install scans for Bluetooth Classic devices. Put the desired speaker into pairing mode, select it by number, and repeat to add additional fallbacks. The selection order becomes speaker priority. Enter `r` to rescan or press Enter without a selection to finish.
 
 For unattended installation:
@@ -197,7 +199,7 @@ sudo a2dpilot audio onboard enable all
 
 The optional selector is `analog`, `hdmi`, or `all`; omitting it means `all`. A change atomically updates `/etc/a2dpilot.conf`, regenerates the managed WirePlumber fragment, restarts the configured user's WirePlumber session, and lets the daemon reconnect Bluetooth normally. Failed validation or application restores the prior configuration and runtime policy.
 
-Suppression uses [WirePlumber's ALSA device rules](https://pipewire.pages.freedesktop.org/wireplumber/daemon/configuration/alsa.html) and is deliberately narrow. The rules require an internal ALSA card whose reported card name begins with `bcm2835` for analogue audio or `vc4-hdmi` for HDMI audio. USB interfaces and audio HATs are not hidden merely because they are present. The command changes live audio-device visibility only: it does not edit boot firmware, unload drivers, disable HDMI video, or require a reboot. On other hardware the rules normally match nothing, and status reports zero visible matching devices.
+Suppression uses [WirePlumber's ALSA device rules](https://pipewire.pages.freedesktop.org/wireplumber/daemon/configuration/alsa.html) and is deliberately narrow. The rules require an internal ALSA card reported as `bcm2835 Headphones` for analogue audio or with a `vc4-hdmi` name for HDMI audio. USB interfaces, audio HATs, and legacy `bcm2835 HDMI` cards are not hidden by the analogue policy. The command changes live audio-device visibility only: it does not edit boot firmware, unload drivers, disable HDMI video, or require a reboot. On other hardware the rules normally match nothing, and status reports zero visible matching devices.
 
 ### Speaker priority
 
@@ -483,7 +485,7 @@ sudo a2dpilot audio onboard status
 sudo journalctl -b --user-unit=wireplumber.service
 ```
 
-The rule intentionally ignores USB and HAT devices and only matches internal Raspberry Pi cards reported with `bcm2835*` or `vc4-hdmi*` ALSA card names. A zero count may mean that the hardware is absent, already hidden by the configured policy, or reported under a different name. Re-enable both classes with `sudo a2dpilot audio onboard enable`.
+The rule intentionally ignores USB and HAT devices and only matches internal Raspberry Pi cards reported as `bcm2835 Headphones` or with `vc4-hdmi*` ALSA card names. A zero count may mean that the hardware is absent, already hidden by the configured policy, or reported under a different name. Re-enable both classes with `sudo a2dpilot audio onboard enable`.
 
 ### Installation or uninstall failed
 
