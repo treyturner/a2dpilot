@@ -99,7 +99,7 @@ When creating a new configuration, an interactive install makes a best-effort ch
 
 After package and service setup, an interactive install scans for Bluetooth Classic devices. Put the desired speaker into pairing mode, select it by number, and repeat to add additional fallbacks. The selection order becomes speaker priority. Enter `r` to rescan or press Enter without a selection to finish.
 
-After pairing finishes, A2DPilot waits up to ten seconds for a configured speaker to become a healthy A2DP sink and makes it PipeWire's effective default. It then looks for exact `caldera-music`, `Plexamp`, or `plexamp` processes owned by the configured audio user. If a process can be mapped safely to an active user service, such as `caldera-music.service`, `plexamp.service`, or `plexamp-headless.service`, the installer offers to restart that service. The prompt defaults to no and each detected service is handled separately:
+After pairing finishes, A2DPilot waits up to ten seconds for the daemon to select a configured speaker after enforcing its codec policy, verifies that it is a healthy A2DP sink, and makes it PipeWire's effective default. It then looks for exact `caldera-music`, `Plexamp`, or `plexamp` processes owned by the configured audio user. If a process can be mapped safely to an active user service, such as `caldera-music.service`, `plexamp.service`, or `plexamp-headless.service`, the installer offers to restart that service. The prompt defaults to no and each detected service is handled separately:
 
 ```text
 Caldera Music is running as caldera-music.service.

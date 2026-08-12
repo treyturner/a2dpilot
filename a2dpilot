@@ -2955,13 +2955,13 @@ wait_for_configured_speaker_default() {
   (( ${#CFG_SPEAKERS[@]} > 0 )) || return 2
   deadline=$(( $(now_seconds) + seconds ))
   while remaining=$(seconds_until_deadline "$deadline"); do
-    for mac in "${CFG_SPEAKERS[@]}"; do
+    if mac=$(read_daemon_selected_speaker); then
       remaining=$(seconds_until_deadline "$deadline") || return 1
       if device_healthy "$mac" "$remaining"; then
         select_speaker_default "$mac" "$DEFAULT_SELECTION_TIMEOUT" || return 3
         return 0
       fi
-    done
+    fi
     sleep 1
   done
   return 1
@@ -3053,6 +3053,19 @@ load_daemon_active() {
   fi
 }
 
+read_daemon_selected_speaker() {
+  local path=$STATE_DIR/active-speaker mac
+  local -a lines=()
+  [[ -f $path && ! -L $path ]] || return 1
+  mapfile -t lines < "$path" || return 1
+  (( ${#lines[@]} == 1 )) || return 1
+  mac=${lines[0]}
+  valid_mac "$mac" || return 1
+  mac=$(normalize_mac "$mac")
+  speaker_configured "$mac" || return 1
+  printf '%s\n' "$mac"
+}
+
 record_daemon_failure() {
   local mac=$1 message=$2 failures delay now
   now=$(now_seconds)
@@ -3070,6 +3083,8 @@ daemon_cycle() {
 
   if [[ -n $DAEMON_ACTIVE ]]; then
     if ! speaker_configured "$DAEMON_ACTIVE"; then
+      clear_recorded_default_sink "$CFG_AUDIO_USER" "$DAEMON_ACTIVE" || \
+        warn "Could not clear A2DPilot's recorded PipeWire default for $DAEMON_ACTIVE."
       disconnect_bluetooth_device "$DAEMON_ACTIVE" || true
       unset "DAEMON_CODEC_POLICY[$DAEMON_ACTIVE]" "DAEMON_CODEC_TARGET[$DAEMON_ACTIVE]"
       remember_daemon_active ''

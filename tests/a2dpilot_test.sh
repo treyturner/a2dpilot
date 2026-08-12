@@ -2554,12 +2554,13 @@ test_default_sink_selection_and_cleanup() {
 }
 
 test_known_player_discovery_and_service_mapping() {
-  local user uid user_cgroup_prefix service_list manual_list
+  local user uid wrong_uid user_cgroup_prefix service_list manual_list
   setup_scratch_dir
   load_app
   configure_scratch_paths
   user=$(id -un)
   uid=$(id -u "$user")
+  if (( uid == 0 )); then wrong_uid=1; else wrong_uid=0; fi
   PROC_ROOT=$TEST_SCRATCH/proc
   install -d "$PROC_ROOT"
   user_cgroup_prefix=/user.slice/user-${uid}.slice/user@${uid}.service/app.slice
@@ -2587,7 +2588,7 @@ test_known_player_discovery_and_service_mapping() {
 
   stat() {
     if [[ ${1:-} == -c && ${2:-} == %u && ${4:-} == "$PROC_ROOT/108" ]]; then
-      printf '0\n'
+      printf '%s\n' "$wrong_uid"
     else
       /usr/bin/stat "$@"
     fi
@@ -2752,6 +2753,34 @@ test_post_install_onboarding_order() {
   post_install_onboarding 0 >/dev/null
   assert_eq $'pair pair --all\npair pair\ndefault\nplayers 1' \
     "$(< "$TEST_SCRATCH/onboarding-order")"
+}
+
+test_onboarding_waits_for_daemon_selected_speaker() {
+  local preferred=AA:BB:CC:DD:EE:01 selected=AA:BB:CC:DD:EE:02 checks=0
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  CFG_SPEAKERS=("$preferred" "$selected")
+  now_seconds() { printf '100\n'; }
+  device_healthy() {
+    printf '%s\n' "$1" >> "$TEST_SCRATCH/onboarding-health-checks"
+    return 0
+  }
+  select_speaker_default() { printf '%s\n' "$1" > "$TEST_SCRATCH/onboarding-default"; }
+  sleep() {
+    checks=$((checks + 1))
+    printf '%s\n' "$selected" > "$STATE_DIR/active-speaker"
+  }
+
+  wait_for_configured_speaker_default 10
+  assert_eq "$selected" "$(< "$TEST_SCRATCH/onboarding-default")"
+  assert_eq "$selected" "$(< "$TEST_SCRATCH/onboarding-health-checks")"
+  assert_eq 1 "$checks"
+
+  printf '%s\n%s\n' "$selected" "$preferred" > "$STATE_DIR/active-speaker"
+  if read_daemon_selected_speaker >/dev/null; then
+    fail 'a malformed daemon active-speaker record was accepted'
+  fi
 }
 
 mock_a2dp_enum_profiles() {
@@ -3146,15 +3175,24 @@ test_daemon_disconnects_removed_active_speaker() {
   CFG_RECONNECT_INTERVAL=5
   CFG_MEDIA_CONTROLS=auto
   CFG_CONTROLLER=auto
+  CFG_AUDIO_USER=$(id -un)
   DAEMON_ACTIVE=
   load_daemon_active
   device_healthy() { [[ $1 == "$replacement" ]]; }
   maintain_speaker_default() { :; }
+  clear_recorded_default_sink() {
+    printf 'clear %s %s\n' "$1" "$2" >> "$TEST_SCRATCH/default-cleanup-order"
+  }
   disconnect_bluetooth_device() {
     printf 'disconnect %s\n' "$1" >> "$TEST_SCRATCH/bluetooth.log"
+    printf 'disconnect %s\n' "$1" >> "$TEST_SCRATCH/default-cleanup-order"
   }
   daemon_cycle
   assert_file_contains "$TEST_SCRATCH/bluetooth.log" "disconnect $removed"
+  assert_eq "clear $CFG_AUDIO_USER $removed" \
+    "$(sed -n '1p' "$TEST_SCRATCH/default-cleanup-order")"
+  assert_eq "disconnect $removed" \
+    "$(sed -n '2p' "$TEST_SCRATCH/default-cleanup-order")"
   assert_eq "$replacement" "$DAEMON_ACTIVE"
   assert_eq "$replacement" "$(< "$STATE_DIR/active-speaker")"
 }
@@ -3641,6 +3679,8 @@ run_test 'known player discovery and service mapping' \
 run_test 'player restart prompts and bounds' test_player_restart_prompts_and_bounds
 run_test 'detected player restart validation' test_detected_player_restart_validation
 run_test 'post-install onboarding order' test_post_install_onboarding_order
+run_test 'onboarding waits for daemon-selected speaker' \
+  test_onboarding_waits_for_daemon_selected_speaker
 run_test 'PipeWire codec profile discovery' test_pipewire_codec_profile_discovery
 run_test 'per-speaker codec selection' test_per_speaker_codec_selection
 run_test 'non-preemptive failover order' test_daemon_nonpreemption_and_failover_order
