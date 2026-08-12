@@ -85,6 +85,7 @@ configure_scratch_paths() {
   STATE_DIR=$TEST_SCRATCH/state
   BACKUP_DIR=$STATE_DIR/backup
   STATE_FILE=$STATE_DIR/state
+  DEFAULT_SINK_STATE_FILE=$STATE_DIR/default-sink
   INSTALLED_CLI=$TEST_SCRATCH/usr/local/sbin/a2dpilot
   SYSTEMD_UNIT=$TEST_SCRATCH/etc/systemd/system/a2dpilot.service
   WIREPLUMBER_CONF=$TEST_SCRATCH/etc/wireplumber/wireplumber.conf.d/51-a2dpilot.conf
@@ -2078,11 +2079,14 @@ test_status_reports_media_url_configuration() {
   systemctl() { :; }
   as_user_systemctl() { :; }
   bounded_user_pw_cli() { :; }
+  bounded_user_pw_metadata() { :; }
   output=$(status_action)
   assert_contains "$output" 'Base URL: http://127.0.0.1:32500'
   assert_contains "$output" 'Media key mappings: 4'
   assert_contains "$output" 'Onboard analog: enabled (0 visible matching devices)'
   assert_contains "$output" 'Onboard HDMI: enabled (0 visible matching devices)'
+  assert_contains "$output" 'Active managed sink: none'
+  assert_contains "$output" 'Effective default sink: none'
 }
 
 test_pairing_provenance_and_existing_bond() {
@@ -2405,6 +2409,125 @@ test_codec_property_parsing() {
   assert_contains "$calls" '3 inspect 42'
 }
 
+test_default_sink_selection_and_cleanup() {
+  local user mac=AA:BB:CC:DD:EE:FF sink other output rc effective_name configured_name
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  sink=bluez_output.AA_BB_CC_DD_EE_FF.1
+  other=alsa_output.platform-hdmi.stereo
+  CFG_AUDIO_USER=$user
+  effective_name=$other
+  configured_name=$other
+  now_seconds() { printf '100\n'; }
+  find_a2dp_node_id() { printf '42\n'; }
+  bounded_user_wpctl() {
+    printf '%s\n' "$*" >> "$TEST_SCRATCH/default-wpctl.log"
+    case $3 in
+      inspect)
+        printf '%s\n' \
+          '  * node.name = "bluez_output.AA_BB_CC_DD_EE_FF.1"' \
+          '  * media.class = "Audio/Sink"'
+        ;;
+      set-default)
+        effective_name=$sink
+        configured_name=$sink
+        ;;
+      clear-default) configured_name= ;;
+    esac
+  }
+  bounded_user_pw_metadata() {
+    local key=$6 value
+    case $key in
+      default.audio.sink) value=$effective_name ;;
+      default.configured.audio.sink) value=$configured_name ;;
+      *) return 1 ;;
+    esac
+    printf 'Found "default" metadata 5\n'
+    [[ -n $value ]] || return 0
+    printf 'update: id:0 key:'\''%s'\'' value:'\''{ "name": "%s" }'\'' type:'\''Spa:String:JSON'\''\n' \
+      "$key" "$value"
+  }
+
+  select_speaker_default "$mac" 3
+  assert_file_contains "$TEST_SCRATCH/default-wpctl.log" 'set-default 42'
+  assert_eq "$user" "$(cut -f1 "$DEFAULT_SINK_STATE_FILE")"
+  assert_file_contains "$DEFAULT_SINK_STATE_FILE" "$user"
+  assert_file_contains "$DEFAULT_SINK_STATE_FILE" "$mac"
+  assert_file_contains "$DEFAULT_SINK_STATE_FILE" "$sink"
+  assert_eq 600 "$(stat -c %a "$DEFAULT_SINK_STATE_FILE")"
+
+  : > "$TEST_SCRATCH/default-wpctl.log"
+  select_speaker_default "$mac" 3
+  assert_file_not_contains "$TEST_SCRATCH/default-wpctl.log" 'set-default'
+
+  clear_recorded_default_sink "$user" "$mac"
+  assert_file_contains "$TEST_SCRATCH/default-wpctl.log" 'clear-default 0'
+  [[ ! -e $DEFAULT_SINK_STATE_FILE ]] || fail 'cleared default ownership remained recorded'
+
+  write_default_sink_state "$user" "$mac" "$sink"
+  configured_name=$other
+  : > "$TEST_SCRATCH/default-wpctl.log"
+  clear_recorded_default_sink "$user" "$mac"
+  [[ ! -e $DEFAULT_SINK_STATE_FILE ]] || fail 'stale default ownership remained recorded'
+  assert_file_not_contains "$TEST_SCRATCH/default-wpctl.log" 'clear-default'
+
+  effective_name=$other
+  configured_name=$other
+  bounded_user_wpctl() {
+    case $3 in
+      inspect)
+        printf '%s\n' \
+          '  * node.name = "bluez_output.AA_BB_CC_DD_EE_FF.1"' \
+          '  * media.class = "Audio/Sink"'
+        ;;
+      set-default) return 1 ;;
+    esac
+  }
+  if select_speaker_default "$mac" 3; then
+    fail 'failed PipeWire default selection was accepted'
+  fi
+  assert_contains "$DEFAULT_SINK_ERROR" 'could not select'
+  [[ ! -e $DEFAULT_SINK_STATE_FILE ]] || fail 'failed selection recorded ownership'
+
+  bounded_user_wpctl() {
+    case $3 in
+      inspect)
+        printf '%s\n' \
+          '  * node.name = "bluez_output.AA_BB_CC_DD_EE_FF.1"' \
+          '  * media.class = "Audio/Sink"'
+        ;;
+      set-default) return 0 ;;
+    esac
+  }
+  if select_speaker_default "$mac" 3; then
+    fail 'unverified PipeWire default selection was accepted'
+  fi
+  assert_contains "$DEFAULT_SINK_ERROR" 'did not make'
+  [[ ! -e $DEFAULT_SINK_STATE_FILE ]] || fail 'unverified selection recorded ownership'
+
+  DAEMON_NEXT_DEFAULT_LOG=0
+  maintain_speaker_default "$mac" > "$TEST_SCRATCH/default-warning"
+  rc=$?
+  output=$(< "$TEST_SCRATCH/default-warning")
+  assert_contains "$output" 'Bluetooth remains connected'
+  assert_eq 0 "$rc"
+
+  bounded_user_pw_metadata() {
+    printf '%s\n' 'unexpected metadata output'
+  }
+  if pipewire_default_sink "$user" 3 effective >/dev/null; then
+    fail 'malformed PipeWire default metadata was accepted'
+  fi
+
+  ln -s "$TEST_SCRATCH/redirected-default" "$DEFAULT_SINK_STATE_FILE"
+  if write_default_sink_state "$user" "$mac" "$sink"; then
+    fail 'symlinked default-sink state was replaced'
+  fi
+  [[ ! -e $TEST_SCRATCH/redirected-default ]] || fail 'default state followed a symlink'
+}
+
 mock_a2dp_enum_profiles() {
   cat <<'EOF'
   Object: size 256, type Spa:Pod:Object:Param:Profile, id EnumProfile
@@ -2454,6 +2577,9 @@ test_pipewire_codec_profile_discovery() {
   assert_contains "$output" 'timeout --signal=TERM --kill-after=1 3 pw-cli enum-params 55 EnumProfile'
   output=$(bounded_user_wpctl audio 2 status --name)
   assert_contains "$output" 'timeout --signal=TERM --kill-after=1 2 wpctl status --name'
+  output=$(bounded_user_pw_metadata audio 2 -n default 0 default.audio.sink)
+  assert_contains "$output" \
+    'timeout --signal=TERM --kill-after=1 2 pw-metadata -n default 0 default.audio.sink'
 
   CFG_AUDIO_USER=audio
   bounded_user_wpctl() {
@@ -2592,11 +2718,13 @@ test_daemon_nonpreemption_and_failover_order() {
   device_healthy() { [[ $1 == "$second" ]]; }
   device_connected() { [[ $1 == "$second" ]]; }
   a2dp_connected() { [[ $1 == "$second" ]]; }
+  maintain_speaker_default() { printf '%s\n' "$1" > "$TEST_SCRATCH/default-maintenance"; }
   disconnect_other_speakers() { printf '%s\n' "$1" > "$TEST_SCRATCH/stale-cleanup"; }
   bluetoothctl() { printf '%s\n' "$*" >> "$TEST_SCRATCH/bluetooth.log"; }
   daemon_cycle
   [[ ! -e $TEST_SCRATCH/bluetooth.log ]] || fail 'healthy fallback was preempted'
   assert_eq "$second" "$(< "$TEST_SCRATCH/stale-cleanup")"
+  assert_eq "$second" "$(< "$TEST_SCRATCH/default-maintenance")"
   assert_eq "$second" "$DAEMON_ACTIVE"
 
   DAEMON_ACTIVE=
@@ -2636,6 +2764,7 @@ test_daemon_disconnects_new_stale_connection() {
   DAEMON_ACTIVE=$active
   device_healthy() { [[ $1 == "$active" ]]; }
   device_connected() { [[ $1 == "$stale" ]]; }
+  maintain_speaker_default() { :; }
   disconnect_bluetooth_device() { printf '%s\n' "$1" >> "$TEST_SCRATCH/disconnected"; }
 
   daemon_cycle
@@ -2702,6 +2831,7 @@ test_daemon_codec_policy_failover() {
   }
   disconnect_bluetooth_device() { printf '%s\n' "$1" >> "$TEST_SCRATCH/disconnected"; }
   disconnect_other_speakers() { :; }
+  maintain_speaker_default() { :; }
   a2dp_codec() { printf 'sbc\n'; }
 
   daemon_cycle > "$TEST_SCRATCH/daemon-output"
@@ -2765,6 +2895,7 @@ test_daemon_cooldown_and_backoff() {
 
   device_healthy() { return 0; }
   apply_speaker_codec_policy() { return 0; }
+  maintain_speaker_default() { :; }
   disconnect_other_speakers() { :; }
   daemon_cycle >/dev/null
   assert_eq "$mac" "$DAEMON_ACTIVE"
@@ -2789,6 +2920,7 @@ test_daemon_disconnects_removed_active_speaker() {
   DAEMON_ACTIVE=
   load_daemon_active
   device_healthy() { [[ $1 == "$replacement" ]]; }
+  maintain_speaker_default() { :; }
   disconnect_bluetooth_device() {
     printf 'disconnect %s\n' "$1" >> "$TEST_SCRATCH/bluetooth.log"
   }
@@ -3273,6 +3405,8 @@ run_test 'forget removes config and provenance' test_forget_removes_config_and_p
 run_test 'media-control health modes' test_media_control_health_modes
 run_test 'optimistic codec reporting' test_codec_reporting_is_optimistic
 run_test 'PipeWire codec property parsing' test_codec_property_parsing
+run_test 'default sink selection and conditional cleanup' \
+  test_default_sink_selection_and_cleanup
 run_test 'PipeWire codec profile discovery' test_pipewire_codec_profile_discovery
 run_test 'per-speaker codec selection' test_per_speaker_codec_selection
 run_test 'non-preemptive failover order' test_daemon_nonpreemption_and_failover_order
