@@ -120,7 +120,7 @@ sudo a2dpilot update --tag v1.2.3
 sudo a2dpilot update --sha 0123456789abcdef0123456789abcdef01234567
 ```
 
-`--tag`, `--branch`, and `--sha` are mutually exclusive. A SHA must contain all 40 hexadecimal characters. A branch or tag may move; a commit SHA is the immutable choice when an exact revision is required. Selecting an older revision is allowed and may install a version that does not itself provide the `update` command; the streamed installation command can restore a current executable in that case.
+`--tag`, `--branch`, and `--sha` are mutually exclusive. A SHA must contain all 40 hexadecimal characters. A branch or tag may move; a commit SHA is the immutable choice when an exact revision is required. The downloaded executable must declare a valid A2DPilot version, and `update` rejects revisions older than the running version before changing the installation. To intentionally downgrade, first back up `/etc/a2dpilot.conf`, run `sudo a2dpilot uninstall --keep-bonds`, and then install the older revision explicitly.
 
 Update downloads and syntax-checks the selected Bash program, then atomically replaces only `/usr/local/sbin/a2dpilot`. It does not invoke APT, rewrite `/etc/a2dpilot.conf`, regenerate systemd, WirePlumber, or Triggerhappy files, run `systemctl daemon-reload`, or alter the installation rollback snapshot. If `a2dpilot.service` was active, it is restarted and checked; an inactive service remains inactive. Failed activation restores the previous executable and attempts to restart the previous daemon. This confirms systemd activation, not Bluetooth, PipeWire, or speaker health, which remains the daemon and `status` command's responsibility.
 
