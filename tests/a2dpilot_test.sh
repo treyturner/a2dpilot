@@ -2779,7 +2779,7 @@ test_post_install_onboarding_order() {
 }
 
 test_onboarding_waits_for_daemon_selected_speaker() {
-  local preferred=AA:BB:CC:DD:EE:01 selected=AA:BB:CC:DD:EE:02 checks=0
+  local preferred=AA:BB:CC:DD:EE:01 selected=AA:BB:CC:DD:EE:02 checks=0 rc
   setup_scratch_dir
   load_app
   configure_scratch_paths
@@ -2799,6 +2799,36 @@ test_onboarding_waits_for_daemon_selected_speaker() {
   assert_eq "$selected" "$(< "$TEST_SCRATCH/onboarding-default")"
   assert_eq "$selected" "$(< "$TEST_SCRATCH/onboarding-health-checks")"
   assert_eq 1 "$checks"
+
+  : > "$TEST_SCRATCH/default-attempts"
+  select_speaker_default() {
+    printf '%s %s\n' "$1" "$2" >> "$TEST_SCRATCH/default-attempts"
+    [[ $(wc -l < "$TEST_SCRATCH/default-attempts") -ge 2 ]]
+  }
+  sleep() { :; }
+  wait_for_configured_speaker_default 10
+  assert_eq 2 "$(wc -l < "$TEST_SCRATCH/default-attempts")"
+  assert_eq "$selected 3" "$(sed -n '1p' "$TEST_SCRATCH/default-attempts")"
+
+  printf '100\n' > "$TEST_SCRATCH/onboarding-clock"
+  now_seconds() { sed -n '1p' "$TEST_SCRATCH/onboarding-clock"; }
+  select_speaker_default() {
+    printf '%s %s\n' "$1" "$2" >> "$TEST_SCRATCH/persistent-default-attempts"
+    DEFAULT_SINK_ERROR='transient default-selection failure'
+    return 1
+  }
+  sleep() {
+    local now
+    now=$(< "$TEST_SCRATCH/onboarding-clock")
+    printf '%s\n' "$((now + 1))" > "$TEST_SCRATCH/onboarding-clock"
+  }
+  set +e
+  wait_for_configured_speaker_default 3
+  rc=$?
+  set -e
+  assert_eq 3 "$rc"
+  assert_eq 3 "$(wc -l < "$TEST_SCRATCH/persistent-default-attempts")"
+  assert_eq "$selected 1" "$(sed -n '3p' "$TEST_SCRATCH/persistent-default-attempts")"
 
   printf '%s\n%s\n' "$selected" "$preferred" > "$STATE_DIR/active-speaker"
   if read_daemon_selected_speaker >/dev/null; then

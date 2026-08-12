@@ -2987,7 +2987,8 @@ wait_for_health() {
 }
 
 wait_for_configured_speaker_default() {
-  local seconds=${1:-$CONNECT_TIMEOUT} deadline remaining mac
+  local seconds=${1:-$CONNECT_TIMEOUT} deadline remaining attempt_seconds mac
+  local default_failed=0
   [[ $seconds =~ ^[1-9][0-9]*$ ]] || return 1
   (( ${#CFG_SPEAKERS[@]} > 0 )) || return 2
   deadline=$(( $(now_seconds) + seconds ))
@@ -2995,12 +2996,19 @@ wait_for_configured_speaker_default() {
     if mac=$(read_daemon_selected_speaker); then
       remaining=$(seconds_until_deadline "$deadline") || return 1
       if device_healthy "$mac" "$remaining"; then
-        select_speaker_default "$mac" "$DEFAULT_SELECTION_TIMEOUT" || return 3
-        return 0
+        remaining=$(seconds_until_deadline "$deadline") || break
+        attempt_seconds=$DEFAULT_SELECTION_TIMEOUT
+        (( attempt_seconds <= remaining )) || attempt_seconds=$remaining
+        if select_speaker_default "$mac" "$attempt_seconds"; then
+          return 0
+        fi
+        default_failed=1
       fi
     fi
+    seconds_until_deadline "$deadline" >/dev/null || break
     sleep 1
   done
+  (( default_failed == 0 )) || return 3
   return 1
 }
 
