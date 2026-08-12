@@ -135,6 +135,31 @@ write_update_payload() {
   write_update_payload_version "$path" "$A2DPILOT_VERSION" "$@"
 }
 
+write_fake_process() {
+  local root=$1 pid=$2 name=$3 cgroup=$4 start=${5:-100} backend=${6:-unknown}
+  local stat_tail='S'
+  local index
+  install -d "$root/$pid/fd"
+  printf '%s\n' "$name" > "$root/$pid/comm"
+  ln -s "/opt/$name" "$root/$pid/exe"
+  for (( index = 1; index < 19; index++ )); do
+    stat_tail+=' 0'
+  done
+  stat_tail+=" $start"
+  printf '%s (%s) %s\n' "$pid" "$name" "$stat_tail" > "$root/$pid/stat"
+  printf '0::%s\n' "$cgroup" > "$root/$pid/cgroup"
+  case $backend in
+    PipeWire)
+      printf '0000-1000 r-xp 0 00:00 0 /usr/lib/libpipewire-0.3.so.0\n' > "$root/$pid/maps"
+      ;;
+    'direct ALSA')
+      : > "$root/$pid/maps"
+      ln -s /dev/snd/pcmC0D0p "$root/$pid/fd/5"
+      ;;
+    *) : > "$root/$pid/maps" ;;
+  esac
+}
+
 run_test() {
   local name=$1 test_function=$2 rc
   TESTS_RUN=$((TESTS_RUN + 1))
@@ -2528,6 +2553,207 @@ test_default_sink_selection_and_cleanup() {
   [[ ! -e $TEST_SCRATCH/redirected-default ]] || fail 'default state followed a symlink'
 }
 
+test_known_player_discovery_and_service_mapping() {
+  local user uid user_cgroup_prefix service_list manual_list
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  uid=$(id -u "$user")
+  PROC_ROOT=$TEST_SCRATCH/proc
+  install -d "$PROC_ROOT"
+  user_cgroup_prefix=/user.slice/user-${uid}.slice/user@${uid}.service/app.slice
+  write_fake_process "$PROC_ROOT" 100 caldera-music \
+    "$user_cgroup_prefix/caldera-music.service" 100 PipeWire
+  write_fake_process "$PROC_ROOT" 101 caldera-music \
+    "$user_cgroup_prefix/caldera-music.service" 101 unknown
+  write_fake_process "$PROC_ROOT" 102 Plexamp \
+    "$user_cgroup_prefix/plexamp-headless.service" 102 'direct ALSA'
+  write_fake_process "$PROC_ROOT" 103 caldera-music-helper \
+    "$user_cgroup_prefix/caldera-music-helper.service" 103 unknown
+  write_fake_process "$PROC_ROOT" 104 plexamp \
+    /system.slice/plexamp.service 104 unknown
+  write_fake_process "$PROC_ROOT" 105 Plexamp \
+    "$user_cgroup_prefix/app-plexamp.scope" 105 unknown
+  write_fake_process "$PROC_ROOT" 106 caldera-music \
+    'malformed cgroup' 106 unknown
+  write_fake_process "$PROC_ROOT" 107 plexamp \
+    "$user_cgroup_prefix/stale.service" 107 unknown
+  write_fake_process "$PROC_ROOT" 108 Plexamp \
+    "$user_cgroup_prefix/root-owned.service" 108 unknown
+  write_fake_process "$PROC_ROOT" 109 caldera-music \
+    "$user_cgroup_prefix/caldera-music.service" 109 unknown
+  printf 'bash\n' > "$PROC_ROOT/109/comm"
+
+  stat() {
+    if [[ ${1:-} == -c && ${2:-} == %u && ${4:-} == "$PROC_ROOT/108" ]]; then
+      printf '0\n'
+    else
+      /usr/bin/stat "$@"
+    fi
+  }
+  bounded_user_systemctl() {
+    local unit=${4:-}
+    [[ ${3:-} == show ]] || return 1
+    case $unit in
+      caldera-music.service|plexamp-headless.service|stale.service)
+        printf 'LoadState=loaded\nActiveState=active\n'
+        printf 'ControlGroup=%s/%s\n' "$user_cgroup_prefix" "$unit"
+        case $unit in
+          caldera-music.service) printf 'MainPID=100\n' ;;
+          plexamp-headless.service) printf 'MainPID=102\n' ;;
+          stale.service) printf 'MainPID=107\n' ;;
+        esac
+        ;;
+      *) return 1 ;;
+    esac
+    if [[ $unit == stale.service ]]; then
+      sed -i 's/ 107$/ 207/' "$PROC_ROOT/107/stat"
+    fi
+  }
+
+  discover_known_players "$user"
+  assert_eq 2 "${#PLAYER_SERVICE_UNITS[@]}"
+  service_list=$(printf '%s\n' "${PLAYER_SERVICE_UNITS[@]}")
+  assert_contains "$service_list" 'caldera-music.service'
+  assert_contains "$service_list" 'plexamp-headless.service'
+  assert_eq 'Caldera Music' "${PLAYER_SERVICE_LABELS[0]}"
+  assert_eq PipeWire "${PLAYER_SERVICE_BACKENDS[0]}"
+  assert_eq 'direct ALSA' "${PLAYER_SERVICE_BACKENDS[1]}"
+  manual_list=$(printf '%s\n' "${PLAYER_MANUAL_PIDS[@]}")
+  assert_contains "$manual_list" '104'
+  assert_contains "$manual_list" '105'
+  assert_contains "$manual_list" '106'
+  assert_not_contains "$service_list $manual_list" '103'
+  assert_not_contains "$service_list $manual_list" '107'
+  assert_not_contains "$service_list $manual_list" '108'
+}
+
+test_player_restart_prompts_and_bounds() {
+  local user output confirm_count=0
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  discover_known_players() {
+    PLAYER_SERVICE_UNITS=(caldera-music.service plexamp.service plexamp-headless.service)
+    PLAYER_SERVICE_LABELS=('Caldera Music' Plexamp Plexamp)
+    PLAYER_SERVICE_BACKENDS=(PipeWire unknown 'direct ALSA')
+    PLAYER_MANUAL_PIDS=(444)
+    PLAYER_MANUAL_LABELS=(Plexamp)
+    PLAYER_MANUAL_BACKENDS=(unknown)
+  }
+  tty_print() {
+    # shellcheck disable=SC2059 # This test double preserves tty_print's format-string contract.
+    printf "$@"
+  }
+  tty_confirm() {
+    printf '%s\n' "$1" >> "$TEST_SCRATCH/restart-prompts"
+    confirm_count=$((confirm_count + 1))
+    (( confirm_count != 2 ))
+  }
+  restart_detected_player() {
+    printf '%s %s %s\n' "$@" >> "$TEST_SCRATCH/player-restarts"
+    [[ $2 != plexamp-headless.service ]]
+  }
+  curl() { fail 'player onboarding called a player API'; }
+  player_control_action() { fail 'player onboarding invoked media controls'; }
+  kill() { fail 'player onboarding signaled a process'; }
+
+  output=$(offer_player_restarts "$user" 1 2>&1)
+  assert_contains "$output" 'Caldera Music is running as caldera-music.service.'
+  assert_file_contains "$TEST_SCRATCH/restart-prompts" 'Playback may resume paused.'
+  assert_contains "$output" 'Restarted caldera-music.service.'
+  assert_contains "$output" 'Left plexamp.service running.'
+  assert_contains "$output" 'Could not safely restart plexamp-headless.service'
+  assert_contains "$output" 'could not be mapped safely to an active user service'
+  assert_file_contains "$TEST_SCRATCH/player-restarts" "$user caldera-music.service Caldera Music"
+  assert_file_contains "$TEST_SCRATCH/player-restarts" "$user plexamp-headless.service Plexamp"
+  assert_file_not_contains "$TEST_SCRATCH/player-restarts" 'plexamp.service'
+  CFG_AUDIO_USER=$user
+  output=$(print_known_player_status)
+  assert_contains "$output" 'Known player: Caldera Music (caldera-music.service, PipeWire)'
+  assert_contains "$output" 'no safe user service, unknown'
+
+  tty_confirm() { fail 'non-interactive onboarding prompted'; }
+  restart_detected_player() { fail 'non-interactive onboarding restarted a player'; }
+  output=$(offer_player_restarts "$user" 0 2>&1)
+  assert_contains "$output" 'non-interactive installation never restarts players'
+}
+
+test_detected_player_restart_validation() {
+  local user rc
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  user_service_has_known_player() { return 0; }
+  now_seconds() { printf '100\n'; }
+  bounded_user_systemctl() {
+    printf '%s\n' "$*" >> "$TEST_SCRATCH/bounded-player-systemctl"
+    return 0
+  }
+  restart_detected_player "$user" caldera-music.service 'Caldera Music'
+  assert_file_contains "$TEST_SCRATCH/bounded-player-systemctl" \
+    "$user 10 restart caldera-music.service"
+  assert_file_contains "$TEST_SCRATCH/bounded-player-systemctl" \
+    "$user 10 is-active --quiet caldera-music.service"
+
+  bounded_user_systemctl() { return 1; }
+  set +e
+  restart_detected_player "$user" caldera-music.service 'Caldera Music'
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'a failed user-service restart was accepted'
+
+  printf '0\n' > "$TEST_SCRATCH/player-clock"
+  now_seconds() {
+    local calls
+    calls=$(< "$TEST_SCRATCH/player-clock")
+    calls=$((calls + 1))
+    printf '%s\n' "$calls" > "$TEST_SCRATCH/player-clock"
+    if (( calls < 3 )); then printf '100\n'; else printf '110\n'; fi
+  }
+  bounded_user_systemctl() {
+    printf '%s\n' "$*" >> "$TEST_SCRATCH/timeout-player-systemctl"
+    return 0
+  }
+  set +e
+  restart_detected_player "$user" caldera-music.service 'Caldera Music'
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'a restart exceeding the shared deadline was accepted'
+  assert_file_not_contains "$TEST_SCRATCH/timeout-player-systemctl" 'is-active'
+
+  : > "$TEST_SCRATCH/bounded-player-systemctl"
+  user_service_has_known_player() { return 1; }
+  set +e
+  restart_detected_player "$user" caldera-music.service 'Caldera Music'
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'a vanished player service was restarted'
+  [[ ! -s $TEST_SCRATCH/bounded-player-systemctl ]] || \
+    fail 'a vanished player reached systemctl restart'
+}
+
+test_post_install_onboarding_order() {
+  local user mac=AA:BB:CC:DD:EE:FF
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  write_test_config "$CONFIG_FILE" "$user"
+  printf 'speaker = %s\n' "$mac" >> "$CONFIG_FILE"
+  parse_config "$CONFIG_FILE"
+  has_tty() { return 0; }
+  run_installed_a2dpilot() { printf 'pair %s\n' "$*" >> "$TEST_SCRATCH/onboarding-order"; }
+  wait_for_configured_speaker_default() { printf 'default\n' >> "$TEST_SCRATCH/onboarding-order"; }
+  offer_player_restarts() { printf 'players %s\n' "$2" >> "$TEST_SCRATCH/onboarding-order"; }
+  post_install_onboarding 0 >/dev/null
+  assert_eq $'pair pair --all\npair pair\ndefault\nplayers 1' \
+    "$(< "$TEST_SCRATCH/onboarding-order")"
+}
+
 mock_a2dp_enum_profiles() {
   cat <<'EOF'
   Object: size 256, type Spa:Pod:Object:Param:Profile, id EnumProfile
@@ -2580,6 +2806,9 @@ test_pipewire_codec_profile_discovery() {
   output=$(bounded_user_pw_metadata audio 2 -n default 0 default.audio.sink)
   assert_contains "$output" \
     'timeout --signal=TERM --kill-after=1 2 pw-metadata -n default 0 default.audio.sink'
+  output=$(bounded_user_systemctl audio 2 show plexamp.service)
+  assert_contains "$output" \
+    'timeout --signal=TERM --kill-after=1 2 systemctl --user show plexamp.service'
 
   CFG_AUDIO_USER=audio
   bounded_user_wpctl() {
@@ -3407,6 +3636,11 @@ run_test 'optimistic codec reporting' test_codec_reporting_is_optimistic
 run_test 'PipeWire codec property parsing' test_codec_property_parsing
 run_test 'default sink selection and conditional cleanup' \
   test_default_sink_selection_and_cleanup
+run_test 'known player discovery and service mapping' \
+  test_known_player_discovery_and_service_mapping
+run_test 'player restart prompts and bounds' test_player_restart_prompts_and_bounds
+run_test 'detected player restart validation' test_detected_player_restart_validation
+run_test 'post-install onboarding order' test_post_install_onboarding_order
 run_test 'PipeWire codec profile discovery' test_pipewire_codec_profile_discovery
 run_test 'per-speaker codec selection' test_per_speaker_codec_selection
 run_test 'non-preemptive failover order' test_daemon_nonpreemption_and_failover_order
