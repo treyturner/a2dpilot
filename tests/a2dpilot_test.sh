@@ -2435,12 +2435,14 @@ test_codec_property_parsing() {
 }
 
 test_default_sink_selection_and_cleanup() {
-  local user mac=AA:BB:CC:DD:EE:FF sink other output rc effective_name configured_name
+  local user mac=AA:BB:CC:DD:EE:FF old_mac=11:22:33:44:55:66
+  local sink old_sink other output rc effective_name configured_name
   setup_scratch_dir
   load_app
   configure_scratch_paths
   user=$(id -un)
   sink=bluez_output.AA_BB_CC_DD_EE_FF.1
+  old_sink=bluez_output.11_22_33_44_55_66.1
   other=alsa_output.platform-hdmi.stereo
   CFG_AUDIO_USER=$user
   effective_name=$other
@@ -2486,6 +2488,27 @@ test_default_sink_selection_and_cleanup() {
   : > "$TEST_SCRATCH/default-wpctl.log"
   select_speaker_default "$mac" 3
   assert_file_not_contains "$TEST_SCRATCH/default-wpctl.log" 'set-default'
+
+  write_default_sink_state "$user" "$old_mac" "$old_sink"
+  effective_name=$sink
+  configured_name=$old_sink
+  : > "$TEST_SCRATCH/default-wpctl.log"
+  select_speaker_default "$mac" 3
+  assert_file_contains "$TEST_SCRATCH/default-wpctl.log" 'set-default 42'
+  assert_file_contains "$DEFAULT_SINK_STATE_FILE" "$mac"
+  assert_file_contains "$DEFAULT_SINK_STATE_FILE" "$sink"
+  assert_file_not_contains "$DEFAULT_SINK_STATE_FILE" "$old_mac"
+
+  write_default_sink_state "$user" "$old_mac" "$old_sink"
+  effective_name=$sink
+  configured_name=$sink
+  : > "$TEST_SCRATCH/default-wpctl.log"
+  select_speaker_default "$mac" 3
+  [[ ! -e $DEFAULT_SINK_STATE_FILE ]] || \
+    fail 'ownership survived a later user-configured default change'
+  assert_file_not_contains "$TEST_SCRATCH/default-wpctl.log" 'set-default'
+
+  write_default_sink_state "$user" "$mac" "$sink"
 
   clear_recorded_default_sink "$user" "$mac"
   assert_file_contains "$TEST_SCRATCH/default-wpctl.log" 'clear-default 0'

@@ -1866,7 +1866,7 @@ remove_default_sink_state() {
 }
 
 select_speaker_default() {
-  local mac=$1 seconds=${2:-$DEFAULT_SELECTION_TIMEOUT} deadline remaining node current result
+  local mac=$1 seconds=${2:-$DEFAULT_SELECTION_TIMEOUT} deadline remaining node current configured result
   DEFAULT_SINK_ERROR=
   [[ $seconds =~ ^[1-9][0-9]*$ ]] || return 1
   valid_mac "$mac" || return 1
@@ -1892,12 +1892,40 @@ select_speaker_default() {
     current=
   fi
   if (( result == 0 )) && [[ $current == "$sink_name" ]]; then
-    if read_default_sink_state 2>/dev/null &&
-       [[ $DEFAULT_STATE_USER != "$CFG_AUDIO_USER" ||
-          $DEFAULT_STATE_MAC != "$mac" || $DEFAULT_STATE_NAME != "$sink_name" ]]; then
-      remove_default_sink_state || true
+    if read_default_sink_state 2>/dev/null; then
+      if [[ $DEFAULT_STATE_USER == "$CFG_AUDIO_USER" &&
+            $DEFAULT_STATE_MAC == "$mac" && $DEFAULT_STATE_NAME == "$sink_name" ]]; then
+        return 0
+      fi
+      [[ $DEFAULT_STATE_USER == "$CFG_AUDIO_USER" ]] || {
+        DEFAULT_SINK_ERROR="the recorded PipeWire default belongs to another audio user"
+        return 1
+      }
+      remaining=$(seconds_until_deadline "$deadline") || return 1
+      if configured=$(pipewire_default_sink "$CFG_AUDIO_USER" "$remaining" configured); then
+        result=0
+      else
+        result=$?
+        configured=
+      fi
+      if (( result == 0 )) && [[ $configured == "$DEFAULT_STATE_NAME" ]]; then
+        : # Replace the configured default that A2DPilot still owns below.
+      elif (( result == 0 || result == 2 )); then
+        remove_default_sink_state || {
+          DEFAULT_SINK_ERROR="could not retire stale PipeWire default ownership"
+          return 1
+        }
+        return 0
+      else
+        DEFAULT_SINK_ERROR="could not inspect PipeWire's configured default sink"
+        return 1
+      fi
+    else
+      result=$?
+      (( result == 2 )) && return 0
+      DEFAULT_SINK_ERROR="could not read PipeWire default ownership"
+      return 1
     fi
-    return 0
   fi
   (( result == 0 || result == 2 )) || {
     DEFAULT_SINK_ERROR="could not inspect PipeWire's effective default sink"
@@ -1915,6 +1943,15 @@ select_speaker_default() {
   }
   [[ $current == "$sink_name" ]] || {
     DEFAULT_SINK_ERROR="PipeWire did not make $sink_name the effective default sink"
+    return 1
+  }
+  remaining=$(seconds_until_deadline "$deadline") || return 1
+  configured=$(pipewire_default_sink "$CFG_AUDIO_USER" "$remaining" configured) || {
+    DEFAULT_SINK_ERROR="could not verify PipeWire's configured default sink"
+    return 1
+  }
+  [[ $configured == "$sink_name" ]] || {
+    DEFAULT_SINK_ERROR="PipeWire did not make $sink_name the configured default sink"
     return 1
   }
   write_default_sink_state "$CFG_AUDIO_USER" "$mac" "$sink_name" || {
