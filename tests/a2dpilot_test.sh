@@ -85,6 +85,7 @@ configure_scratch_paths() {
   STATE_DIR=$TEST_SCRATCH/state
   BACKUP_DIR=$STATE_DIR/backup
   STATE_FILE=$STATE_DIR/state
+  DEFAULT_SINK_STATE_FILE=$STATE_DIR/default-sink
   INSTALLED_CLI=$TEST_SCRATCH/usr/local/sbin/a2dpilot
   SYSTEMD_UNIT=$TEST_SCRATCH/etc/systemd/system/a2dpilot.service
   WIREPLUMBER_CONF=$TEST_SCRATCH/etc/wireplumber/wireplumber.conf.d/51-a2dpilot.conf
@@ -116,6 +117,47 @@ write_test_config() {
       shift
     done
   } > "$path"
+}
+
+write_update_payload_version() {
+  local path=$1 version=$2
+  shift 2
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'A2DPILOT_VERSION=%s\n' "$version"
+    printf '%s\n' "$@"
+  } > "$path"
+}
+
+write_update_payload() {
+  local path=$1
+  shift
+  write_update_payload_version "$path" "$A2DPILOT_VERSION" "$@"
+}
+
+write_fake_process() {
+  local root=$1 pid=$2 name=$3 cgroup=$4 start=${5:-100} backend=${6:-unknown}
+  local stat_tail='S'
+  local index
+  install -d "$root/$pid/fd"
+  printf '%s\n' "$name" > "$root/$pid/comm"
+  ln -s "/opt/$name" "$root/$pid/exe"
+  for (( index = 1; index < 19; index++ )); do
+    stat_tail+=' 0'
+  done
+  stat_tail+=" $start"
+  printf '%s (%s) %s\n' "$pid" "$name" "$stat_tail" > "$root/$pid/stat"
+  printf '0::%s\n' "$cgroup" > "$root/$pid/cgroup"
+  case $backend in
+    PipeWire)
+      printf '0000-1000 r-xp 0 00:00 0 /usr/lib/libpipewire-0.3.so.0\n' > "$root/$pid/maps"
+      ;;
+    'direct ALSA')
+      : > "$root/$pid/maps"
+      ln -s /dev/snd/pcmC0D0p "$root/$pid/fd/5"
+      ;;
+    *) : > "$root/$pid/maps" ;;
+  esac
 }
 
 run_test() {
@@ -271,6 +313,53 @@ test_onboard_audio_configuration() {
   write_default_config "$CONFIG_FILE" "$user"
   assert_file_contains "$CONFIG_FILE" 'onboard-analog = enabled'
   assert_file_contains "$CONFIG_FILE" 'onboard-hdmi = enabled'
+}
+
+test_install_onboard_audio_detection() {
+  local model cards sound_class
+  setup_scratch_dir
+  load_app
+  model=$TEST_SCRATCH/model
+  cards=$TEST_SCRATCH/cards
+  sound_class=$TEST_SCRATCH/sound
+  mkdir -p "$sound_class"
+
+  printf 'Generic ARM host\n' > "$model"
+  printf 'bcm2835 Headphones\nvc4-hdmi-0\n' > "$cards"
+  if detect_install_onboard_audio "$model" "$cards" "$sound_class"; then
+    fail 'non-Raspberry Pi host was offered onboard-audio suppression'
+  fi
+  assert_eq 0 "$INSTALL_ONBOARD_ANALOG_AVAILABLE"
+  assert_eq 0 "$INSTALL_ONBOARD_HDMI_AVAILABLE"
+
+  printf 'Raspberry Pi 4 Model B Rev 1.5\0' > "$model"
+  printf ' 0 [HDMI]: bcm2835_hdmi - bcm2835 HDMI\n' > "$cards"
+  if detect_install_onboard_audio "$model" "$cards" "$sound_class"; then
+    fail 'legacy bcm2835 HDMI card was classified as onboard analogue audio'
+  fi
+  assert_eq 0 "$INSTALL_ONBOARD_ANALOG_AVAILABLE"
+  assert_eq 0 "$INSTALL_ONBOARD_HDMI_AVAILABLE"
+
+  printf ' 2 [Headphones]: bcm2835_headpho - bcm2835 Headphones\n' > "$cards"
+  detect_install_onboard_audio "$model" "$cards" "$sound_class"
+  assert_eq 1 "$INSTALL_ONBOARD_ANALOG_AVAILABLE"
+  assert_eq 0 "$INSTALL_ONBOARD_HDMI_AVAILABLE"
+
+  : > "$cards"
+  mkdir -p "$sound_class/card0/device"
+  printf 'vc4hdmi0\n' > "$sound_class/card0/id"
+  ln -s /drivers/vc4_hdmi "$sound_class/card0/device/driver"
+  detect_install_onboard_audio "$model" "$cards" "$sound_class"
+  assert_eq 0 "$INSTALL_ONBOARD_ANALOG_AVAILABLE"
+  assert_eq 1 "$INSTALL_ONBOARD_HDMI_AVAILABLE"
+
+  : > "$cards"
+  rm -f -- "$sound_class/card0/device/driver" "$sound_class/card0/id"
+  if detect_install_onboard_audio "$model" "$cards" "$sound_class"; then
+    fail 'Raspberry Pi without matching sound devices was offered suppression'
+  fi
+  assert_eq 0 "$INSTALL_ONBOARD_ANALOG_AVAILABLE"
+  assert_eq 0 "$INSTALL_ONBOARD_HDMI_AVAILABLE"
 }
 
 test_default_media_key_mappings() {
@@ -523,14 +612,16 @@ test_generated_integration_files() {
   write_wireplumber_config "$WIREPLUMBER_CONF"
   assert_file_contains "$WIREPLUMBER_CONF" 'monitor.alsa.rules'
   assert_file_contains "$WIREPLUMBER_CONF" 'device.form-factor = "internal"'
-  assert_file_contains "$WIREPLUMBER_CONF" 'api.alsa.card.name = "~bcm2835.*"'
+  assert_file_contains "$WIREPLUMBER_CONF" \
+    'api.alsa.card.name = "~bcm2835.*[Hh]eadphones.*"'
   assert_file_contains "$WIREPLUMBER_CONF" 'device.disabled = true'
   assert_file_not_contains "$WIREPLUMBER_CONF" 'vc4-hdmi'
   assert_file_not_contains "$WIREPLUMBER_CONF" 'bluez5.codecs'
 
   CFG_ONBOARD_HDMI=disabled
   write_wireplumber_config "$WIREPLUMBER_CONF"
-  assert_file_contains "$WIREPLUMBER_CONF" 'api.alsa.card.name = "~bcm2835.*"'
+  assert_file_contains "$WIREPLUMBER_CONF" \
+    'api.alsa.card.name = "~bcm2835.*[Hh]eadphones.*"'
   assert_file_contains "$WIREPLUMBER_CONF" 'api.alsa.card.name = "~vc4-hdmi.*"'
 
   write_trigger_config "$TRIGGER_CONF" off
@@ -639,6 +730,8 @@ test_noninteractive_install_and_uninstall_fixture() {
   assert_eq "$user" "$CFG_AUDIO_USER"
   assert_eq 0 "${#CFG_SPEAKERS[@]}"
   assert_eq http://127.0.0.1:32500 "$CFG_BASE_URL"
+  assert_eq enabled "$CFG_ONBOARD_ANALOG"
+  assert_eq enabled "$CFG_ONBOARD_HDMI"
   assert_eq 20 "${#CFG_MEDIA_KEYS[@]}"
   assert_file_contains "$SYSTEMD_UNIT" "$INSTALLED_CLI daemon"
   assert_file_contains "$TRIGGER_CONF" 'player-control KEY_PLAYCD'
@@ -669,6 +762,67 @@ test_noninteractive_install_and_uninstall_fixture() {
   [[ ! -e $CONFIG_FILE ]] || fail 'created configuration survived uninstall'
   [[ ! -e $STATE_DIR ]] || fail 'rollback state survived successful uninstall'
   assert_file_not_contains "$apt_log" 'remove -y'
+}
+
+test_interactive_install_configures_onboard_audio_before_pairing() {
+  local user output tty_checks=0 tty_answer_index=0
+  local -a tty_answers=(maybe yes no)
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+
+  require_root() { :; }
+  acquire_lock() { :; }
+  release_lock() { :; }
+  has_tty() {
+    tty_checks=$((tty_checks + 1))
+    (( tty_checks == 1 ))
+  }
+  tty_print() { printf '%s\n' "$*" >> "$TEST_SCRATCH/tty.log"; }
+  tty_read() {
+    local variable=$1
+    (( tty_answer_index < ${#tty_answers[@]} )) || return 1
+    printf -v "$variable" '%s' "${tty_answers[$tty_answer_index]}"
+    tty_answer_index=$((tty_answer_index + 1))
+  }
+  install() {
+    local -a forwarded=()
+    while [[ $# -gt 0 ]]; do
+      case $1 in
+        -o|-g) shift 2 ;;
+        *) forwarded+=("$1"); shift ;;
+      esac
+    done
+    /usr/bin/install "${forwarded[@]}"
+  }
+  chown() { :; }
+  record_system_service_states() { : > "$STATE_DIR/system-service-states"; }
+  record_user_state() { :; }
+  record_rfkill_state() { : > "$STATE_DIR/rfkill-state"; }
+  record_controller_state() { : > "$STATE_DIR/controller-state"; }
+  detect_install_onboard_audio() {
+    INSTALL_ONBOARD_ANALOG_AVAILABLE=1
+    INSTALL_ONBOARD_HDMI_AVAILABLE=1
+  }
+  apt-get() { :; }
+  systemctl() { :; }
+  ensure_audio_user() { :; }
+  power_controller() { :; }
+
+  output=$(install_action --user "$user")
+  assert_contains "$output" 'installed successfully'
+  assert_file_contains "$TEST_SCRATCH/tty.log" \
+    'You may optionally disable one or more onboard audio interfaces before Bluetooth pairing.'
+  assert_file_contains "$TEST_SCRATCH/tty.log" 'Disable Raspberry Pi onboard analogue audio?'
+  assert_file_contains "$TEST_SCRATCH/tty.log" 'Disable Raspberry Pi onboard HDMI audio?'
+  assert_file_contains "$TEST_SCRATCH/tty.log" 'Please answer y or n.'
+  parse_config "$CONFIG_FILE"
+  assert_eq disabled "$CFG_ONBOARD_ANALOG"
+  assert_eq enabled "$CFG_ONBOARD_HDMI"
+  assert_file_contains "$WIREPLUMBER_CONF" \
+    'api.alsa.card.name = "~bcm2835.*[Hh]eadphones.*"'
+  assert_file_not_contains "$WIREPLUMBER_CONF" 'api.alsa.card.name = "~vc4-hdmi.*"'
 }
 
 test_uninstall_keeps_packages_and_reports_empty_bond_policy() {
@@ -752,11 +906,12 @@ EOF
 }
 
 test_update_source_selection_and_validation() {
-  local sha=0123456789abcdef0123456789abcdef01234567 ref
+  local sha=0123456789abcdef0123456789abcdef01234567 ref parsed_version version_file
   local -a valid_refs=(main feat/update_command release/v1.2.3 v1.2.3+build one@two -tag)
   local -a invalid_refs=('' '@' '/main' 'main/' 'main.' 'feat//one' 'feat/../one' \
     'feat/@{one' '.hidden' 'feat/.hidden' 'release.lock' 'feat/release.lock' 'has space' \
     'question?' 'star*' 'back\slash')
+  setup_scratch_dir
   load_app
   assert_eq 'https://raw.githubusercontent.com/treyturner/a2dpilot/refs/heads/main/a2dpilot' \
     "$(update_source_url branch main)"
@@ -772,6 +927,21 @@ test_update_source_selection_and_validation() {
   for ref in "${invalid_refs[@]}"; do
     if valid_update_ref "$ref"; then fail "invalid update ref was accepted: $ref"; fi
   done
+  valid_a2dpilot_version "$A2DPILOT_VERSION" || fail 'running version is invalid'
+  a2dpilot_version_is_older 0.0.9 "$A2DPILOT_VERSION" || \
+    fail 'older candidate version was not detected'
+  if a2dpilot_version_is_older "$A2DPILOT_VERSION" "$A2DPILOT_VERSION"; then
+    fail 'equal candidate version was treated as older'
+  fi
+  if a2dpilot_version_is_older 0.2.0 "$A2DPILOT_VERSION"; then
+    fail 'newer candidate version was treated as older'
+  fi
+  a2dpilot_version_is_older 99999999999999999999.0.0 100000000000000000000.0.0 || \
+    fail 'large older candidate version was not detected'
+  version_file=$TEST_SCRATCH/versioned-executable
+  write_update_payload "$version_file" '# version fixture'
+  read_a2dpilot_version "$version_file" parsed_version || fail 'valid version was not read'
+  assert_eq "$A2DPILOT_VERSION" "$parsed_version"
 
   require_root() { :; }
   expect_failure_contains 'mutually exclusive' update_action --tag v1.0.0 --branch main
@@ -795,7 +965,7 @@ test_update_executable_only_transaction() {
   printf 'replaced files sentinel\n' > "$STATE_DIR/replaced-files"
   printf 'created bonds sentinel\n' > "$STATE_DIR/created-bonds"
   printf 'runtime user sentinel\n' > "$STATE_DIR/runtime-user"
-  printf '#!/usr/bin/env bash\n# old executable\n' > "$INSTALLED_CLI"
+  write_update_payload "$INSTALLED_CLI" '# old executable'
   chmod 0755 "$INSTALLED_CLI"
   printf 'config sentinel\n' > "$CONFIG_FILE"
   printf 'unit sentinel\n' > "$SYSTEMD_UNIT"
@@ -808,11 +978,8 @@ test_update_executable_only_transaction() {
   payload=$TEST_SCRATCH/update-payload
   UPDATE_EXECUTION_LOG=$TEST_SCRATCH/candidate-execution.log
   export UPDATE_EXECUTION_LOG
-  cat > "$payload" <<'EOF'
-#!/usr/bin/env bash
-printf 'executed\n' >> "$UPDATE_EXECUTION_LOG"
-# updated main
-EOF
+  write_update_payload "$payload" \
+    'printf '\''executed\n'\'' >> "$UPDATE_EXECUTION_LOG"' '# updated main'
 
   require_root() { :; }
   acquire_lock() { printf 'acquire\n' >> "$TEST_SCRATCH/lock.log"; }
@@ -891,15 +1058,15 @@ EOF
   : > "$TEST_SCRATCH/systemctl.log"
 
   service_active=0
-  printf '#!/usr/bin/env bash\n# updated branch\n' > "$payload"
+  write_update_payload "$payload" '# updated branch'
   update_action --branch feat/update_command >/dev/null
   assert_file_contains "$TEST_SCRATCH/curl.log" \
     'https://raw.githubusercontent.com/treyturner/a2dpilot/refs/heads/feat/update_command/a2dpilot'
-  printf '#!/usr/bin/env bash\n# updated tag\n' > "$payload"
+  write_update_payload "$payload" '# updated tag'
   update_action --tag v1.2.3 >/dev/null
   assert_file_contains "$TEST_SCRATCH/curl.log" \
     'https://raw.githubusercontent.com/treyturner/a2dpilot/refs/tags/v1.2.3/a2dpilot'
-  printf '#!/usr/bin/env bash\n# updated sha\n' > "$payload"
+  write_update_payload "$payload" '# updated sha'
   update_action --sha "$upper_sha" >/dev/null
   assert_file_contains "$TEST_SCRATCH/curl.log" \
     'https://raw.githubusercontent.com/treyturner/a2dpilot/abcdef0123456789abcdef0123456789abcdef01/a2dpilot'
@@ -915,6 +1082,60 @@ EOF
   [[ ! -e $UPDATE_EXECUTION_LOG ]] || fail 'update directly executed an installed candidate'
 }
 
+test_update_rechecks_installed_version_under_lock() {
+  local payload output rc major minor patch candidate_version concurrent_version
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  install -d "$(dirname "$INSTALLED_CLI")"
+  render_state_file "$STATE_FILE" installed
+  write_update_payload "$INSTALLED_CLI" '# original executable'
+  chmod 0755 "$INSTALLED_CLI"
+  IFS=. read -r major minor patch <<< "$A2DPILOT_VERSION"
+  candidate_version=$major.$minor.$((patch + 1))
+  concurrent_version=$major.$minor.$((patch + 2))
+  payload=$TEST_SCRATCH/update-payload
+  write_update_payload_version "$payload" "$candidate_version" '# downloaded candidate'
+
+  require_root() { :; }
+  acquire_lock() {
+    write_update_payload_version "$INSTALLED_CLI" "$concurrent_version" \
+      '# concurrent update winner'
+    chmod 0755 "$INSTALLED_CLI"
+    printf 'acquire\n' >> "$TEST_SCRATCH/lock.log"
+  }
+  release_lock() { printf 'release\n' >> "$TEST_SCRATCH/lock.log"; }
+  stat() {
+    if [[ ${1:-} == -c && ${2:-} == %u && ${4:-} == "$INSTALLED_CLI" ]]; then
+      printf '0\n'
+    else
+      /usr/bin/stat "$@"
+    fi
+  }
+  curl() {
+    local output_path=''
+    while [[ $# -gt 0 ]]; do
+      if [[ $1 == --output ]]; then output_path=$2; shift 2; else shift; fi
+    done
+    cp "$payload" "$output_path"
+  }
+  atomic_install_file() { : > "$TEST_SCRATCH/unexpected-replacement"; return 1; }
+  systemctl() { fail 'concurrent downgrade queried or changed the service'; }
+
+  set +e
+  output=$(update_action 2>&1)
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'concurrent update installed an older candidate'
+  assert_contains "$output" \
+    "Refusing to downgrade A2DPilot from $concurrent_version to $candidate_version"
+  assert_file_contains "$INSTALLED_CLI" "A2DPILOT_VERSION=$concurrent_version"
+  assert_file_contains "$INSTALLED_CLI" '# concurrent update winner'
+  [[ ! -e $TEST_SCRATCH/unexpected-replacement ]] || \
+    fail 'concurrent downgrade reached executable replacement'
+  assert_eq $'acquire\nrelease' "$(< "$TEST_SCRATCH/lock.log")"
+}
+
 test_update_rejects_bad_candidates_and_targets() {
   local mode output rc candidate target_owner=0 parent redirected
   setup_scratch_dir
@@ -922,7 +1143,7 @@ test_update_rejects_bad_candidates_and_targets() {
   configure_scratch_paths
   install -d "$(dirname "$INSTALLED_CLI")"
   render_state_file "$STATE_FILE" installed
-  printf '#!/usr/bin/env bash\n# old executable\n' > "$INSTALLED_CLI"
+  write_update_payload "$INSTALLED_CLI" '# old executable'
   chmod 0755 "$INSTALLED_CLI"
 
   require_root() { :; }
@@ -946,10 +1167,17 @@ test_update_rejects_bad_candidates_and_targets() {
       empty) : > "$output_path" ;;
       no-shebang) printf 'printf "valid Bash without a shebang"\n' > "$output_path" ;;
       invalid) printf '#!/usr/bin/env bash\nif broken syntax\n' > "$output_path" ;;
+      missing-version) printf '#!/usr/bin/env bash\n# no version\n' > "$output_path" ;;
+      malformed-version) printf '#!/usr/bin/env bash\nA2DPILOT_VERSION=latest\n' > "$output_path" ;;
+      duplicate-version)
+        printf '#!/usr/bin/env bash\nA2DPILOT_VERSION=%s\nA2DPILOT_VERSION=%s\n' \
+          "$A2DPILOT_VERSION" "$A2DPILOT_VERSION" > "$output_path"
+        ;;
+      downgrade) printf '#!/usr/bin/env bash\nA2DPILOT_VERSION=0.0.9\n' > "$output_path" ;;
     esac
   }
 
-  for mode in fail empty no-shebang invalid; do
+  for mode in fail empty no-shebang invalid missing-version malformed-version duplicate-version downgrade; do
     : > "$TEST_SCRATCH/lock.log"
     set +e
     output=$(update_action 2>&1)
@@ -961,6 +1189,13 @@ test_update_rejects_bad_candidates_and_targets() {
       empty) assert_contains "$output" 'empty or unsafe' ;;
       no-shebang) assert_contains "$output" 'lacks the expected Bash shebang' ;;
       invalid) assert_contains "$output" 'failed Bash syntax validation' ;;
+      missing-version|malformed-version|duplicate-version)
+        assert_contains "$output" 'must declare exactly one valid A2DPILOT_VERSION'
+        ;;
+      downgrade)
+        assert_contains "$output" "Refusing to downgrade A2DPilot from $A2DPILOT_VERSION to 0.0.9"
+        assert_contains "$output" 'sudo a2dpilot uninstall --keep-bonds'
+        ;;
     esac
     candidate=$(< "$TEST_SCRATCH/candidate-path")
     [[ ! -e $candidate ]] || fail "$mode update left its candidate behind"
@@ -1000,10 +1235,10 @@ test_update_activation_rollback_and_interruption() {
   configure_scratch_paths
   install -d "$(dirname "$INSTALLED_CLI")"
   render_state_file "$STATE_FILE" installed
-  printf '#!/usr/bin/env bash\n# old executable\n' > "$INSTALLED_CLI"
+  write_update_payload "$INSTALLED_CLI" '# old executable'
   chmod 0755 "$INSTALLED_CLI"
   payload=$TEST_SCRATCH/update-payload
-  printf '#!/usr/bin/env bash\n# new executable\n' > "$payload"
+  write_update_payload "$payload" '# new executable'
   restart_count=$TEST_SCRATCH/restart-count
   atomic_count=$TEST_SCRATCH/atomic-count
   printf '0\n' > "$restart_count"
@@ -1065,7 +1300,7 @@ test_update_activation_rollback_and_interruption() {
   [[ -z $(find "$TEST_SCRATCH" -maxdepth 1 -name 'a2dpilot-update.*' -o \
     -name 'a2dpilot-previous.*') ]] || fail 'successful rollback retained temporary files'
 
-  printf '#!/usr/bin/env bash\n# old executable\n' > "$INSTALLED_CLI"
+  write_update_payload "$INSTALLED_CLI" '# old executable'
   printf '0\n' > "$restart_count"
   printf '0\n' > "$atomic_count"
   atomic_install_file() {
@@ -1092,7 +1327,7 @@ test_update_activation_rollback_and_interruption() {
   assert_file_contains "$INSTALLED_CLI" '# new executable'
   rm -f -- "$retained_previous"
 
-  printf '#!/usr/bin/env bash\n# old executable before signal\n' > "$INSTALLED_CLI"
+  write_update_payload "$INSTALLED_CLI" '# old executable before signal'
   printf '0\n' > "$atomic_count"
   : > "$TEST_SCRATCH/replacement-state.log"
   systemctl() {
@@ -1128,7 +1363,7 @@ test_update_activation_rollback_and_interruption() {
     -name 'a2dpilot-previous.*') ]] || fail 'interrupted replacement retained temporary files'
 
   test_signal=HUP
-  printf '#!/usr/bin/env bash\n# old executable before hangup\n' > "$INSTALLED_CLI"
+  write_update_payload "$INSTALLED_CLI" '# old executable before hangup'
   printf '0\n' > "$atomic_count"
   : > "$TEST_SCRATCH/replacement-state.log"
   set +e
@@ -1147,7 +1382,7 @@ test_update_activation_rollback_and_interruption() {
   UPDATE_CANDIDATE=$TEST_SCRATCH/interrupted-candidate
   printf '#!/usr/bin/env bash\n# interrupted old\n' > "$UPDATE_PREVIOUS"
   printf '#!/usr/bin/env bash\n# interrupted candidate\n' > "$UPDATE_CANDIDATE"
-  printf '#!/usr/bin/env bash\n# interrupted new\n' > "$INSTALLED_CLI"
+  write_update_payload "$INSTALLED_CLI" '# interrupted new'
   UPDATE_REPLACED=1
   UPDATE_WAS_ACTIVE=0
   atomic_install_file() { cp "$1" "$2"; chmod "$3" "$2"; }
@@ -1161,8 +1396,8 @@ test_update_activation_rollback_and_interruption() {
   [[ ! -e $UPDATE_PREVIOUS && ! -e $UPDATE_CANDIDATE ]] || \
     fail 'interrupted update retained temporary files'
 
-  printf '#!/usr/bin/env bash\n# old executable before query failure\n' > "$INSTALLED_CLI"
-  printf '#!/usr/bin/env bash\n# candidate before query failure\n' > "$payload"
+  write_update_payload "$INSTALLED_CLI" '# old executable before query failure'
+  write_update_payload "$payload" '# candidate before query failure'
   rm -f -- "$TEST_SCRATCH/unexpected-replacement"
   systemctl() {
     case $1 in
@@ -1335,7 +1570,8 @@ test_onboard_audio_cli_and_application() {
   assert_eq disabled "$CFG_ONBOARD_ANALOG"
   assert_eq enabled "$CFG_ONBOARD_HDMI"
   assert_eq AA:BB:CC:DD:EE:FF "${CFG_SPEAKERS[0]}"
-  assert_file_contains "$WIREPLUMBER_CONF" 'api.alsa.card.name = "~bcm2835.*"'
+  assert_file_contains "$WIREPLUMBER_CONF" \
+    'api.alsa.card.name = "~bcm2835.*[Hh]eadphones.*"'
   assert_file_not_contains "$WIREPLUMBER_CONF" 'vc4-hdmi'
 
   audio_onboard_action disable
@@ -1466,6 +1702,9 @@ test_onboard_audio_status_and_matching() {
 	id 54, type PipeWire:Interface:Device/3
 		device.api = "alsa"
 		media.class = "Audio/Device"
+	id 55, type PipeWire:Interface:Device/3
+		device.api = "alsa"
+		media.class = "Audio/Device"
 EOF
       return 0
     fi
@@ -1512,6 +1751,15 @@ EOF
 	type: PipeWire:Interface:Device/3
 *		api.alsa.card.name = "bcm2835 USB device without form factor"
 *		device.api = "alsa"
+*		media.class = "Audio/Device"
+EOF
+        ;;
+      55) cat <<'EOF'
+	id: 55
+	type: PipeWire:Interface:Device/3
+*		api.alsa.card.name = "bcm2835 HDMI"
+*		device.api = "alsa"
+*		device.form-factor = "internal"
 *		media.class = "Audio/Device"
 EOF
         ;;
@@ -1856,11 +2104,14 @@ test_status_reports_media_url_configuration() {
   systemctl() { :; }
   as_user_systemctl() { :; }
   bounded_user_pw_cli() { :; }
+  bounded_user_pw_metadata() { :; }
   output=$(status_action)
   assert_contains "$output" 'Base URL: http://127.0.0.1:32500'
   assert_contains "$output" 'Media key mappings: 4'
   assert_contains "$output" 'Onboard analog: enabled (0 visible matching devices)'
   assert_contains "$output" 'Onboard HDMI: enabled (0 visible matching devices)'
+  assert_contains "$output" 'Active managed sink: none'
+  assert_contains "$output" 'Effective default sink: none'
 }
 
 test_pairing_provenance_and_existing_bond() {
@@ -2183,6 +2434,408 @@ test_codec_property_parsing() {
   assert_contains "$calls" '3 inspect 42'
 }
 
+test_default_sink_selection_and_cleanup() {
+  local user mac=AA:BB:CC:DD:EE:FF old_mac=11:22:33:44:55:66
+  local sink old_sink other output rc effective_name configured_name
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  sink=bluez_output.AA_BB_CC_DD_EE_FF.1
+  old_sink=bluez_output.11_22_33_44_55_66.1
+  other=alsa_output.platform-hdmi.stereo
+  CFG_AUDIO_USER=$user
+  effective_name=$other
+  configured_name=$other
+  now_seconds() { printf '100\n'; }
+  find_a2dp_node_id() { printf '42\n'; }
+  bounded_user_wpctl() {
+    printf '%s\n' "$*" >> "$TEST_SCRATCH/default-wpctl.log"
+    case $3 in
+      inspect)
+        printf '%s\n' \
+          '  * node.name = "bluez_output.AA_BB_CC_DD_EE_FF.1"' \
+          '  * media.class = "Audio/Sink"'
+        ;;
+      set-default)
+        effective_name=$sink
+        configured_name=$sink
+        ;;
+      clear-default) configured_name= ;;
+    esac
+  }
+  bounded_user_pw_metadata() {
+    local key=$6 value
+    case $key in
+      default.audio.sink) value=$effective_name ;;
+      default.configured.audio.sink) value=$configured_name ;;
+      *) return 1 ;;
+    esac
+    printf 'Found "default" metadata 5\n'
+    [[ -n $value ]] || return 0
+    printf 'update: id:0 key:'\''%s'\'' value:'\''{ "name": "%s" }'\'' type:'\''Spa:String:JSON'\''\n' \
+      "$key" "$value"
+  }
+
+  select_speaker_default "$mac" 3
+  assert_file_contains "$TEST_SCRATCH/default-wpctl.log" 'set-default 42'
+  assert_eq "$user" "$(cut -f1 "$DEFAULT_SINK_STATE_FILE")"
+  assert_file_contains "$DEFAULT_SINK_STATE_FILE" "$user"
+  assert_file_contains "$DEFAULT_SINK_STATE_FILE" "$mac"
+  assert_file_contains "$DEFAULT_SINK_STATE_FILE" "$sink"
+  assert_eq 600 "$(stat -c %a "$DEFAULT_SINK_STATE_FILE")"
+
+  : > "$TEST_SCRATCH/default-wpctl.log"
+  select_speaker_default "$mac" 3
+  assert_file_not_contains "$TEST_SCRATCH/default-wpctl.log" 'set-default'
+
+  write_default_sink_state "$user" "$old_mac" "$old_sink"
+  effective_name=$sink
+  configured_name=$old_sink
+  : > "$TEST_SCRATCH/default-wpctl.log"
+  select_speaker_default "$mac" 3
+  assert_file_contains "$TEST_SCRATCH/default-wpctl.log" 'set-default 42'
+  assert_file_contains "$DEFAULT_SINK_STATE_FILE" "$mac"
+  assert_file_contains "$DEFAULT_SINK_STATE_FILE" "$sink"
+  assert_file_not_contains "$DEFAULT_SINK_STATE_FILE" "$old_mac"
+
+  write_default_sink_state "$user" "$old_mac" "$old_sink"
+  effective_name=$sink
+  configured_name=$sink
+  : > "$TEST_SCRATCH/default-wpctl.log"
+  select_speaker_default "$mac" 3
+  [[ ! -e $DEFAULT_SINK_STATE_FILE ]] || \
+    fail 'ownership survived a later user-configured default change'
+  assert_file_not_contains "$TEST_SCRATCH/default-wpctl.log" 'set-default'
+
+  write_default_sink_state "$user" "$mac" "$sink"
+
+  clear_recorded_default_sink "$user" "$mac"
+  assert_file_contains "$TEST_SCRATCH/default-wpctl.log" 'clear-default 0'
+  [[ ! -e $DEFAULT_SINK_STATE_FILE ]] || fail 'cleared default ownership remained recorded'
+
+  write_default_sink_state "$user" "$mac" "$sink"
+  configured_name=$other
+  : > "$TEST_SCRATCH/default-wpctl.log"
+  clear_recorded_default_sink "$user" "$mac"
+  [[ ! -e $DEFAULT_SINK_STATE_FILE ]] || fail 'stale default ownership remained recorded'
+  assert_file_not_contains "$TEST_SCRATCH/default-wpctl.log" 'clear-default'
+
+  effective_name=$other
+  configured_name=$other
+  bounded_user_wpctl() {
+    case $3 in
+      inspect)
+        printf '%s\n' \
+          '  * node.name = "bluez_output.AA_BB_CC_DD_EE_FF.1"' \
+          '  * media.class = "Audio/Sink"'
+        ;;
+      set-default) return 1 ;;
+    esac
+  }
+  if select_speaker_default "$mac" 3; then
+    fail 'failed PipeWire default selection was accepted'
+  fi
+  assert_contains "$DEFAULT_SINK_ERROR" 'could not select'
+  [[ ! -e $DEFAULT_SINK_STATE_FILE ]] || fail 'failed selection recorded ownership'
+
+  bounded_user_wpctl() {
+    case $3 in
+      inspect)
+        printf '%s\n' \
+          '  * node.name = "bluez_output.AA_BB_CC_DD_EE_FF.1"' \
+          '  * media.class = "Audio/Sink"'
+        ;;
+      set-default) return 0 ;;
+    esac
+  }
+  if select_speaker_default "$mac" 3; then
+    fail 'unverified PipeWire default selection was accepted'
+  fi
+  assert_contains "$DEFAULT_SINK_ERROR" 'did not make'
+  [[ ! -e $DEFAULT_SINK_STATE_FILE ]] || fail 'unverified selection recorded ownership'
+
+  DAEMON_NEXT_DEFAULT_LOG=0
+  maintain_speaker_default "$mac" > "$TEST_SCRATCH/default-warning"
+  rc=$?
+  output=$(< "$TEST_SCRATCH/default-warning")
+  assert_contains "$output" 'Bluetooth remains connected'
+  assert_eq 0 "$rc"
+
+  bounded_user_pw_metadata() {
+    printf '%s\n' 'unexpected metadata output'
+  }
+  if pipewire_default_sink "$user" 3 effective >/dev/null; then
+    fail 'malformed PipeWire default metadata was accepted'
+  fi
+
+  ln -s "$TEST_SCRATCH/redirected-default" "$DEFAULT_SINK_STATE_FILE"
+  if write_default_sink_state "$user" "$mac" "$sink"; then
+    fail 'symlinked default-sink state was replaced'
+  fi
+  [[ ! -e $TEST_SCRATCH/redirected-default ]] || fail 'default state followed a symlink'
+}
+
+test_known_player_discovery_and_service_mapping() {
+  local user uid wrong_uid user_cgroup_prefix service_list manual_list
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  uid=$(id -u "$user")
+  if (( uid == 0 )); then wrong_uid=1; else wrong_uid=0; fi
+  PROC_ROOT=$TEST_SCRATCH/proc
+  install -d "$PROC_ROOT"
+  user_cgroup_prefix=/user.slice/user-${uid}.slice/user@${uid}.service/app.slice
+  write_fake_process "$PROC_ROOT" 100 caldera-music \
+    "$user_cgroup_prefix/caldera-music.service" 100 PipeWire
+  write_fake_process "$PROC_ROOT" 101 caldera-music \
+    "$user_cgroup_prefix/caldera-music.service" 101 unknown
+  write_fake_process "$PROC_ROOT" 102 Plexamp \
+    "$user_cgroup_prefix/plexamp-headless.service" 102 'direct ALSA'
+  write_fake_process "$PROC_ROOT" 103 caldera-music-helper \
+    "$user_cgroup_prefix/caldera-music-helper.service" 103 unknown
+  write_fake_process "$PROC_ROOT" 104 plexamp \
+    /system.slice/plexamp.service 104 unknown
+  write_fake_process "$PROC_ROOT" 105 Plexamp \
+    "$user_cgroup_prefix/app-plexamp.scope" 105 unknown
+  write_fake_process "$PROC_ROOT" 106 caldera-music \
+    'malformed cgroup' 106 unknown
+  write_fake_process "$PROC_ROOT" 107 plexamp \
+    "$user_cgroup_prefix/stale.service" 107 unknown
+  write_fake_process "$PROC_ROOT" 108 Plexamp \
+    "$user_cgroup_prefix/root-owned.service" 108 unknown
+  write_fake_process "$PROC_ROOT" 109 caldera-music \
+    "$user_cgroup_prefix/caldera-music.service" 109 unknown
+  printf 'bash\n' > "$PROC_ROOT/109/comm"
+
+  stat() {
+    if [[ ${1:-} == -c && ${2:-} == %u && ${4:-} == "$PROC_ROOT/108" ]]; then
+      printf '%s\n' "$wrong_uid"
+    else
+      /usr/bin/stat "$@"
+    fi
+  }
+  bounded_user_systemctl() {
+    local unit=${4:-}
+    [[ ${3:-} == show ]] || return 1
+    case $unit in
+      caldera-music.service|plexamp-headless.service|stale.service)
+        printf 'LoadState=loaded\nActiveState=active\n'
+        printf 'ControlGroup=%s/%s\n' "$user_cgroup_prefix" "$unit"
+        case $unit in
+          caldera-music.service) printf 'MainPID=100\n' ;;
+          plexamp-headless.service) printf 'MainPID=102\n' ;;
+          stale.service) printf 'MainPID=107\n' ;;
+        esac
+        ;;
+      *) return 1 ;;
+    esac
+    if [[ $unit == stale.service ]]; then
+      sed -i 's/ 107$/ 207/' "$PROC_ROOT/107/stat"
+    fi
+  }
+
+  discover_known_players "$user"
+  assert_eq 2 "${#PLAYER_SERVICE_UNITS[@]}"
+  service_list=$(printf '%s\n' "${PLAYER_SERVICE_UNITS[@]}")
+  assert_contains "$service_list" 'caldera-music.service'
+  assert_contains "$service_list" 'plexamp-headless.service'
+  assert_eq 'Caldera Music' "${PLAYER_SERVICE_LABELS[0]}"
+  assert_eq PipeWire "${PLAYER_SERVICE_BACKENDS[0]}"
+  assert_eq 'direct ALSA' "${PLAYER_SERVICE_BACKENDS[1]}"
+  manual_list=$(printf '%s\n' "${PLAYER_MANUAL_PIDS[@]}")
+  assert_contains "$manual_list" '104'
+  assert_contains "$manual_list" '105'
+  assert_contains "$manual_list" '106'
+  assert_not_contains "$service_list $manual_list" '103'
+  assert_not_contains "$service_list $manual_list" '107'
+  assert_not_contains "$service_list $manual_list" '108'
+}
+
+test_player_restart_prompts_and_bounds() {
+  local user output confirm_count=0
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  discover_known_players() {
+    PLAYER_SERVICE_UNITS=(caldera-music.service plexamp.service plexamp-headless.service)
+    PLAYER_SERVICE_LABELS=('Caldera Music' Plexamp Plexamp)
+    PLAYER_SERVICE_BACKENDS=(PipeWire unknown 'direct ALSA')
+    PLAYER_MANUAL_PIDS=(444)
+    PLAYER_MANUAL_LABELS=(Plexamp)
+    PLAYER_MANUAL_BACKENDS=(unknown)
+  }
+  tty_print() {
+    # shellcheck disable=SC2059 # This test double preserves tty_print's format-string contract.
+    printf "$@"
+  }
+  tty_confirm() {
+    printf '%s\n' "$1" >> "$TEST_SCRATCH/restart-prompts"
+    confirm_count=$((confirm_count + 1))
+    (( confirm_count != 2 ))
+  }
+  restart_detected_player() {
+    printf '%s %s %s\n' "$@" >> "$TEST_SCRATCH/player-restarts"
+    [[ $2 != plexamp-headless.service ]]
+  }
+  curl() { fail 'player onboarding called a player API'; }
+  player_control_action() { fail 'player onboarding invoked media controls'; }
+  kill() { fail 'player onboarding signaled a process'; }
+
+  output=$(offer_player_restarts "$user" 1 2>&1)
+  assert_contains "$output" 'Caldera Music is running as caldera-music.service.'
+  assert_file_contains "$TEST_SCRATCH/restart-prompts" 'Playback may resume paused.'
+  assert_contains "$output" 'Restarted caldera-music.service.'
+  assert_contains "$output" 'Left plexamp.service running.'
+  assert_contains "$output" 'Could not safely restart plexamp-headless.service'
+  assert_contains "$output" 'could not be mapped safely to an active user service'
+  assert_file_contains "$TEST_SCRATCH/player-restarts" "$user caldera-music.service Caldera Music"
+  assert_file_contains "$TEST_SCRATCH/player-restarts" "$user plexamp-headless.service Plexamp"
+  assert_file_not_contains "$TEST_SCRATCH/player-restarts" 'plexamp.service'
+  CFG_AUDIO_USER=$user
+  output=$(print_known_player_status)
+  assert_contains "$output" 'Known player: Caldera Music (caldera-music.service, PipeWire)'
+  assert_contains "$output" 'no safe user service, unknown'
+
+  tty_confirm() { fail 'non-interactive onboarding prompted'; }
+  restart_detected_player() { fail 'non-interactive onboarding restarted a player'; }
+  output=$(offer_player_restarts "$user" 0 2>&1)
+  assert_contains "$output" 'non-interactive installation never restarts players'
+}
+
+test_detected_player_restart_validation() {
+  local user rc
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  user_service_has_known_player() { return 0; }
+  now_seconds() { printf '100\n'; }
+  bounded_user_systemctl() {
+    printf '%s\n' "$*" >> "$TEST_SCRATCH/bounded-player-systemctl"
+    return 0
+  }
+  restart_detected_player "$user" caldera-music.service 'Caldera Music'
+  assert_file_contains "$TEST_SCRATCH/bounded-player-systemctl" \
+    "$user 10 restart caldera-music.service"
+  assert_file_contains "$TEST_SCRATCH/bounded-player-systemctl" \
+    "$user 10 is-active --quiet caldera-music.service"
+
+  bounded_user_systemctl() { return 1; }
+  set +e
+  restart_detected_player "$user" caldera-music.service 'Caldera Music'
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'a failed user-service restart was accepted'
+
+  printf '0\n' > "$TEST_SCRATCH/player-clock"
+  now_seconds() {
+    local calls
+    calls=$(< "$TEST_SCRATCH/player-clock")
+    calls=$((calls + 1))
+    printf '%s\n' "$calls" > "$TEST_SCRATCH/player-clock"
+    if (( calls < 3 )); then printf '100\n'; else printf '110\n'; fi
+  }
+  bounded_user_systemctl() {
+    printf '%s\n' "$*" >> "$TEST_SCRATCH/timeout-player-systemctl"
+    return 0
+  }
+  set +e
+  restart_detected_player "$user" caldera-music.service 'Caldera Music'
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'a restart exceeding the shared deadline was accepted'
+  assert_file_not_contains "$TEST_SCRATCH/timeout-player-systemctl" 'is-active'
+
+  : > "$TEST_SCRATCH/bounded-player-systemctl"
+  user_service_has_known_player() { return 1; }
+  set +e
+  restart_detected_player "$user" caldera-music.service 'Caldera Music'
+  rc=$?
+  set -e
+  (( rc != 0 )) || fail 'a vanished player service was restarted'
+  [[ ! -s $TEST_SCRATCH/bounded-player-systemctl ]] || \
+    fail 'a vanished player reached systemctl restart'
+}
+
+test_post_install_onboarding_order() {
+  local user mac=AA:BB:CC:DD:EE:FF
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  user=$(id -un)
+  write_test_config "$CONFIG_FILE" "$user"
+  printf 'speaker = %s\n' "$mac" >> "$CONFIG_FILE"
+  parse_config "$CONFIG_FILE"
+  has_tty() { return 0; }
+  run_installed_a2dpilot() { printf 'pair %s\n' "$*" >> "$TEST_SCRATCH/onboarding-order"; }
+  wait_for_configured_speaker_default() { printf 'default\n' >> "$TEST_SCRATCH/onboarding-order"; }
+  offer_player_restarts() { printf 'players %s\n' "$2" >> "$TEST_SCRATCH/onboarding-order"; }
+  post_install_onboarding 0 >/dev/null
+  assert_eq $'pair pair --all\npair pair\ndefault\nplayers 1' \
+    "$(< "$TEST_SCRATCH/onboarding-order")"
+}
+
+test_onboarding_waits_for_daemon_selected_speaker() {
+  local preferred=AA:BB:CC:DD:EE:01 selected=AA:BB:CC:DD:EE:02 checks=0 rc
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  CFG_SPEAKERS=("$preferred" "$selected")
+  now_seconds() { printf '100\n'; }
+  device_healthy() {
+    printf '%s\n' "$1" >> "$TEST_SCRATCH/onboarding-health-checks"
+    return 0
+  }
+  select_speaker_default() { printf '%s\n' "$1" > "$TEST_SCRATCH/onboarding-default"; }
+  sleep() {
+    checks=$((checks + 1))
+    printf '%s\n' "$selected" > "$STATE_DIR/active-speaker"
+  }
+
+  wait_for_configured_speaker_default 10
+  assert_eq "$selected" "$(< "$TEST_SCRATCH/onboarding-default")"
+  assert_eq "$selected" "$(< "$TEST_SCRATCH/onboarding-health-checks")"
+  assert_eq 1 "$checks"
+
+  : > "$TEST_SCRATCH/default-attempts"
+  select_speaker_default() {
+    printf '%s %s\n' "$1" "$2" >> "$TEST_SCRATCH/default-attempts"
+    [[ $(wc -l < "$TEST_SCRATCH/default-attempts") -ge 2 ]]
+  }
+  sleep() { :; }
+  wait_for_configured_speaker_default 10
+  assert_eq 2 "$(wc -l < "$TEST_SCRATCH/default-attempts")"
+  assert_eq "$selected 3" "$(sed -n '1p' "$TEST_SCRATCH/default-attempts")"
+
+  printf '100\n' > "$TEST_SCRATCH/onboarding-clock"
+  now_seconds() { sed -n '1p' "$TEST_SCRATCH/onboarding-clock"; }
+  select_speaker_default() {
+    printf '%s %s\n' "$1" "$2" >> "$TEST_SCRATCH/persistent-default-attempts"
+    DEFAULT_SINK_ERROR='transient default-selection failure'
+    return 1
+  }
+  sleep() {
+    local now
+    now=$(< "$TEST_SCRATCH/onboarding-clock")
+    printf '%s\n' "$((now + 1))" > "$TEST_SCRATCH/onboarding-clock"
+  }
+  set +e
+  wait_for_configured_speaker_default 3
+  rc=$?
+  set -e
+  assert_eq 3 "$rc"
+  assert_eq 3 "$(wc -l < "$TEST_SCRATCH/persistent-default-attempts")"
+  assert_eq "$selected 1" "$(sed -n '3p' "$TEST_SCRATCH/persistent-default-attempts")"
+
+  printf '%s\n%s\n' "$selected" "$preferred" > "$STATE_DIR/active-speaker"
+  if read_daemon_selected_speaker >/dev/null; then
+    fail 'a malformed daemon active-speaker record was accepted'
+  fi
+}
+
 mock_a2dp_enum_profiles() {
   cat <<'EOF'
   Object: size 256, type Spa:Pod:Object:Param:Profile, id EnumProfile
@@ -2232,6 +2885,12 @@ test_pipewire_codec_profile_discovery() {
   assert_contains "$output" 'timeout --signal=TERM --kill-after=1 3 pw-cli enum-params 55 EnumProfile'
   output=$(bounded_user_wpctl audio 2 status --name)
   assert_contains "$output" 'timeout --signal=TERM --kill-after=1 2 wpctl status --name'
+  output=$(bounded_user_pw_metadata audio 2 -n default 0 default.audio.sink)
+  assert_contains "$output" \
+    'timeout --signal=TERM --kill-after=1 2 pw-metadata -n default 0 default.audio.sink'
+  output=$(bounded_user_systemctl audio 2 show plexamp.service)
+  assert_contains "$output" \
+    'timeout --signal=TERM --kill-after=1 2 systemctl --user show plexamp.service'
 
   CFG_AUDIO_USER=audio
   bounded_user_wpctl() {
@@ -2370,11 +3029,13 @@ test_daemon_nonpreemption_and_failover_order() {
   device_healthy() { [[ $1 == "$second" ]]; }
   device_connected() { [[ $1 == "$second" ]]; }
   a2dp_connected() { [[ $1 == "$second" ]]; }
+  maintain_speaker_default() { printf '%s\n' "$1" > "$TEST_SCRATCH/default-maintenance"; }
   disconnect_other_speakers() { printf '%s\n' "$1" > "$TEST_SCRATCH/stale-cleanup"; }
   bluetoothctl() { printf '%s\n' "$*" >> "$TEST_SCRATCH/bluetooth.log"; }
   daemon_cycle
   [[ ! -e $TEST_SCRATCH/bluetooth.log ]] || fail 'healthy fallback was preempted'
   assert_eq "$second" "$(< "$TEST_SCRATCH/stale-cleanup")"
+  assert_eq "$second" "$(< "$TEST_SCRATCH/default-maintenance")"
   assert_eq "$second" "$DAEMON_ACTIVE"
 
   DAEMON_ACTIVE=
@@ -2414,6 +3075,7 @@ test_daemon_disconnects_new_stale_connection() {
   DAEMON_ACTIVE=$active
   device_healthy() { [[ $1 == "$active" ]]; }
   device_connected() { [[ $1 == "$stale" ]]; }
+  maintain_speaker_default() { :; }
   disconnect_bluetooth_device() { printf '%s\n' "$1" >> "$TEST_SCRATCH/disconnected"; }
 
   daemon_cycle
@@ -2480,6 +3142,7 @@ test_daemon_codec_policy_failover() {
   }
   disconnect_bluetooth_device() { printf '%s\n' "$1" >> "$TEST_SCRATCH/disconnected"; }
   disconnect_other_speakers() { :; }
+  maintain_speaker_default() { :; }
   a2dp_codec() { printf 'sbc\n'; }
 
   daemon_cycle > "$TEST_SCRATCH/daemon-output"
@@ -2543,6 +3206,7 @@ test_daemon_cooldown_and_backoff() {
 
   device_healthy() { return 0; }
   apply_speaker_codec_policy() { return 0; }
+  maintain_speaker_default() { :; }
   disconnect_other_speakers() { :; }
   daemon_cycle >/dev/null
   assert_eq "$mac" "$DAEMON_ACTIVE"
@@ -2564,14 +3228,24 @@ test_daemon_disconnects_removed_active_speaker() {
   CFG_RECONNECT_INTERVAL=5
   CFG_MEDIA_CONTROLS=auto
   CFG_CONTROLLER=auto
+  CFG_AUDIO_USER=$(id -un)
   DAEMON_ACTIVE=
   load_daemon_active
   device_healthy() { [[ $1 == "$replacement" ]]; }
+  maintain_speaker_default() { :; }
+  clear_recorded_default_sink() {
+    printf 'clear %s %s\n' "$1" "$2" >> "$TEST_SCRATCH/default-cleanup-order"
+  }
   disconnect_bluetooth_device() {
     printf 'disconnect %s\n' "$1" >> "$TEST_SCRATCH/bluetooth.log"
+    printf 'disconnect %s\n' "$1" >> "$TEST_SCRATCH/default-cleanup-order"
   }
   daemon_cycle
   assert_file_contains "$TEST_SCRATCH/bluetooth.log" "disconnect $removed"
+  assert_eq "clear $CFG_AUDIO_USER $removed" \
+    "$(sed -n '1p' "$TEST_SCRATCH/default-cleanup-order")"
+  assert_eq "disconnect $removed" \
+    "$(sed -n '2p' "$TEST_SCRATCH/default-cleanup-order")"
   assert_eq "$replacement" "$DAEMON_ACTIVE"
   assert_eq "$replacement" "$(< "$STATE_DIR/active-speaker")"
 }
@@ -3005,6 +3679,7 @@ run_test 'syntax, help, and streamed bootstrap' test_syntax_help_and_stream_boot
 run_test 'managed dependency list' test_managed_package_list
 run_test 'configuration parsing and normalization' test_config_parser_and_normalization
 run_test 'onboard-audio configuration and defaults' test_onboard_audio_configuration
+run_test 'install detects suppressible onboard audio' test_install_onboard_audio_detection
 run_test 'per-speaker codec configuration' test_speaker_codec_configuration
 run_test 'default media-key mappings' test_default_media_key_mappings
 run_test 'configuration rejection and non-evaluation' test_config_parser_rejections_and_no_eval
@@ -3015,11 +3690,15 @@ run_test 'generated system integration files' test_generated_integration_files
 run_test 'WirePlumber config path safety' test_wireplumber_config_path_safety
 run_test 'Triggerhappy config rejects symlinked parent' test_trigger_config_rejects_symlinked_parent
 run_test 'non-interactive install and uninstall fixture' test_noninteractive_install_and_uninstall_fixture
+run_test 'interactive install configures onboard audio before pairing' \
+  test_interactive_install_configures_onboard_audio_before_pairing
 run_test 'uninstall keeps packages and reports empty bond policy' test_uninstall_keeps_packages_and_reports_empty_bond_policy
 run_test 'failed install rollback retains packages' test_failed_install_rollback_retains_packages
 run_test 'install recovery needs no package snapshot' test_install_recovery_needs_no_package_snapshot
 run_test 'update source selection and validation' test_update_source_selection_and_validation
 run_test 'executable-only update transaction' test_update_executable_only_transaction
+run_test 'update rechecks installed version under lock' \
+  test_update_rechecks_installed_version_under_lock
 run_test 'update rejects bad candidates and targets' test_update_rejects_bad_candidates_and_targets
 run_test 'update activation rollback and interruption' test_update_activation_rollback_and_interruption
 run_test 'safe config editor success and validation failure' test_config_editor_success_and_validation_failure
@@ -3046,6 +3725,15 @@ run_test 'forget removes config and provenance' test_forget_removes_config_and_p
 run_test 'media-control health modes' test_media_control_health_modes
 run_test 'optimistic codec reporting' test_codec_reporting_is_optimistic
 run_test 'PipeWire codec property parsing' test_codec_property_parsing
+run_test 'default sink selection and conditional cleanup' \
+  test_default_sink_selection_and_cleanup
+run_test 'known player discovery and service mapping' \
+  test_known_player_discovery_and_service_mapping
+run_test 'player restart prompts and bounds' test_player_restart_prompts_and_bounds
+run_test 'detected player restart validation' test_detected_player_restart_validation
+run_test 'post-install onboarding order' test_post_install_onboarding_order
+run_test 'onboarding waits for daemon-selected speaker' \
+  test_onboarding_waits_for_daemon_selected_speaker
 run_test 'PipeWire codec profile discovery' test_pipewire_codec_profile_discovery
 run_test 'per-speaker codec selection' test_per_speaker_codec_selection
 run_test 'non-preemptive failover order' test_daemon_nonpreemption_and_failover_order

@@ -11,9 +11,11 @@ The project is delivered as one Bash program. The same `a2dpilot` file installs 
 - Non-preemptive failover: a working fallback is not interrupted merely because a preferred speaker reappears.
 - Automatic controller soft-unblock and power-on at boot and after adapter loss.
 - BlueZ, PipeWire A2DP, and optional AVRCP health checks.
+- Best-effort selection of the healthy managed Bluetooth sink as PipeWire's default.
 - Automatic PipeWire codec negotiation by default, with optional ordered codec preferences for each speaker.
 - Responsive media-key routing with broad Linux transport-key coverage, relative volume control, configurable HTTP(S) URLs, and one bounded action deadline.
 - Reversible live suppression of Raspberry Pi onboard analogue and HDMI audio devices without disabling HDMI video.
+- Optional post-pairing restart of safely detected Caldera Music and Plexamp user services.
 - Safe configuration editing and validation through the CLI.
 - Atomic executable-only updates from `main`, a branch, a tag, or an exact commit.
 - Headless PipeWire/WirePlumber operation using systemd linger.
@@ -46,7 +48,7 @@ Managed files are:
 | `/etc/systemd/system/a2dpilot.service`                 | Connection-maintenance daemon                                                     |
 | `/etc/wireplumber/wireplumber.conf.d/51-a2dpilot.conf` | Headless Bluetooth policy and optional Raspberry Pi onboard-audio suppression     |
 | `/etc/triggerhappy/triggers.d/a2dpilot.conf`           | Media-key mappings, or an inert file when controls are disabled                   |
-| `/var/lib/a2dpilot/`                                   | Root-only backups, rollback metadata, user snapshots, and created-bond provenance |
+| `/var/lib/a2dpilot/`                                   | Root-only backups, rollback metadata, user snapshots, created-bond provenance, and current default-sink ownership |
 
 ## Environment expectations
 
@@ -93,7 +95,19 @@ curl -fsSL https://raw.githubusercontent.com/treyturner/a2dpilot/main/a2dpilot \
   | sudo bash -s -- install --user pi
 ```
 
+When creating a new configuration, an interactive install makes a best-effort check for Raspberry Pi onboard analogue and HDMI audio and asks separately whether to suppress each detected class. Undetected devices remain enabled and can be changed later with `a2dpilot audio onboard`. These choices are written before WirePlumber is provisioned and before Bluetooth pairing, avoiding an unnecessary interruption to a newly paired speaker.
+
 After package and service setup, an interactive install scans for Bluetooth Classic devices. Put the desired speaker into pairing mode, select it by number, and repeat to add additional fallbacks. The selection order becomes speaker priority. Enter `r` to rescan or press Enter without a selection to finish.
+
+After pairing finishes, A2DPilot waits up to ten seconds for the daemon to select a configured speaker after enforcing its codec policy, verifies that it is a healthy A2DP sink, and makes it PipeWire's effective default. It then looks for exact `caldera-music`, `Plexamp`, or `plexamp` processes owned by the configured audio user. If a process can be mapped safely to an active user service, such as `caldera-music.service`, `plexamp.service`, or `plexamp-headless.service`, the installer offers to restart that service. The prompt defaults to no and each detected service is handled separately:
+
+```text
+Caldera Music is running as caldera-music.service.
+Restart it now so it reopens audio through PipeWire?
+Playback may resume paused. [y/N]:
+```
+
+Restarting lets the player reopen audio after onboard devices and the PipeWire default have changed. A2DPilot does not capture playback state or resume playback, so manually press play if the application comes back paused. It also does not kill or relaunch processes directly. A recognized process that cannot be tied safely to the audio user's active `.service` is reported for manual restart.
 
 For unattended installation:
 
@@ -102,7 +116,7 @@ curl -fsSL https://raw.githubusercontent.com/treyturner/a2dpilot/main/a2dpilot \
   | sudo bash -s -- install --user pi --non-interactive
 ```
 
-An unattended installation with no speakers is valid and remains idle until `a2dpilot pair` or `a2dpilot config` is used.
+An unattended installation with no speakers is valid and remains idle until `a2dpilot pair` or `a2dpilot config` is used. Non-interactive installation never restarts a player; it prints an actionable warning for each recognized running instance.
 
 ## Updating A2DPilot
 
@@ -120,7 +134,7 @@ sudo a2dpilot update --tag v1.2.3
 sudo a2dpilot update --sha 0123456789abcdef0123456789abcdef01234567
 ```
 
-`--tag`, `--branch`, and `--sha` are mutually exclusive. A SHA must contain all 40 hexadecimal characters. A branch or tag may move; a commit SHA is the immutable choice when an exact revision is required. Selecting an older revision is allowed and may install a version that does not itself provide the `update` command; the streamed installation command can restore a current executable in that case.
+`--tag`, `--branch`, and `--sha` are mutually exclusive. A SHA must contain all 40 hexadecimal characters. A branch or tag may move; a commit SHA is the immutable choice when an exact revision is required. The downloaded executable must declare a valid A2DPilot version, and `update` rejects revisions older than the running version before changing the installation. To intentionally downgrade, first back up `/etc/a2dpilot.conf`, run `sudo a2dpilot uninstall --keep-bonds`, and then install the older revision explicitly.
 
 Update downloads and syntax-checks the selected Bash program, then atomically replaces only `/usr/local/sbin/a2dpilot`. It does not invoke APT, rewrite `/etc/a2dpilot.conf`, regenerate systemd, WirePlumber, or Triggerhappy files, run `systemctl daemon-reload`, or alter the installation rollback snapshot. If `a2dpilot.service` was active, it is restarted and checked; an inactive service remains inactive. Failed activation restores the previous executable and attempts to restart the previous daemon. This confirms systemd activation, not Bluetooth, PipeWire, or speaker health, which remains the daemon and `status` command's responsibility.
 
@@ -197,7 +211,7 @@ sudo a2dpilot audio onboard enable all
 
 The optional selector is `analog`, `hdmi`, or `all`; omitting it means `all`. A change atomically updates `/etc/a2dpilot.conf`, regenerates the managed WirePlumber fragment, restarts the configured user's WirePlumber session, and lets the daemon reconnect Bluetooth normally. Failed validation or application restores the prior configuration and runtime policy.
 
-Suppression uses [WirePlumber's ALSA device rules](https://pipewire.pages.freedesktop.org/wireplumber/daemon/configuration/alsa.html) and is deliberately narrow. The rules require an internal ALSA card whose reported card name begins with `bcm2835` for analogue audio or `vc4-hdmi` for HDMI audio. USB interfaces and audio HATs are not hidden merely because they are present. The command changes live audio-device visibility only: it does not edit boot firmware, unload drivers, disable HDMI video, or require a reboot. On other hardware the rules normally match nothing, and status reports zero visible matching devices.
+Suppression uses [WirePlumber's ALSA device rules](https://pipewire.pages.freedesktop.org/wireplumber/daemon/configuration/alsa.html) and is deliberately narrow. The rules require an internal ALSA card reported as `bcm2835 Headphones` for analogue audio or with a `vc4-hdmi` name for HDMI audio. USB interfaces, audio HATs, and legacy `bcm2835 HDMI` cards are not hidden by the analogue policy. The command changes live audio-device visibility only: it does not edit boot firmware, unload drivers, disable HDMI video, or require a reboot. On other hardware the rules normally match nothing, and status reports zero visible matching devices.
 
 ### Speaker priority
 
@@ -271,7 +285,7 @@ sudo a2dpilot status
 sudo a2dpilot audio onboard status
 ```
 
-`devices` prints priority, pairing, trust, BlueZ connection, A2DP, AVRCP, negotiated codec, configured codec policy, and device name for every speaker. A policy appears as `auto` or an ordered value such as `aptx_hd>aptx>sbc`. `status` adds installation, controller, rfkill, base URL, media-key count, onboard-audio policy and visibility, system-service, and audio-user service diagnostics.
+`devices` prints priority, pairing, trust, BlueZ connection, A2DP, AVRCP, negotiated codec, configured codec policy, and device name for every speaker. A policy appears as `auto` or an ordered value such as `aptx_hd>aptx>sbc`. `status` adds installation, controller, rfkill, base URL, media-key count, onboard-audio policy and visibility, the active managed sink, PipeWire's effective default, recognized player services, best-effort player backend classification (`PipeWire`, `direct ALSA`, or `unknown`), system-service, and audio-user service diagnostics.
 
 ### Add or repair speakers
 
@@ -352,6 +366,8 @@ aptX Adaptive is not currently exposed by this PipeWire stack. Although the LC3 
 - Install records its managed-state rollback snapshot before APT and service mutations. A failed or interrupted installation invokes uninstall automatically; APT-managed packages are retained, and a failed rollback keeps the snapshot for recovery.
 - Update preserves that snapshot and replaces only the installed executable; an active daemon is restarted, while an inactive daemon remains stopped.
 - Pairing happens after installation commits, so a speaker being unavailable does not erase a valid system setup.
+- Default selection uses bounded `wpctl` and `pw-metadata` calls and records only the last selection A2DPilot successfully verified. Forgetting that speaker, changing the audio user, or uninstalling clears the configured default only if it still matches the recorded sink; a later user change is preserved.
+- A2DPilot does not enumerate or retarget existing playback streams. During interactive installation it can instead restart an exact Caldera Music or Plexamp user service after validating its process owner, cgroup, active service, and process identity. The restart is bounded to ten seconds and never invokes a player API or sends a process signal directly.
 - The system-wide WirePlumber fragment disables seat monitoring and, when requested, hides narrowly matched Raspberry Pi onboard ALSA devices. It deliberately does not override `bluez5.codecs`; per-speaker selection uses advertised PipeWire profile indices with `save: false`.
 
 ## Tests
@@ -430,6 +446,17 @@ sudo loginctl show-user pi -p Linger
 sudo systemctl status "user@$(id -u pi).service"
 ```
 
+`sudo a2dpilot status` reports both the active managed sink and PipeWire's effective default. The daemon retries default selection while the speaker remains healthy, but it deliberately does not seize or migrate a stream that a player opened earlier. If Caldera Music or Plexamp was already running when audio policy changed, restart its user service so it opens a fresh output:
+
+```sh
+sudo -u pi env \
+  XDG_RUNTIME_DIR="/run/user/$(id -u pi)" \
+  DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u pi)/bus" \
+  systemctl --user restart caldera-music.service
+```
+
+Use the service name shown by `a2dpilot status`. A `direct ALSA` backend can retain a hardware PCM and bypass PipeWire; a safely detected service is why interactive installation offers the same restart after pairing. Restarting may leave playback paused, and A2DPilot does not issue a resume command. If status shows `no safe user service`, restart the player through its own documented supervisor rather than killing the reported PID.
+
 ### A preferred codec was not selected
 
 Run `sudo a2dpilot devices` and compare `CODEC` with `CODEC-POLICY`. For an automatic entry, SBC or SBC-XQ is a valid negotiated fallback. For a strict entry, the journal reports the requested and advertised codec sets when they do not overlap. Confirm the exact speaker model supports the desired codec and inspect the associated PipeWire object:
@@ -483,7 +510,7 @@ sudo a2dpilot audio onboard status
 sudo journalctl -b --user-unit=wireplumber.service
 ```
 
-The rule intentionally ignores USB and HAT devices and only matches internal Raspberry Pi cards reported with `bcm2835*` or `vc4-hdmi*` ALSA card names. A zero count may mean that the hardware is absent, already hidden by the configured policy, or reported under a different name. Re-enable both classes with `sudo a2dpilot audio onboard enable`.
+The rule intentionally ignores USB and HAT devices and only matches internal Raspberry Pi cards reported as `bcm2835 Headphones` or with `vc4-hdmi*` ALSA card names. A zero count may mean that the hardware is absent, already hidden by the configured policy, or reported under a different name. Re-enable both classes with `sudo a2dpilot audio onboard enable`.
 
 ### Installation or uninstall failed
 

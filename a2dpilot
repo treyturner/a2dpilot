@@ -17,12 +17,14 @@ fi
 
 set -Eeuo pipefail
 
+A2DPILOT_VERSION=0.1.0
 SCRIPT_PATH=$(readlink -f -- "${BASH_SOURCE[0]}")
 INSTALLED_CLI=/usr/local/sbin/a2dpilot
 CONFIG_FILE=/etc/a2dpilot.conf
 STATE_DIR=/var/lib/a2dpilot
 BACKUP_DIR=$STATE_DIR/backup
 STATE_FILE=$STATE_DIR/state
+DEFAULT_SINK_STATE_FILE=$STATE_DIR/default-sink
 SYSTEMD_UNIT=/etc/systemd/system/a2dpilot.service
 WIREPLUMBER_CONF=/etc/wireplumber/wireplumber.conf.d/51-a2dpilot.conf
 TRIGGER_CONF=/etc/triggerhappy/triggers.d/a2dpilot.conf
@@ -33,7 +35,12 @@ MEDIA_LOCK_FILE=$MEDIA_STATE_DIR/media.lock
 # Debian's triggerhappy.service drops handler processes to this account.
 MEDIA_RUNTIME_USER=nobody
 RFKILL_SYSFS=/sys/class/rfkill
+PROC_ROOT=/proc
 CONNECT_TIMEOUT=10
+DEFAULT_SELECTION_TIMEOUT=3
+DEFAULT_LOG_INTERVAL=60
+PLAYER_DISCOVERY_TIMEOUT=3
+PLAYER_RESTART_TIMEOUT=10
 ONBOARD_STATUS_TIMEOUT=3
 SCAN_TIMEOUT=15
 VOLUME_STEP=5
@@ -149,6 +156,18 @@ AVAILABLE_A2DP_CODECS=
 SELECTED_A2DP_CODEC=
 SELECTED_A2DP_PROFILE=
 SELECTED_A2DP_DEVICE=
+A2DP_SINK_NAME=
+DEFAULT_SINK_ERROR=
+DEFAULT_STATE_USER=
+DEFAULT_STATE_MAC=
+DEFAULT_STATE_NAME=
+DAEMON_NEXT_DEFAULT_LOG=0
+PLAYER_SERVICE_UNITS=()
+PLAYER_SERVICE_LABELS=()
+PLAYER_SERVICE_BACKENDS=()
+PLAYER_MANUAL_PIDS=()
+PLAYER_MANUAL_LABELS=()
+PLAYER_MANUAL_BACKENDS=()
 
 usage() {
   cat <<'EOF'
@@ -194,6 +213,67 @@ tty_read() {
   local variable=$1
   # shellcheck disable=SC2229 # Bash read accepts a variable name here.
   IFS= read -r "$variable" < /dev/tty
+}
+
+tty_confirm() {
+  local prompt=$1 answer
+  while true; do
+    tty_print '%s [y/N]: ' "$prompt"
+    if ! tty_read answer; then
+      tty_print '\n'
+      return 1
+    fi
+    case ${answer,,} in
+      y|yes) return 0 ;;
+      ''|n|no) return 1 ;;
+      *) tty_print 'Please answer y or n.\n' ;;
+    esac
+  done
+}
+
+detect_install_onboard_audio() {
+  local model_path=${1:-/proc/device-tree/model}
+  local cards_path=${2:-/proc/asound/cards}
+  local sound_class=${3:-/sys/class/sound}
+  local model='' line card value driver
+  INSTALL_ONBOARD_ANALOG_AVAILABLE=0
+  INSTALL_ONBOARD_HDMI_AVAILABLE=0
+
+  [[ -r $model_path ]] || return 1
+  IFS= read -r -d '' model < "$model_path" || true
+  [[ $model == Raspberry\ Pi* ]] || return 1
+
+  if [[ -r $cards_path ]]; then
+    while IFS= read -r line || [[ -n $line ]]; do
+      case $line in
+        *bcm2835*Headphones*|*bcm2835*headphones*) INSTALL_ONBOARD_ANALOG_AVAILABLE=1 ;;
+      esac
+      case $line in
+        *vc4-hdmi*|*vc4hdmi*) INSTALL_ONBOARD_HDMI_AVAILABLE=1 ;;
+      esac
+    done < "$cards_path"
+  fi
+
+  for card in "$sound_class"/card*; do
+    [[ -d $card ]] || continue
+    value=
+    if [[ -r $card/id ]]; then
+      IFS= read -r value < "$card/id" || true
+    fi
+    case $value in
+      *Headphones*|*headphones*) INSTALL_ONBOARD_ANALOG_AVAILABLE=1 ;;
+    esac
+    case $value in
+      *vc4-hdmi*|*vc4hdmi*) INSTALL_ONBOARD_HDMI_AVAILABLE=1 ;;
+    esac
+    driver=
+    if [[ -L $card/device/driver ]]; then
+      driver=$(readlink -- "$card/device/driver" 2>/dev/null || true)
+    fi
+    [[ ${driver##*/} != *vc4_hdmi* ]] || INSTALL_ONBOARD_HDMI_AVAILABLE=1
+  done
+
+  (( INSTALL_ONBOARD_ANALOG_AVAILABLE || INSTALL_ONBOARD_HDMI_AVAILABLE ))
 }
 
 prepare_lock_directory() {
@@ -651,13 +731,14 @@ parse_config() {
 
 write_default_config() {
   local path=$1 audio_user=$2
+  local onboard_analog=${3:-enabled} onboard_hdmi=${4:-enabled}
   {
     printf 'audio-user = %s\n' "$audio_user"
     printf 'controller = auto\n'
     printf 'reconnect-interval = 5\n'
     printf 'media-controls = auto\n'
-    printf 'onboard-analog = enabled\n'
-    printf 'onboard-hdmi = enabled\n'
+    printf 'onboard-analog = %s\n' "$onboard_analog"
+    printf 'onboard-hdmi = %s\n' "$onboard_hdmi"
     printf 'base-url = http://127.0.0.1:32500\n\n'
     printf 'media-key = KEY_PLAYPAUSE player/playback/playPause?type=music&commandID={command-id}\n'
     printf 'media-key = KEY_PLAY player/playback/play?type=music&commandID={command-id}\n'
@@ -724,6 +805,47 @@ update_candidate_has_bash_shebang() {
   local shebang
   IFS= read -r shebang < "$1" || return 1
   [[ $shebang == '#!/usr/bin/env bash' ]]
+}
+
+valid_a2dpilot_version() {
+  [[ $1 =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+}
+
+read_a2dpilot_version() {
+  local path=$1 target=$2 line value='' declarations=0
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line == A2DPILOT_VERSION=* ]] || continue
+    declarations=$((declarations + 1))
+    value=${line#A2DPILOT_VERSION=}
+    valid_a2dpilot_version "$value" || return 1
+  done < "$path"
+  (( declarations == 1 )) || return 1
+  printf -v "$target" '%s' "$value"
+}
+
+a2dpilot_version_is_older() {
+  local candidate=$1 current=$2 candidate_part current_part index digit_index
+  local -a candidate_parts=() current_parts=()
+  valid_a2dpilot_version "$candidate" && valid_a2dpilot_version "$current" || return 2
+  IFS=. read -r -a candidate_parts <<< "$candidate"
+  IFS=. read -r -a current_parts <<< "$current"
+  for index in 0 1 2; do
+    candidate_part=${candidate_parts[$index]}
+    current_part=${current_parts[$index]}
+    if (( ${#candidate_part} < ${#current_part} )); then
+      return 0
+    elif (( ${#candidate_part} > ${#current_part} )); then
+      return 1
+    fi
+    for (( digit_index = 0; digit_index < ${#candidate_part}; digit_index++ )); do
+      if (( ${candidate_part:digit_index:1} < ${current_part:digit_index:1} )); then
+        return 0
+      elif (( ${candidate_part:digit_index:1} > ${current_part:digit_index:1} )); then
+        return 1
+      fi
+    done
+  done
+  return 1
 }
 
 validate_managed_paths() {
@@ -820,12 +942,24 @@ as_user_systemctl() {
     DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus" systemctl --user "$@"
 }
 
+bounded_user_systemctl() {
+  local user=$1 seconds=$2 uid runtime home
+  shift 2
+  [[ $seconds =~ ^[1-9][0-9]*$ ]] || return 1
+  uid=$(id -u "$user")
+  runtime=/run/user/$uid
+  home=$(user_home "$user")
+  runuser -u "$user" -- env HOME="$home" XDG_RUNTIME_DIR="$runtime" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus" \
+    timeout --signal=TERM --kill-after=1 "$seconds" systemctl --user "$@"
+}
+
 bounded_user_pipewire_command() {
   local user=$1 seconds=$2 command=$3 uid runtime home
   shift 3
   [[ $seconds =~ ^[1-9][0-9]*$ ]] || return 1
   case $command in
-    pw-cli|wpctl) ;;
+    pw-cli|pw-metadata|wpctl) ;;
     *) return 1 ;;
   esac
   uid=$(id -u "$user")
@@ -846,6 +980,12 @@ bounded_user_wpctl() {
   local user=$1 seconds=$2
   shift 2
   bounded_user_pipewire_command "$user" "$seconds" wpctl "$@"
+}
+
+bounded_user_pw_metadata() {
+  local user=$1 seconds=$2
+  shift 2
+  bounded_user_pipewire_command "$user" "$seconds" pw-metadata "$@"
 }
 
 system_unit_enabled_state() {
@@ -1034,6 +1174,10 @@ reconcile_audio_user() {
   [[ -d $STATE_DIR ]] || return 0
   [[ -f $STATE_DIR/runtime-user ]] && old_user=$(< "$STATE_DIR/runtime-user")
   [[ $old_user == "$new_user" ]] && return 0
+  if [[ -n $old_user && $old_user != "$new_user" ]] &&
+     ! clear_recorded_default_sink "$old_user"; then
+    warn "Could not clear A2DPilot's recorded PipeWire default for $old_user."
+  fi
   ensure_audio_user "$new_user" || return 1
   if [[ -n $old_user && $old_user != "$new_user" ]] && id "$old_user" >/dev/null 2>&1; then
     restore_user_state "$old_user" || return 1
@@ -1197,7 +1341,7 @@ EOF
     matches = [
       {
         device.form-factor = "internal"
-        api.alsa.card.name = "~bcm2835.*"
+        api.alsa.card.name = "~bcm2835.*[Hh]eadphones.*"
       }
     ]
     actions = {
@@ -1630,6 +1774,492 @@ find_a2dp_node_id() {
   node=$(sed -E 's/^[^0-9]*([0-9]+)\..*/\1/' <<< "$line")
   [[ $node =~ ^[0-9]+$ ]] || return 1
   printf '%s\n' "$node"
+}
+
+valid_pipewire_name() {
+  [[ $1 =~ ^[A-Za-z0-9_.:+-]+$ ]]
+}
+
+inspect_a2dp_sink_node() {
+  local mac=$1 node=$2 seconds=$3 output line name='' class=''
+  local name_pattern='^[[:space:]]*\*?[[:space:]]*node\.name[[:space:]]*=[[:space:]]*"([^"]+)"[[:space:]]*$'
+  local class_pattern='^[[:space:]]*\*?[[:space:]]*media\.class[[:space:]]*=[[:space:]]*"([^"]+)"[[:space:]]*$'
+  local mac_key=${mac//:/_}
+  [[ $node =~ ^[0-9]+$ && $seconds =~ ^[1-9][0-9]*$ ]] || return 1
+  output=$(bounded_user_wpctl "$CFG_AUDIO_USER" "$seconds" inspect "$node" 2>/dev/null) || return 1
+  while IFS= read -r line; do
+    if [[ $line =~ $name_pattern ]]; then
+      [[ -z $name ]] || return 1
+      name=${BASH_REMATCH[1]}
+    elif [[ $line =~ $class_pattern ]]; then
+      [[ -z $class ]] || return 1
+      class=${BASH_REMATCH[1]}
+    fi
+  done <<< "$output"
+  valid_pipewire_name "$name" || return 1
+  [[ $class == Audio/Sink && $name == "bluez_output.${mac_key}."* ]] || return 1
+  A2DP_SINK_NAME=$name
+}
+
+pipewire_default_sink() {
+  local user=$1 seconds=$2 kind=$3 key output line name='' found=0 have_banner=0
+  local pattern
+  [[ $seconds =~ ^[1-9][0-9]*$ ]] || return 1
+  case $kind in
+    effective) key=default.audio.sink ;;
+    configured) key=default.configured.audio.sink ;;
+    *) return 1 ;;
+  esac
+  pattern="key:'${key//./\\.}'.*value:'\\{[[:space:]]*\"name\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9_.:+-]+)\"[[:space:]]*\\}'"
+  output=$(bounded_user_pw_metadata "$user" "$seconds" -n default 0 "$key" 2>/dev/null) || return 1
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    if [[ $line =~ $pattern ]]; then
+      (( found == 0 )) || return 1
+      name=${BASH_REMATCH[1]}
+      valid_pipewire_name "$name" || return 1
+      found=1
+    elif [[ $line =~ ^Found[[:space:]]\"default\"[[:space:]]metadata[[:space:]][0-9]+$ ]]; then
+      (( have_banner == 0 )) || return 1
+      have_banner=1
+    else
+      return 1
+    fi
+  done <<< "$output"
+  (( found == 1 )) || return 2
+  printf '%s\n' "$name"
+}
+
+read_default_sink_state() {
+  local user mac name extra
+  [[ -e $DEFAULT_SINK_STATE_FILE || -L $DEFAULT_SINK_STATE_FILE ]] || return 2
+  [[ -f $DEFAULT_SINK_STATE_FILE && ! -L $DEFAULT_SINK_STATE_FILE ]] || return 1
+  IFS=$'\t' read -r user mac name extra < "$DEFAULT_SINK_STATE_FILE" || return 1
+  [[ -z $extra && -n $user ]] || return 1
+  id "$user" >/dev/null 2>&1 || return 1
+  valid_mac "$mac" && [[ $mac == "${mac^^}" ]] || return 1
+  valid_pipewire_name "$name" || return 1
+  DEFAULT_STATE_USER=$user
+  DEFAULT_STATE_MAC=$mac
+  DEFAULT_STATE_NAME=$name
+}
+
+write_default_sink_state() {
+  local user=$1 mac=$2 name=$3 temp
+  id "$user" >/dev/null 2>&1 || return 1
+  valid_mac "$mac" || return 1
+  mac=$(normalize_mac "$mac")
+  valid_pipewire_name "$name" || return 1
+  [[ ! -e $DEFAULT_SINK_STATE_FILE && ! -L $DEFAULT_SINK_STATE_FILE ||
+     -f $DEFAULT_SINK_STATE_FILE && ! -L $DEFAULT_SINK_STATE_FILE ]] || return 1
+  temp=$(mktemp "$STATE_DIR/.default-sink.XXXXXX") || return 1
+  if ! printf '%s\t%s\t%s\n' "$user" "$mac" "$name" > "$temp" ||
+     ! chmod 0600 "$temp" || ! mv -f -- "$temp" "$DEFAULT_SINK_STATE_FILE"; then
+    rm -f -- "$temp"
+    return 1
+  fi
+}
+
+remove_default_sink_state() {
+  [[ ! -L $DEFAULT_SINK_STATE_FILE ]] || return 1
+  rm -f -- "$DEFAULT_SINK_STATE_FILE"
+}
+
+select_speaker_default() {
+  local mac=$1 seconds=${2:-$DEFAULT_SELECTION_TIMEOUT} deadline remaining node current configured result
+  DEFAULT_SINK_ERROR=
+  [[ $seconds =~ ^[1-9][0-9]*$ ]] || return 1
+  valid_mac "$mac" || return 1
+  mac=$(normalize_mac "$mac")
+  deadline=$(( $(now_seconds) + seconds ))
+  remaining=$(seconds_until_deadline "$deadline") || return 1
+  node=$(find_a2dp_node_id "$mac" "$remaining") || {
+    DEFAULT_SINK_ERROR="could not locate the A2DP sink for $mac"
+    return 1
+  }
+  [[ $node =~ ^[0-9]+$ ]] || return 1
+  remaining=$(seconds_until_deadline "$deadline") || return 1
+  inspect_a2dp_sink_node "$mac" "$node" "$remaining" || {
+    DEFAULT_SINK_ERROR="could not validate the A2DP sink for $mac"
+    return 1
+  }
+  local sink_name=$A2DP_SINK_NAME
+  remaining=$(seconds_until_deadline "$deadline") || return 1
+  if current=$(pipewire_default_sink "$CFG_AUDIO_USER" "$remaining" effective); then
+    result=0
+  else
+    result=$?
+    current=
+  fi
+  if (( result == 0 )) && [[ $current == "$sink_name" ]]; then
+    if read_default_sink_state 2>/dev/null; then
+      if [[ $DEFAULT_STATE_USER == "$CFG_AUDIO_USER" &&
+            $DEFAULT_STATE_MAC == "$mac" && $DEFAULT_STATE_NAME == "$sink_name" ]]; then
+        return 0
+      fi
+      [[ $DEFAULT_STATE_USER == "$CFG_AUDIO_USER" ]] || {
+        DEFAULT_SINK_ERROR="the recorded PipeWire default belongs to another audio user"
+        return 1
+      }
+      remaining=$(seconds_until_deadline "$deadline") || return 1
+      if configured=$(pipewire_default_sink "$CFG_AUDIO_USER" "$remaining" configured); then
+        result=0
+      else
+        result=$?
+        configured=
+      fi
+      if (( result == 0 )) && [[ $configured == "$DEFAULT_STATE_NAME" ]]; then
+        : # Replace the configured default that A2DPilot still owns below.
+      elif (( result == 0 || result == 2 )); then
+        remove_default_sink_state || {
+          DEFAULT_SINK_ERROR="could not retire stale PipeWire default ownership"
+          return 1
+        }
+        return 0
+      else
+        DEFAULT_SINK_ERROR="could not inspect PipeWire's configured default sink"
+        return 1
+      fi
+    else
+      result=$?
+      (( result == 2 )) && return 0
+      DEFAULT_SINK_ERROR="could not read PipeWire default ownership"
+      return 1
+    fi
+  fi
+  (( result == 0 || result == 2 )) || {
+    DEFAULT_SINK_ERROR="could not inspect PipeWire's effective default sink"
+    return 1
+  }
+  remaining=$(seconds_until_deadline "$deadline") || return 1
+  bounded_user_wpctl "$CFG_AUDIO_USER" "$remaining" set-default "$node" >/dev/null 2>&1 || {
+    DEFAULT_SINK_ERROR="could not select $sink_name as PipeWire's default sink"
+    return 1
+  }
+  remaining=$(seconds_until_deadline "$deadline") || return 1
+  current=$(pipewire_default_sink "$CFG_AUDIO_USER" "$remaining" effective) || {
+    DEFAULT_SINK_ERROR="could not verify PipeWire's effective default sink"
+    return 1
+  }
+  [[ $current == "$sink_name" ]] || {
+    DEFAULT_SINK_ERROR="PipeWire did not make $sink_name the effective default sink"
+    return 1
+  }
+  remaining=$(seconds_until_deadline "$deadline") || return 1
+  configured=$(pipewire_default_sink "$CFG_AUDIO_USER" "$remaining" configured) || {
+    DEFAULT_SINK_ERROR="could not verify PipeWire's configured default sink"
+    return 1
+  }
+  [[ $configured == "$sink_name" ]] || {
+    DEFAULT_SINK_ERROR="PipeWire did not make $sink_name the configured default sink"
+    return 1
+  }
+  write_default_sink_state "$CFG_AUDIO_USER" "$mac" "$sink_name" || {
+    DEFAULT_SINK_ERROR="could not record ownership of PipeWire's default sink"
+    return 1
+  }
+}
+
+clear_recorded_default_sink() {
+  local wanted_user=${1:-} wanted_mac=${2:-} current result
+  if read_default_sink_state; then
+    result=0
+  else
+    result=$?
+    (( result == 2 )) && return 0
+    return 1
+  fi
+  [[ -z $wanted_user || $DEFAULT_STATE_USER == "$wanted_user" ]] || return 0
+  if [[ -n $wanted_mac ]]; then
+    valid_mac "$wanted_mac" || return 1
+    wanted_mac=$(normalize_mac "$wanted_mac")
+    [[ $DEFAULT_STATE_MAC == "$wanted_mac" ]] || return 0
+  fi
+  if current=$(pipewire_default_sink "$DEFAULT_STATE_USER" "$DEFAULT_SELECTION_TIMEOUT" configured); then
+    result=0
+  else
+    result=$?
+    current=
+  fi
+  if (( result == 2 )) || { (( result == 0 )) && [[ $current != "$DEFAULT_STATE_NAME" ]]; }; then
+    remove_default_sink_state
+    return
+  fi
+  (( result == 0 )) || return 1
+  bounded_user_wpctl "$DEFAULT_STATE_USER" "$DEFAULT_SELECTION_TIMEOUT" \
+    clear-default 0 >/dev/null 2>&1 || return 1
+  if current=$(pipewire_default_sink "$DEFAULT_STATE_USER" "$DEFAULT_SELECTION_TIMEOUT" configured); then
+    [[ $current != "$DEFAULT_STATE_NAME" ]] || return 1
+  else
+    result=$?
+    (( result == 2 )) || return 1
+  fi
+  remove_default_sink_state
+}
+
+maintain_speaker_default() {
+  local mac=$1 now
+  if select_speaker_default "$mac" "$DEFAULT_SELECTION_TIMEOUT"; then
+    DAEMON_NEXT_DEFAULT_LOG=0
+    return 0
+  fi
+  now=$(now_seconds)
+  if (( now >= DAEMON_NEXT_DEFAULT_LOG )); then
+    [[ -n $DEFAULT_SINK_ERROR ]] || \
+      DEFAULT_SINK_ERROR="could not select the active Bluetooth sink as PipeWire's default"
+    daemon_log "$DEFAULT_SINK_ERROR; Bluetooth remains connected"
+    DAEMON_NEXT_DEFAULT_LOG=$((now + DEFAULT_LOG_INTERVAL))
+  fi
+  return 0
+}
+
+valid_user_service_unit() {
+  [[ $1 =~ ^[A-Za-z0-9_.@:+-]+\.service$ ]]
+}
+
+known_player_identity() {
+  local pid=$1 comm='' executable='' identity
+  [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ -r $PROC_ROOT/$pid/comm ]] || return 1
+  IFS= read -r comm < "$PROC_ROOT/$pid/comm" || return 1
+  if [[ -L $PROC_ROOT/$pid/exe ]]; then
+    executable=$(readlink -- "$PROC_ROOT/$pid/exe" 2>/dev/null || true)
+    executable=${executable##*/}
+  fi
+  identity=$comm
+  case $identity in
+    caldera-music) PLAYER_IDENTITY_LABEL='Caldera Music' ;;
+    Plexamp|plexamp) PLAYER_IDENTITY_LABEL=Plexamp ;;
+    *)
+      identity=$executable
+      case $identity in
+        caldera-music) PLAYER_IDENTITY_LABEL='Caldera Music' ;;
+        Plexamp|plexamp) PLAYER_IDENTITY_LABEL=Plexamp ;;
+        *) return 1 ;;
+      esac
+      ;;
+  esac
+}
+
+process_start_time() {
+  local pid=$1 stat_line
+  local -a fields=()
+  [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
+  IFS= read -r stat_line < "$PROC_ROOT/$pid/stat" || return 1
+  [[ $stat_line == "$pid ("* && $stat_line == *") "* ]] || return 1
+  stat_line=${stat_line##*) }
+  read -r -a fields <<< "$stat_line"
+  (( ${#fields[@]} >= 20 )) || return 1
+  [[ ${fields[19]} =~ ^[1-9][0-9]*$ ]] || return 1
+  printf '%s\n' "${fields[19]}"
+}
+
+process_cgroup_path() {
+  local pid=$1 line path='' count=0
+  [[ -r $PROC_ROOT/$pid/cgroup ]] || return 1
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line == 0::* ]] || return 1
+    path=${line#0::}
+    count=$((count + 1))
+  done < "$PROC_ROOT/$pid/cgroup"
+  (( count == 1 )) || return 1
+  [[ $path == /* && $path != *[[:space:]]* ]] || return 1
+  printf '%s\n' "$path"
+}
+
+inspect_active_user_service() {
+  local user=$1 unit=$2 output line key value
+  local load='' active='' control_group='' main_pid=''
+  local load_seen=0 active_seen=0 group_seen=0 pid_seen=0
+  valid_user_service_unit "$unit" || return 1
+  output=$(bounded_user_systemctl "$user" "$PLAYER_DISCOVERY_TIMEOUT" show "$unit" \
+    -p LoadState -p ActiveState -p ControlGroup -p MainPID 2>/dev/null) || return 1
+  while IFS= read -r line; do
+    [[ $line == *=* ]] || return 1
+    key=${line%%=*}
+    value=${line#*=}
+    case $key in
+      LoadState) (( load_seen++ == 0 )) || return 1; load=$value ;;
+      ActiveState) (( active_seen++ == 0 )) || return 1; active=$value ;;
+      ControlGroup) (( group_seen++ == 0 )) || return 1; control_group=$value ;;
+      MainPID) (( pid_seen++ == 0 )) || return 1; main_pid=$value ;;
+      *) return 1 ;;
+    esac
+  done <<< "$output"
+  [[ $load == loaded && ( $active == active || $active == reloading ) ]] || return 1
+  [[ $control_group == /* && $control_group != *[[:space:]]* ]] || return 1
+  [[ $main_pid =~ ^[1-9][0-9]*$ ]] || return 1
+  PLAYER_SERVICE_CONTROL_GROUP=$control_group
+}
+
+player_service_for_pid() {
+  local user=$1 pid=$2 uid path prefix unit
+  uid=$(id -u "$user") || return 1
+  path=$(process_cgroup_path "$pid") || return 1
+  prefix=/user.slice/user-${uid}.slice/user@${uid}.service/app.slice/
+  [[ $path == "$prefix"* ]] || return 1
+  unit=${path#"$prefix"}
+  valid_user_service_unit "$unit" || return 1
+  inspect_active_user_service "$user" "$unit" || return 1
+  [[ $PLAYER_SERVICE_CONTROL_GROUP == "$path" ]] || return 1
+  printf '%s\n' "$unit"
+}
+
+player_backend_for_pid() {
+  local pid=$1 fd target line
+  for fd in "$PROC_ROOT/$pid"/fd/*; do
+    [[ -L $fd ]] || continue
+    target=$(readlink -- "$fd" 2>/dev/null || true)
+    [[ $target != /dev/snd/pcm* ]] || {
+      printf 'direct ALSA\n'
+      return 0
+    }
+  done
+  if [[ -r $PROC_ROOT/$pid/maps ]]; then
+    while IFS= read -r line || [[ -n $line ]]; do
+      case $line in
+        *'/libpipewire-'*|*'/alsa-lib/libasound_module_pcm_pipewire.so'*)
+          printf 'PipeWire\n'
+          return 0
+          ;;
+      esac
+    done < "$PROC_ROOT/$pid/maps"
+  fi
+  printf 'unknown\n'
+}
+
+player_backend_rank() {
+  case $1 in
+    'direct ALSA') printf '3\n' ;;
+    PipeWire) printf '2\n' ;;
+    *) printf '1\n' ;;
+  esac
+}
+
+discover_known_players() {
+  local user=$1 uid directory pid owner label start_before start_after unit backend index rank old_rank
+  local -A service_indexes=()
+  PLAYER_SERVICE_UNITS=()
+  PLAYER_SERVICE_LABELS=()
+  PLAYER_SERVICE_BACKENDS=()
+  PLAYER_MANUAL_PIDS=()
+  PLAYER_MANUAL_LABELS=()
+  PLAYER_MANUAL_BACKENDS=()
+  uid=$(id -u "$user") || return 1
+  for directory in "$PROC_ROOT"/[0-9]*; do
+    [[ -d $directory ]] || continue
+    pid=${directory##*/}
+    [[ $pid =~ ^[1-9][0-9]*$ ]] || continue
+    owner=$(stat -c %u -- "$directory" 2>/dev/null) || continue
+    [[ $owner == "$uid" ]] || continue
+    start_before=$(process_start_time "$pid" 2>/dev/null) || continue
+    known_player_identity "$pid" || continue
+    label=$PLAYER_IDENTITY_LABEL
+    backend=$(player_backend_for_pid "$pid")
+    if unit=$(player_service_for_pid "$user" "$pid"); then
+      start_after=$(process_start_time "$pid" 2>/dev/null) || continue
+      [[ $start_after == "$start_before" ]] || continue
+      known_player_identity "$pid" || continue
+      [[ $PLAYER_IDENTITY_LABEL == "$label" ]] || continue
+      if [[ ${service_indexes[$unit]+present} ]]; then
+        index=${service_indexes[$unit]}
+        rank=$(player_backend_rank "$backend")
+        old_rank=$(player_backend_rank "${PLAYER_SERVICE_BACKENDS[$index]}")
+        (( rank <= old_rank )) || PLAYER_SERVICE_BACKENDS[index]=$backend
+      else
+        service_indexes[$unit]=${#PLAYER_SERVICE_UNITS[@]}
+        PLAYER_SERVICE_UNITS+=("$unit")
+        PLAYER_SERVICE_LABELS+=("$label")
+        PLAYER_SERVICE_BACKENDS+=("$backend")
+      fi
+    else
+      start_after=$(process_start_time "$pid" 2>/dev/null) || continue
+      [[ $start_after == "$start_before" ]] || continue
+      PLAYER_MANUAL_PIDS+=("$pid")
+      PLAYER_MANUAL_LABELS+=("$label")
+      PLAYER_MANUAL_BACKENDS+=("$backend")
+    fi
+  done
+}
+
+user_service_has_known_player() {
+  local user=$1 unit=$2 label=$3 uid directory pid owner path start_before start_after
+  uid=$(id -u "$user") || return 1
+  inspect_active_user_service "$user" "$unit" || return 1
+  for directory in "$PROC_ROOT"/[0-9]*; do
+    [[ -d $directory ]] || continue
+    pid=${directory##*/}
+    owner=$(stat -c %u -- "$directory" 2>/dev/null) || continue
+    [[ $owner == "$uid" ]] || continue
+    start_before=$(process_start_time "$pid" 2>/dev/null) || continue
+    known_player_identity "$pid" || continue
+    [[ $PLAYER_IDENTITY_LABEL == "$label" ]] || continue
+    path=$(process_cgroup_path "$pid" 2>/dev/null) || continue
+    [[ $path == "$PLAYER_SERVICE_CONTROL_GROUP" ]] || continue
+    start_after=$(process_start_time "$pid" 2>/dev/null) || continue
+    [[ $start_after == "$start_before" ]] || continue
+    return 0
+  done
+  return 1
+}
+
+restart_detected_player() {
+  local user=$1 unit=$2 label=$3 deadline remaining
+  valid_user_service_unit "$unit" || return 1
+  user_service_has_known_player "$user" "$unit" "$label" || return 1
+  deadline=$(( $(now_seconds) + PLAYER_RESTART_TIMEOUT ))
+  remaining=$(seconds_until_deadline "$deadline") || return 1
+  bounded_user_systemctl "$user" "$remaining" restart "$unit" >/dev/null 2>&1 || return 1
+  remaining=$(seconds_until_deadline "$deadline") || return 1
+  bounded_user_systemctl "$user" "$remaining" is-active --quiet "$unit" >/dev/null 2>&1
+}
+
+offer_player_restarts() {
+  local user=$1 interactive=$2 index unit label backend
+  discover_known_players "$user" || {
+    warn "Could not inspect running Caldera or Plexamp instances."
+    return 0
+  }
+  for index in "${!PLAYER_MANUAL_PIDS[@]}"; do
+    warn "${PLAYER_MANUAL_LABELS[$index]} is running as PID ${PLAYER_MANUAL_PIDS[$index]} (${PLAYER_MANUAL_BACKENDS[$index]}) but could not be mapped safely to an active user service; restart it manually to reopen audio through PipeWire."
+  done
+  for index in "${!PLAYER_SERVICE_UNITS[@]}"; do
+    unit=${PLAYER_SERVICE_UNITS[$index]}
+    label=${PLAYER_SERVICE_LABELS[$index]}
+    backend=${PLAYER_SERVICE_BACKENDS[$index]}
+    if (( interactive == 0 )); then
+      warn "$label is running as $unit ($backend). Restart it manually to reopen audio through PipeWire; non-interactive installation never restarts players."
+      continue
+    fi
+    tty_print '\n%s is running as %s.\n' "$label" "$unit"
+    if tty_confirm $'Restart it now so it reopens audio through PipeWire?\nPlayback may resume paused.'; then
+      if restart_detected_player "$user" "$unit" "$label"; then
+        note "Restarted $unit."
+      else
+        warn "Could not safely restart $unit; restart it manually."
+      fi
+    else
+      note "Left $unit running."
+    fi
+  done
+}
+
+print_known_player_status() {
+  local index
+  if ! discover_known_players "$CFG_AUDIO_USER"; then
+    note "Known players: unavailable"
+    return 0
+  fi
+  if (( ${#PLAYER_SERVICE_UNITS[@]} == 0 && ${#PLAYER_MANUAL_PIDS[@]} == 0 )); then
+    note "Known players: none"
+    return 0
+  fi
+  for index in "${!PLAYER_SERVICE_UNITS[@]}"; do
+    note "Known player: ${PLAYER_SERVICE_LABELS[$index]} (${PLAYER_SERVICE_UNITS[$index]}, ${PLAYER_SERVICE_BACKENDS[$index]})"
+  done
+  for index in "${!PLAYER_MANUAL_PIDS[@]}"; do
+    note "Known player: ${PLAYER_MANUAL_LABELS[$index]} (PID ${PLAYER_MANUAL_PIDS[$index]}, no safe user service, ${PLAYER_MANUAL_BACKENDS[$index]})"
+  done
 }
 
 a2dp_connected() {
@@ -2302,6 +2932,8 @@ forget_action() {
     release_lock
     die "$error"
   }
+  clear_recorded_default_sink "$CFG_AUDIO_USER" "$mac" || \
+    warn "Could not clear A2DPilot's recorded PipeWire default for $mac."
   disconnect_bluetooth_device "$mac" || true
   if device_info "$mac" >/dev/null 2>&1; then
     remove_bluetooth_device "$mac" || {
@@ -2352,6 +2984,32 @@ wait_for_health() {
     seconds_until_deadline "$deadline" >/dev/null || return 1
     sleep 1
   done
+}
+
+wait_for_configured_speaker_default() {
+  local seconds=${1:-$CONNECT_TIMEOUT} deadline remaining attempt_seconds mac
+  local default_failed=0
+  [[ $seconds =~ ^[1-9][0-9]*$ ]] || return 1
+  (( ${#CFG_SPEAKERS[@]} > 0 )) || return 2
+  deadline=$(( $(now_seconds) + seconds ))
+  while remaining=$(seconds_until_deadline "$deadline"); do
+    if mac=$(read_daemon_selected_speaker); then
+      remaining=$(seconds_until_deadline "$deadline") || return 1
+      if device_healthy "$mac" "$remaining"; then
+        remaining=$(seconds_until_deadline "$deadline") || break
+        attempt_seconds=$DEFAULT_SELECTION_TIMEOUT
+        (( attempt_seconds <= remaining )) || attempt_seconds=$remaining
+        if select_speaker_default "$mac" "$attempt_seconds"; then
+          return 0
+        fi
+        default_failed=1
+      fi
+    fi
+    seconds_until_deadline "$deadline" >/dev/null || break
+    sleep 1
+  done
+  (( default_failed == 0 )) || return 3
+  return 1
 }
 
 disconnect_other_speakers() {
@@ -2440,6 +3098,19 @@ load_daemon_active() {
   fi
 }
 
+read_daemon_selected_speaker() {
+  local path=$STATE_DIR/active-speaker mac
+  local -a lines=()
+  [[ -f $path && ! -L $path ]] || return 1
+  mapfile -t lines < "$path" || return 1
+  (( ${#lines[@]} == 1 )) || return 1
+  mac=${lines[0]}
+  valid_mac "$mac" || return 1
+  mac=$(normalize_mac "$mac")
+  speaker_configured "$mac" || return 1
+  printf '%s\n' "$mac"
+}
+
 record_daemon_failure() {
   local mac=$1 message=$2 failures delay now
   now=$(now_seconds)
@@ -2457,6 +3128,8 @@ daemon_cycle() {
 
   if [[ -n $DAEMON_ACTIVE ]]; then
     if ! speaker_configured "$DAEMON_ACTIVE"; then
+      clear_recorded_default_sink "$CFG_AUDIO_USER" "$DAEMON_ACTIVE" || \
+        warn "Could not clear A2DPilot's recorded PipeWire default for $DAEMON_ACTIVE."
       disconnect_bluetooth_device "$DAEMON_ACTIVE" || true
       unset "DAEMON_CODEC_POLICY[$DAEMON_ACTIVE]" "DAEMON_CODEC_TARGET[$DAEMON_ACTIVE]"
       remember_daemon_active ''
@@ -2465,6 +3138,7 @@ daemon_cycle() {
       if apply_speaker_codec_policy "$DAEMON_ACTIVE" "$deadline"; then
         DAEMON_FAILURES[$DAEMON_ACTIVE]=0
         DAEMON_NEXT_ATTEMPT[$DAEMON_ACTIVE]=0
+        maintain_speaker_default "$DAEMON_ACTIVE"
         disconnect_other_speakers "$DAEMON_ACTIVE"
         return 0
       fi
@@ -2493,6 +3167,7 @@ daemon_cycle() {
         DAEMON_FAILURES[$mac]=0
         DAEMON_NEXT_ATTEMPT[$mac]=0
         remember_daemon_active "$mac"
+        maintain_speaker_default "$mac"
         disconnect_other_speakers "$mac"
         return 0
       fi
@@ -2526,6 +3201,7 @@ daemon_cycle() {
       remember_daemon_active "$mac"
       DAEMON_FAILURES[$mac]=0
       DAEMON_NEXT_ATTEMPT[$mac]=0
+      maintain_speaker_default "$mac"
       disconnect_other_speakers "$mac"
       daemon_log "connected $mac with codec $(a2dp_codec "$mac" 2>/dev/null || printf unknown)"
       return 0
@@ -3059,7 +3735,8 @@ visible_onboard_devices() {
   list_onboard_audio_device_ids || return 1
   for id in "${ONBOARD_DEVICE_IDS[@]}"; do
     inspect_onboard_audio_device "$id" || return 1
-    [[ $ONBOARD_DEVICE_FORM == internal && $ONBOARD_DEVICE_CARD == bcm2835* ]] && \
+    [[ $ONBOARD_DEVICE_FORM == internal && \
+       $ONBOARD_DEVICE_CARD == bcm2835*[Hh]eadphones* ]] && \
       ONBOARD_ANALOG_VISIBLE=$((ONBOARD_ANALOG_VISIBLE + 1))
     [[ $ONBOARD_DEVICE_FORM == internal && $ONBOARD_DEVICE_CARD == vc4-hdmi* ]] && \
       ONBOARD_HDMI_VISIBLE=$((ONBOARD_HDMI_VISIBLE + 1))
@@ -3172,6 +3849,32 @@ devices_action() {
   (( priority > 0 )) || note "No speakers are configured."
 }
 
+print_default_sink_status() {
+  local active=none saved='' node effective result
+  if [[ -f $STATE_DIR/active-speaker && ! -L $STATE_DIR/active-speaker ]]; then
+    IFS= read -r saved < "$STATE_DIR/active-speaker" || saved=
+    if valid_mac "$saved"; then
+      saved=$(normalize_mac "$saved")
+      if node=$(find_a2dp_node_id "$saved" "$DEFAULT_SELECTION_TIMEOUT") &&
+         inspect_a2dp_sink_node "$saved" "$node" "$DEFAULT_SELECTION_TIMEOUT"; then
+        active="$A2DP_SINK_NAME ($saved)"
+      else
+        active="unavailable ($saved)"
+      fi
+    fi
+  fi
+  if effective=$(pipewire_default_sink \
+    "$CFG_AUDIO_USER" "$DEFAULT_SELECTION_TIMEOUT" effective); then
+    result=0
+  else
+    result=$?
+    effective=unknown
+  fi
+  (( result != 2 )) || effective=none
+  note "Active managed sink: $active"
+  note "Effective default sink: $effective"
+}
+
 status_action() {
   require_root
   [[ $# -eq 0 ]] || die "status does not accept arguments."
@@ -3192,6 +3895,8 @@ status_action() {
     note "Base URL: ${CFG_BASE_URL:-none}"
     note "Media key mappings: ${#CFG_MEDIA_KEYS[@]}"
     print_onboard_audio_status all
+    print_default_sink_status
+    print_known_player_status
     devices_action
   else
     warn "$CONFIG_ERROR"
@@ -3266,6 +3971,7 @@ rollback_failed_update() {
 update_action() {
   require_root
   local selector=branch ref=main selector_set=0 url phase previous_umask
+  local candidate_version installed_version
   while [[ $# -gt 0 ]]; do
     case $1 in
       --tag|--branch|--sha)
@@ -3323,6 +4029,13 @@ update_action() {
     rollback_failed_update 1 "The downloaded A2DPilot executable lacks the expected Bash shebang."
   bash -n "$UPDATE_CANDIDATE" || \
     rollback_failed_update 1 "The downloaded A2DPilot executable failed Bash syntax validation."
+  read_a2dpilot_version "$UPDATE_CANDIDATE" candidate_version || \
+    rollback_failed_update 1 \
+      "The downloaded A2DPilot executable must declare exactly one valid A2DPILOT_VERSION."
+  if a2dpilot_version_is_older "$candidate_version" "$A2DPILOT_VERSION"; then
+    rollback_failed_update 1 \
+      "Refusing to downgrade A2DPilot from $A2DPILOT_VERSION to $candidate_version. Back up $CONFIG_FILE, run 'sudo a2dpilot uninstall --keep-bonds', then install the older revision explicitly."
+  fi
 
   acquire_lock
   phase=$(read_install_phase) || \
@@ -3331,6 +4044,13 @@ update_action() {
     rollback_failed_update 1 "A2DPilot installation state changed to '$phase' during the update."
   validate_update_target || \
     rollback_failed_update 1 "The installed executable became unsafe during the update."
+  read_a2dpilot_version "$INSTALLED_CLI" installed_version || \
+    rollback_failed_update 1 \
+      "The installed A2DPilot executable does not declare exactly one valid A2DPILOT_VERSION."
+  if a2dpilot_version_is_older "$candidate_version" "$installed_version"; then
+    rollback_failed_update 1 \
+      "Refusing to downgrade A2DPilot from $installed_version to $candidate_version. Back up $CONFIG_FILE, run 'sudo a2dpilot uninstall --keep-bonds', then install the older revision explicitly."
+  fi
 
   if cmp -s -- "$UPDATE_CANDIDATE" "$INSTALLED_CLI" && update_target_metadata_current; then
     trap '' HUP INT TERM
@@ -3386,6 +4106,41 @@ infer_audio_user() {
   fi
 }
 
+run_installed_a2dpilot() {
+  "$INSTALLED_CLI" "$@"
+}
+
+post_install_onboarding() {
+  local non_interactive=$1 onboarding_result
+  if (( non_interactive == 0 )) && has_tty; then
+    if (( ${#CFG_SPEAKERS[@]} > 0 )); then
+      run_installed_a2dpilot pair --all || warn "Some configured speakers were not paired."
+    fi
+    run_installed_a2dpilot pair || warn "Interactive pairing did not complete."
+    if parse_config "$CONFIG_FILE" && (( ${#CFG_SPEAKERS[@]} > 0 )); then
+      note "Waiting for a configured Bluetooth speaker to become ready..."
+      if wait_for_configured_speaker_default "$CONNECT_TIMEOUT"; then
+        :
+      else
+        onboarding_result=$?
+        if (( onboarding_result == 3 )); then
+          [[ -n $DEFAULT_SINK_ERROR ]] || \
+            DEFAULT_SINK_ERROR="Could not make the healthy Bluetooth sink PipeWire's default."
+          warn "$DEFAULT_SINK_ERROR"
+        else
+          warn "No configured speaker became a healthy A2DP sink within ${CONNECT_TIMEOUT}s."
+        fi
+      fi
+    fi
+    offer_player_restarts "$CFG_AUDIO_USER" 1
+  else
+    if (( ${#CFG_SPEAKERS[@]} == 0 )); then
+      note "No speakers are configured. Run 'sudo a2dpilot pair' or 'sudo a2dpilot config'."
+    fi
+    offer_player_restarts "$CFG_AUDIO_USER" 0
+  fi
+}
+
 install_action() {
   require_root
   local requested_user='' non_interactive=0
@@ -3429,12 +4184,14 @@ install_action() {
   : > "$STATE_DIR/replaced-files"
   : > "$STATE_DIR/created-bonds"
 
-  local audio_user config_seed
+  local audio_user config_seed create_config=0
+  local onboard_analog=enabled onboard_hdmi=enabled
   if [[ -e $CONFIG_FILE || -L $CONFIG_FILE ]]; then
     [[ -z $requested_user ]] || die "--user only applies when creating a new configuration."
     parse_config "$CONFIG_FILE" || die "$CONFIG_ERROR"
     audio_user=$CFG_AUDIO_USER
   else
+    create_config=1
     audio_user=$(infer_audio_user "$requested_user") || \
       die "Could not infer an audio user; use install --user USER."
     id "$audio_user" >/dev/null 2>&1 || die "Audio user does not exist: $audio_user"
@@ -3455,6 +4212,21 @@ install_action() {
   trap 'rollback_failed_install 130' INT
   trap 'rollback_failed_install 143' TERM
 
+  if (( create_config && non_interactive == 0 )) && has_tty; then
+    detect_install_onboard_audio || true
+    if (( INSTALL_ONBOARD_ANALOG_AVAILABLE || INSTALL_ONBOARD_HDMI_AVAILABLE )); then
+      tty_print '\nYou may optionally disable one or more onboard audio interfaces before Bluetooth pairing.\n'
+    fi
+    if (( INSTALL_ONBOARD_ANALOG_AVAILABLE )) && \
+       tty_confirm 'Disable Raspberry Pi onboard analogue audio?'; then
+      onboard_analog=disabled
+    fi
+    if (( INSTALL_ONBOARD_HDMI_AVAILABLE )) && \
+       tty_confirm 'Disable Raspberry Pi onboard HDMI audio?'; then
+      onboard_hdmi=disabled
+    fi
+  fi
+
   note "Installing BlueZ, PipeWire, WirePlumber, Triggerhappy, and A2DP codec support..."
   apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${PACKAGES[@]}"
@@ -3470,7 +4242,7 @@ install_action() {
 
   if [[ ! -e $CONFIG_FILE ]]; then
     config_seed=$(mktemp "$(dirname "$CONFIG_FILE")/.a2dpilot-config.XXXXXX")
-    write_default_config "$config_seed" "$audio_user"
+    write_default_config "$config_seed" "$audio_user" "$onboard_analog" "$onboard_hdmi"
     mv -f -- "$config_seed" "$CONFIG_FILE"
   fi
   chown root:root "$CONFIG_FILE"
@@ -3501,14 +4273,7 @@ install_action() {
   release_lock
   note "A2DPilot installed successfully for audio user $CFG_AUDIO_USER."
 
-  if (( non_interactive == 0 )) && has_tty; then
-    if (( ${#CFG_SPEAKERS[@]} > 0 )); then
-      "$INSTALLED_CLI" pair --all || warn "Some configured speakers were not paired."
-    fi
-    "$INSTALLED_CLI" pair || warn "Interactive pairing did not complete."
-  elif (( ${#CFG_SPEAKERS[@]} == 0 )); then
-    note "No speakers are configured. Run 'sudo a2dpilot pair' or 'sudo a2dpilot config'."
-  fi
+  post_install_onboarding "$non_interactive"
 }
 
 remove_created_bonds() {
@@ -3611,6 +4376,8 @@ uninstall_action() {
   if systemctl show a2dpilot.service -p LoadState --value 2>/dev/null | grep -qv '^not-found$'; then
     systemctl disable --now a2dpilot.service || rollback_failure=1
   fi
+  clear_recorded_default_sink || \
+    warn "Could not clear A2DPilot's recorded PipeWire default sink."
   if [[ $bond_policy == remove ]]; then
     remove_created_bonds || bond_failure=1
   elif [[ $bond_policy == none ]]; then
