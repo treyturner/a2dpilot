@@ -1605,6 +1605,13 @@ run_bounded_bluetoothctl() {
   timeout --signal=TERM --kill-after=1 "$timeout" bluetoothctl "$@"
 }
 
+run_bounded_busctl() {
+  local seconds=$1
+  shift
+  [[ $seconds =~ ^[1-9][0-9]*$ ]] || return 1
+  timeout --signal=TERM --kill-after=1 "$seconds" busctl "$@"
+}
+
 bluetooth_device_command_on_controller() {
   local controller=$1 timeout=$2 verb=$3 mac=$4
   controller_batch "$controller" "$timeout" "$verb $mac"
@@ -1716,24 +1723,25 @@ scan_bredr() {
 }
 
 device_info_on_controller() {
-  local controller=$1 mac=$2 output
-  output=$(bluetooth_device_command_on_controller "$controller" 5 info "$mac" 2>/dev/null) || return 1
+  local controller=$1 mac=$2 seconds=${3:-5} output
+  [[ $seconds =~ ^[1-9][0-9]*$ ]] || return 1
+  output=$(bluetooth_device_command_on_controller "$controller" "$seconds" info "$mac" 2>/dev/null) || return 1
   grep -q '^[[:space:]]*Paired:' <<< "$output" || return 1
   printf '%s\n' "$output"
 }
 
 device_info() {
-  device_info_on_controller "$CFG_CONTROLLER" "$1"
+  device_info_on_controller "$CFG_CONTROLLER" "$1" "${2:-5}"
 }
 
 device_property_is_yes() {
-  local mac=$1 property=$2
-  device_info "$mac" | grep -q "^[[:space:]]*$property: yes$"
+  local mac=$1 property=$2 seconds=${3:-5}
+  device_info "$mac" "$seconds" | grep -q "^[[:space:]]*$property: yes$"
 }
 
-device_paired() { device_property_is_yes "$1" Paired; }
-device_trusted() { device_property_is_yes "$1" Trusted; }
-device_connected() { device_property_is_yes "$1" Connected; }
+device_paired() { device_property_is_yes "$1" Paired "${2:-5}"; }
+device_trusted() { device_property_is_yes "$1" Trusted "${2:-5}"; }
+device_connected() { device_property_is_yes "$1" Connected "${2:-5}"; }
 
 disconnect_bluetooth_device() {
   local mac=$1
@@ -2379,7 +2387,8 @@ select_preferred_a2dp_profile() {
 wait_for_a2dp_transport() {
   local mac=$1 deadline=$2 remaining
   while true; do
-    if device_connected "$mac"; then
+    remaining=$(seconds_until_deadline "$deadline") || return 1
+    if device_connected "$mac" "$remaining"; then
       remaining=$(seconds_until_deadline "$deadline") || return 1
       a2dp_connected "$mac" "$remaining" && return 0
     fi
@@ -2395,11 +2404,12 @@ restore_automatic_codec_negotiation() {
     return 1
   }
   bluetooth_device_command "$remaining" disconnect "$mac" >/dev/null 2>&1 || true
-  while device_connected "$mac"; do
-    seconds_until_deadline "$deadline" >/dev/null || {
+  while true; do
+    remaining=$(seconds_until_deadline "$deadline") || {
       CODEC_POLICY_ERROR="could not disconnect $mac to restore automatic codec negotiation"
       return 1
     }
+    device_connected "$mac" "$remaining" || break
     sleep 1
   done
   remaining=$(seconds_until_deadline "$deadline") || {
@@ -2507,40 +2517,58 @@ apply_speaker_codec_policy() {
 }
 
 configured_controller_path() {
-  local address=$CFG_CONTROLLER line path property
+  local seconds=${1:-$CONNECT_TIMEOUT} address=$CFG_CONTROLLER
+  local deadline remaining line paths path property
+  [[ $seconds =~ ^[1-9][0-9]*$ ]] || return 1
+  deadline=$(( $(now_seconds) + seconds ))
   if [[ $address == auto ]]; then
-    line=$(bluetoothctl list 2>/dev/null | sed -n '1p') || return 1
+    remaining=$(seconds_until_deadline "$deadline") || return 1
+    line=$(run_bounded_bluetoothctl "$remaining" list 2>/dev/null | sed -n '1p') || return 1
     [[ $line =~ ^Controller[[:space:]]+(([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}) ]] || return 1
     address=${BASH_REMATCH[1]^^}
   fi
+  remaining=$(seconds_until_deadline "$deadline") || return 1
+  paths=$(run_bounded_busctl "$remaining" tree --list org.bluez 2>/dev/null) || return 1
   while IFS= read -r path; do
     [[ $path =~ ^/org/bluez/hci[0-9]+$ ]] || continue
-    property=$(busctl get-property org.bluez "$path" org.bluez.Adapter1 Address 2>/dev/null) || continue
+    remaining=$(seconds_until_deadline "$deadline") || return 1
+    property=$(run_bounded_busctl "$remaining" get-property \
+      org.bluez "$path" org.bluez.Adapter1 Address 2>/dev/null) || continue
     [[ $property =~ ^s[[:space:]]+\"(([[:xdigit:]]{2}:){5}[[:xdigit:]]{2})\"$ ]] || continue
     [[ ${BASH_REMATCH[1]^^} == "$address" ]] || continue
     printf '%s\n' "$path"
     return 0
-  done < <(busctl tree --list org.bluez 2>/dev/null || true)
+  done <<< "$paths"
   return 1
 }
 
 avrcp_connected() {
-  local mac=$1 mac_key controller_path device_path
+  local mac=$1 seconds=${2:-$CONNECT_TIMEOUT} deadline remaining
+  local mac_key controller_path device_path property
+  [[ $seconds =~ ^[1-9][0-9]*$ ]] || return 1
+  deadline=$(( $(now_seconds) + seconds ))
   mac_key=${mac//:/_}
-  controller_path=$(configured_controller_path) || return 1
+  remaining=$(seconds_until_deadline "$deadline") || return 1
+  controller_path=$(configured_controller_path "$remaining") || return 1
   device_path=$controller_path/dev_$mac_key
-  busctl get-property org.bluez "$device_path" org.bluez.MediaControl1 Connected 2>/dev/null | \
-    grep -q '^b true$'
+  remaining=$(seconds_until_deadline "$deadline") || return 1
+  property=$(run_bounded_busctl "$remaining" get-property \
+    org.bluez "$device_path" org.bluez.MediaControl1 Connected 2>/dev/null) || return 1
+  [[ $property == 'b true' ]]
 }
 
 device_healthy() {
   local mac=$1 seconds=${2:-$CONNECT_TIMEOUT} deadline remaining
   [[ $seconds =~ ^[1-9][0-9]*$ ]] || return 1
   deadline=$(( $(now_seconds) + seconds ))
-  device_connected "$mac" || return 1
+  remaining=$(seconds_until_deadline "$deadline") || return 1
+  device_connected "$mac" "$remaining" || return 1
   remaining=$(seconds_until_deadline "$deadline") || return 1
   a2dp_connected "$mac" "$remaining" || return 1
-  [[ $CFG_MEDIA_CONTROLS != required ]] || avrcp_connected "$mac"
+  [[ $CFG_MEDIA_CONTROLS != required ]] || {
+    remaining=$(seconds_until_deadline "$deadline") || return 1
+    avrcp_connected "$mac" "$remaining"
+  }
 }
 
 speaker_configured() {
@@ -2667,11 +2695,12 @@ valid_agent() {
 }
 
 wait_for_device_connection() {
-  local mac=$1 deadline=${2:-}
+  local mac=$1 deadline=${2:-} remaining
   [[ -n $deadline ]] || deadline=$(( $(now_seconds) + CONNECT_TIMEOUT ))
   while true; do
-    device_connected "$mac" && return 0
-    (( $(now_seconds) < deadline )) || return 1
+    remaining=$(seconds_until_deadline "$deadline") || return 1
+    device_connected "$mac" "$remaining" && return 0
+    seconds_until_deadline "$deadline" >/dev/null || return 1
     sleep 1
   done
 }

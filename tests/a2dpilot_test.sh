@@ -2378,6 +2378,92 @@ test_media_control_health_modes() {
   if device_healthy AA:BB:CC:DD:EE:FF; then fail 'required mode ignored AVRCP'; fi
 }
 
+test_health_checks_share_supplied_deadline() {
+  local mac=AA:BB:CC:DD:EE:FF clock_file
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  CFG_CONTROLLER=auto
+  CFG_MEDIA_CONTROLS=required
+  clock_file=$TEST_SCRATCH/health-clock
+  printf '100\n' > "$clock_file"
+
+  bluetooth_device_command_on_controller() {
+    printf '%s %s %s %s\n' "$1" "$2" "$3" "$4" > "$TEST_SCRATCH/device-info-call"
+    printf 'Device %s Test Speaker\n\tPaired: yes\n\tConnected: yes\n' "$4"
+  }
+  device_connected "$mac" 2
+  assert_eq "auto 2 info $mac" "$(< "$TEST_SCRATCH/device-info-call")"
+
+  now_seconds() { sed -n '1p' "$clock_file"; }
+  advance_health_clock() {
+    local increment=$1 now
+    now=$(< "$clock_file")
+    printf '%s\n' "$((now + increment))" > "$clock_file"
+  }
+  device_connected() {
+    printf 'bluez %s\n' "${2:-missing}" >> "$TEST_SCRATCH/health-budgets"
+    advance_health_clock 1
+  }
+  a2dp_connected() {
+    printf 'a2dp %s\n' "${2:-missing}" >> "$TEST_SCRATCH/health-budgets"
+    advance_health_clock 2
+  }
+  avrcp_connected() {
+    printf 'avrcp %s\n' "${2:-missing}" >> "$TEST_SCRATCH/health-budgets"
+  }
+
+  device_healthy "$mac" 5
+  assert_eq $'bluez 5\na2dp 4\navrcp 2' "$(< "$TEST_SCRATCH/health-budgets")"
+}
+
+test_avrcp_check_shares_supplied_deadline() {
+  local mac=AA:BB:CC:DD:EE:FF clock_file
+  setup_scratch_dir
+  load_app
+  configure_scratch_paths
+  CFG_CONTROLLER=auto
+  clock_file=$TEST_SCRATCH/health-clock
+  printf '100\n' > "$clock_file"
+
+  now_seconds() { sed -n '1p' "$clock_file"; }
+  advance_avrcp_clock() {
+    local now
+    now=$(< "$clock_file")
+    printf '%s\n' "$((now + 1))" > "$clock_file"
+  }
+  run_bounded_bluetoothctl() {
+    local seconds=$1
+    shift
+    printf 'bluetooth %s %s\n' "$seconds" "$*" >> "$TEST_SCRATCH/controller-budgets"
+    advance_avrcp_clock
+    printf 'Controller 12:34:56:78:9A:BC Test Adapter [default]\n'
+  }
+  run_bounded_busctl() {
+    local seconds=$1
+    shift
+    printf 'busctl %s %s\n' "$seconds" "$*" >> "$TEST_SCRATCH/controller-budgets"
+    advance_avrcp_clock
+    case $* in
+      'tree --list org.bluez')
+        printf '/org/bluez/hci0\n'
+        ;;
+      'get-property org.bluez /org/bluez/hci0 org.bluez.Adapter1 Address')
+        printf 's "12:34:56:78:9A:BC"\n'
+        ;;
+      "get-property org.bluez /org/bluez/hci0/dev_${mac//:/_} org.bluez.MediaControl1 Connected")
+        printf 'b true\n'
+        ;;
+      *) return 1 ;;
+    esac
+  }
+
+  avrcp_connected "$mac" 5
+  assert_eq \
+    $'bluetooth 5 list\nbusctl 4 tree --list org.bluez\nbusctl 3 get-property org.bluez /org/bluez/hci0 org.bluez.Adapter1 Address\nbusctl 2 get-property org.bluez /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF org.bluez.MediaControl1 Connected' \
+    "$(< "$TEST_SCRATCH/controller-budgets")"
+}
+
 test_codec_reporting_is_optimistic() {
   local user candidate_codec output
   setup_scratch_dir
@@ -3469,7 +3555,8 @@ test_explicit_controller_scopes_device_operations() {
       *devices*) printf 'Device %s Test Speaker\n' "$mac" ;;
     esac
   }
-  busctl() {
+  run_bounded_busctl() {
+    shift
     case $* in
       'tree --list org.bluez')
         printf '/org/bluez/hci0\n/org/bluez/hci7\n'
@@ -3723,6 +3810,8 @@ run_test 'pair --all attempts every configured speaker' test_pair_all_attempts_e
 run_test 'interactive scan selection' test_interactive_scan_selection
 run_test 'forget removes config and provenance' test_forget_removes_config_and_provenance
 run_test 'media-control health modes' test_media_control_health_modes
+run_test 'health checks share the supplied deadline' test_health_checks_share_supplied_deadline
+run_test 'AVRCP checks share the supplied deadline' test_avrcp_check_shares_supplied_deadline
 run_test 'optimistic codec reporting' test_codec_reporting_is_optimistic
 run_test 'PipeWire codec property parsing' test_codec_property_parsing
 run_test 'default sink selection and conditional cleanup' \
